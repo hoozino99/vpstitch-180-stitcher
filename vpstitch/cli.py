@@ -59,6 +59,12 @@ def _apply_canvas_overrides(config: RigConfig, args: argparse.Namespace) -> RigC
         "center_pitch_deg": getattr(args, "center_pitch", None),
     }
     output = replace(output, **{key: value for key, value in replacements.items() if value is not None})
+    if getattr(args, "rugby_strength", None) is not None:
+        output = replace(
+            output,
+            projection="cylindrical_rugby",
+            rugby_strength=args.rugby_strength,
+        )
     return replace(config, output=output)
 
 
@@ -72,6 +78,11 @@ def _add_canvas_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--v-fov", type=float, help="vertical field of view in degrees")
     parser.add_argument("--center-yaw", type=float, help="canvas center yaw in degrees")
     parser.add_argument("--center-pitch", type=float, help="canvas center pitch in degrees")
+    parser.add_argument(
+        "--rugby-strength",
+        type=float,
+        help="vertical edge compression for a cylindrical rugby-ball projection (0-<1)",
+    )
 
 
 def _stitch_frame(args: argparse.Namespace) -> None:

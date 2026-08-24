@@ -72,7 +72,9 @@ def _apply_view_rotation(
     return rays, world_longitude
 
 
-def cylindrical_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
+def _cylindrical_world_rays(
+    tile: Tile, output: Output, rugby_strength: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
     xs = np.arange(tile.x, tile.x + tile.width, dtype=np.float64) + 0.5
     ys = np.arange(tile.y, tile.y + tile.height, dtype=np.float64) + 0.5
     local_longitude = (
@@ -81,9 +83,27 @@ def cylindrical_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.n
     vertical_extent = np.tan(np.deg2rad(output.vertical_fov_deg) * 0.5)
     vertical = (ys / output.height - 0.5) * (2.0 * vertical_extent)
     lon, vert = np.meshgrid(local_longitude, vertical)
+    if rugby_strength:
+        # Keep the frontal center at its original vertical scale while making
+        # the left/right sides progressively shorter. This gives the wide
+        # view a mild rugby-ball profile without changing the center heading.
+        horizontal_half_fov = np.deg2rad(output.horizontal_fov_deg) * 0.5
+        normalized_longitude = lon / horizontal_half_fov
+        side_scale = 1.0 - rugby_strength * normalized_longitude**2
+        vert *= side_scale
     rays = np.stack([np.sin(lon), vert, np.cos(lon)], axis=-1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
     return _apply_view_rotation(rays, output)
+
+
+def cylindrical_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
+    return _cylindrical_world_rays(tile, output)
+
+
+def cylindrical_rugby_world_rays(
+    tile: Tile, output: Output
+) -> tuple[np.ndarray, np.ndarray]:
+    return _cylindrical_world_rays(tile, output, output.rugby_strength)
 
 
 def rectilinear_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
@@ -108,6 +128,8 @@ def rectilinear_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.n
 def world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
     if output.projection == "rectilinear":
         return rectilinear_world_rays(tile, output)
+    if output.projection == "cylindrical_rugby":
+        return cylindrical_rugby_world_rays(tile, output)
     return cylindrical_world_rays(tile, output)
 
 

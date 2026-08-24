@@ -57,6 +57,10 @@ class Output:
     center_yaw_deg: float = 0.0
     center_pitch_deg: float = 0.0
     projection: str = "cylindrical"
+    # Fractional vertical compression at the horizontal edges for the
+    # cylindrical_rugby projection. 0.10 means the outermost columns are
+    # 10% shorter vertically than the center columns.
+    rugby_strength: float = 0.0
     tile_width: int = 1024
     tile_height: int = 512
     seam_feather_deg: float = 4.0
@@ -157,8 +161,12 @@ def load_config(path: str | Path) -> RigConfig:
 
     out_raw = _expect_dict(root.get("output", {}), "output")
     output = Output(**out_raw)
-    if output.projection not in {"cylindrical", "rectilinear"}:
-        raise ConfigError("projection must be 'cylindrical' or 'rectilinear'")
+    if output.projection not in {"cylindrical", "cylindrical_rugby", "rectilinear"}:
+        raise ConfigError(
+            "projection must be 'cylindrical', 'cylindrical_rugby', or 'rectilinear'"
+        )
+    if not 0.0 <= output.rugby_strength < 1.0:
+        raise ConfigError("rugby_strength must be between 0 (inclusive) and 1 (exclusive)")
     if output.width < 1 or output.height < 1:
         raise ConfigError("output dimensions must be positive")
     if output.width > MAX_CANVAS_WIDTH or output.height > MAX_CANVAS_HEIGHT:

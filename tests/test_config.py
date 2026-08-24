@@ -45,3 +45,14 @@ def test_accepts_rectilinear_projection(tmp_path: Path) -> None:
     path = tmp_path / "rectilinear.json"
     path.write_text(json.dumps(source), encoding="utf-8")
     assert load_config(path).output.projection == "rectilinear"
+
+
+def test_accepts_cylindrical_rugby_projection(tmp_path: Path) -> None:
+    source = json.loads(Path("configs/five_cam_180.sample.json").read_text(encoding="utf-8"))
+    source["output"]["projection"] = "cylindrical_rugby"
+    source["output"]["rugby_strength"] = 0.10
+    path = tmp_path / "cylindrical-rugby.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
+    config = load_config(path)
+    assert config.output.projection == "cylindrical_rugby"
+    assert config.output.rugby_strength == 0.10

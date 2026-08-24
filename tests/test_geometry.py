@@ -6,6 +6,7 @@ from vpstitch.config import Camera, Lens, Output
 from vpstitch.geometry import (
     Tile,
     camera_map,
+    cylindrical_rugby_world_rays,
     expand_tile,
     iter_tiles,
     seam_weights,
@@ -87,6 +88,21 @@ def test_rectilinear_center_ray_is_forward() -> None:
     assert center[2] > 0.99
     assert abs(float(center[0])) < 0.01
     assert abs(float(center[1])) < 0.01
+
+
+def test_cylindrical_rugby_compresses_vertical_scale_at_sides() -> None:
+    output = Output(
+        width=320,
+        height=240,
+        horizontal_fov_deg=180,
+        vertical_fov_deg=50,
+        projection="cylindrical_rugby",
+        rugby_strength=0.10,
+        tile_width=320,
+        tile_height=240,
+    )
+    rays, _ = cylindrical_rugby_world_rays(Tile(0, 0, 320, 240), output)
+    assert abs(float(rays[0, 0, 1])) < abs(float(rays[0, 159, 1]))
 
 
 def test_seam_weights_are_smooth_and_nonnegative() -> None:
