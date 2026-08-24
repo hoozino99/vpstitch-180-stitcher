@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vpstitch"
+version = "0.1.0"
+description = "High-bit-depth, color-managed 5-camera 180-degree video stitcher"
+requires-python = ">=3.12"
+dependencies = [
+  "imageio-ffmpeg>=0.6",
+  "numpy>=2.2",
+  "OpenEXR>=3.4",
+  "opencv-python-headless>=4.10",
+  "opencolorio>=2.4",
+  "PySide6>=6.8",
+  "tifffile>=2025.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3"]
+
+[project.scripts]
+vpstitch = "vpstitch.cli:main"
+vpstitch-gui = "vpstitch.gui:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"
+
+[tool.setuptools.packages.find]
+include = ["vpstitch*"]
