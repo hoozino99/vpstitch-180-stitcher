@@ -65,3 +65,19 @@ def test_accepts_cylindrical_rugby_projection(tmp_path: Path) -> None:
     config = load_config(path)
     assert config.output.projection == "cylindrical_rugby"
     assert config.output.rugby_strength == 0.10
+
+
+def test_validates_per_camera_input_interpretation(tmp_path: Path) -> None:
+    source = json.loads(Path("configs/five_cam_180.sample.json").read_text(encoding="utf-8"))
+    source["cameras"][0]["input_color_space"] = "bt709"
+    source["cameras"][0]["input_video_range"] = "tv"
+    path = tmp_path / "interpreted.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
+    camera = load_config(path).cameras[0]
+    assert camera.input_color_space == "bt709"
+    assert camera.input_video_range == "tv"
+
+    source["cameras"][0]["input_video_range"] = "broadcast-ish"
+    path.write_text(json.dumps(source), encoding="utf-8")
+    with pytest.raises(ConfigError, match="input_video_range"):
+        load_config(path)

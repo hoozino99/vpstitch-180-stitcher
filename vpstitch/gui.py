@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -63,6 +66,17 @@ GUI_MASTER_BIT_DEPTHS = {
     "hevc-444-10": 10,
     "dpx12-sequence": 12,
 }
+INPUT_COLOR_SPACES = (
+    ("Auto", None),
+    ("Rec.709", "bt709"),
+    ("Rec.2020", "bt2020nc"),
+    ("Rec.601", "smpte170m"),
+)
+INPUT_VIDEO_RANGES = (
+    ("Auto", None),
+    ("Video (Limited)", "tv"),
+    ("Full", "pc"),
+)
 _EXPLICIT_PLATE_NUMBER = re.compile(
     r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-5])(?=$|[^0-9])",
     re.IGNORECASE,
@@ -309,7 +323,140 @@ class TrimRangeBar(QWidget):
             self.rangeChanged.emit(self._lower, self._upper)
 
 
+def _format_bit_rate(value: object) -> str:
+    try:
+        bits_per_second = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    if bits_per_second >= 1_000_000:
+        return f"{bits_per_second / 1_000_000:.1f} Mb/s"
+    if bits_per_second >= 1_000:
+        return f"{bits_per_second / 1_000:.0f} kb/s"
+    return f"{bits_per_second} b/s"
+
+
+class InputSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        paths: list[str],
+        probes: list[dict[str, object] | None],
+        overrides: list[dict[str, str | None]],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Clip Input Settings")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(12)
+
+        title = QLabel(
+            Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} clips selected"
+        )
+        title.setProperty("sectionTitle", True)
+        layout.addWidget(title)
+
+        info = QFormLayout()
+        info.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        info.setHorizontalSpacing(24)
+        info.setVerticalSpacing(6)
+        populated = [probe for probe in probes if probe is not None]
+
+        def common(key: str, fallback: str = "—") -> object:
+            values = {str(probe.get(key) or fallback) for probe in populated}
+            if not values:
+                return fallback
+            return next(iter(values)) if len(values) == 1 else "Mixed"
+
+        resolution = "—"
+        if populated:
+            sizes = {
+                f"{probe.get('width', '—')}×{probe.get('height', '—')} · "
+                f"{float(probe.get('fps', 0.0)):.3f} fps"
+                for probe in populated
+            }
+            resolution = next(iter(sizes)) if len(sizes) == 1 else "Mixed"
+        depth = "—"
+        if populated:
+            depths = {
+                f"{probe.get('pixel_format', 'unknown')} · {probe.get('bit_depth', '—')}-bit"
+                for probe in populated
+            }
+            depth = next(iter(depths)) if len(depths) == 1 else "Mixed"
+        rates = {_format_bit_rate(probe.get("bit_rate")) for probe in populated}
+        bit_rate = next(iter(rates)) if len(rates) == 1 else "Mixed"
+        detected_color = common("colorspace")
+        detected_range = {
+            "tv": "Video (Limited)",
+            "pc": "Full",
+            "—": "—",
+        }.get(str(common("color_range")), str(common("color_range")))
+        for label, value in (
+            ("Codec", common("codec")),
+            ("Resolution", resolution),
+            ("Pixel format", depth),
+            ("Bitrate", bit_rate),
+            ("Detected color", detected_color),
+            ("Detected range", detected_range),
+        ):
+            value_label = QLabel(str(value))
+            value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            info.addRow(label, value_label)
+        layout.addLayout(info)
+
+        note = QLabel(
+            "Bit depth and bitrate are intrinsic source properties. Input settings only "
+            "change how pixels are interpreted; preview and final render use the same setting."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+
+        interpretation = QFormLayout()
+        interpretation.setHorizontalSpacing(24)
+        interpretation.setVerticalSpacing(8)
+        self.color_space = QComboBox()
+        for label, value in INPUT_COLOR_SPACES:
+            self.color_space.addItem(label, value)
+        self.video_range = QComboBox()
+        for label, value in INPUT_VIDEO_RANGES:
+            self.video_range.addItem(label, value)
+
+        def shared(key: str) -> str | None:
+            values = {override.get(key) for override in overrides}
+            return next(iter(values)) if len(values) == 1 else None
+
+        self.color_space.setCurrentIndex(
+            max(0, self.color_space.findData(shared("input_color_space")))
+        )
+        self.video_range.setCurrentIndex(
+            max(0, self.video_range.findData(shared("input_video_range")))
+        )
+        interpretation.addRow("Input Color Space", self.color_space)
+        interpretation.addRow("Video Range", self.video_range)
+        layout.addLayout(interpretation)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        apply_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        apply_button.setText("APPLY")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict[str, str | None]:
+        return {
+            "input_color_space": self.color_space.currentData(),
+            "input_video_range": self.video_range.currentData(),
+        }
+
+
 class SourceTable(QTableWidget):
+    inputSettingsRequested = Signal(list)
+
     def __init__(self) -> None:
         super().__init__(5, 9)
         self.setHorizontalHeaderLabels(
@@ -317,7 +464,9 @@ class SourceTable(QTableWidget):
         )
         self.verticalHeader().hide()
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         self.setAlternatingRowColors(False)
         self.setShowGrid(False)
         self.setMinimumHeight(212)
@@ -332,6 +481,30 @@ class SourceTable(QTableWidget):
             self.setColumnHidden(column, True)
         self.setColumnWidth(1, 150)
         self.verticalHeader().setDefaultSectionSize(32)
+
+    def _show_context_menu(self, position) -> None:  # type: ignore[no-untyped-def]
+        item = self.itemAt(position)
+        if item is None:
+            return
+        row = item.row()
+        selected = {index.row() for index in self.selectionModel().selectedRows()}
+        if row not in selected:
+            self.clearSelection()
+            self.selectRow(row)
+            selected = {row}
+        menu = QMenu(self)
+        action = menu.addAction("INPUT SETTINGS…")
+        chosen = menu.exec(self.viewport().mapToGlobal(position))
+        if chosen is action:
+            self.inputSettingsRequested.emit(sorted(selected))
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() in {Qt.Key.Key_Menu, Qt.Key.Key_F10}:
+            rows = sorted(index.row() for index in self.selectionModel().selectedRows())
+            if rows:
+                self.inputSettingsRequested.emit(rows)
+            return
+        super().keyPressEvent(event)
 
     def set_rig(self, cameras: list[dict[str, object]], paths: list[str] | None = None) -> None:
         paths = paths or [""] * len(cameras)
@@ -413,18 +586,38 @@ class SourceTable(QTableWidget):
                 item.setText(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-    def set_probe_data(self, inputs: list[dict[str, object]]) -> None:
+    def set_probe_data(
+        self,
+        inputs: list[dict[str, object]],
+        overrides: dict[str, dict[str, str | None]] | None = None,
+    ) -> None:
         if len(inputs) != self.rowCount():
             raise ValueError("source probe result does not match the source count")
         for row, probe in enumerate(inputs):
             bit_depth = int(probe.get("bit_depth", 0))
             pixel_format = str(probe.get("pixel_format") or "unknown")
+            path = self.paths()[row]
+            interpretation = (overrides or {}).get(path, {})
+            color_space = interpretation.get("input_color_space")
+            video_range = interpretation.get("input_video_range")
+            color_label = {
+                "bt709": "709",
+                "bt2020nc": "2020",
+                "smpte170m": "601",
+            }.get(color_space)
+            range_label = {"tv": "VIDEO", "pc": "FULL"}.get(video_range)
+            suffix = "/".join(value for value in (color_label, range_label) if value)
             item = self.item(row, 4)
             if item is None:
                 item = QTableWidgetItem()
                 self.setItem(row, 4, item)
-            item.setText(f"{bit_depth}-BIT")
-            item.setToolTip(f"Detected source: {pixel_format}, {bit_depth}-bit")
+            item.setText(f"{bit_depth}b" + (f" {suffix}" if suffix else " AUTO"))
+            item.setToolTip(
+                f"Detected: {pixel_format}, {bit_depth}-bit, "
+                f"{_format_bit_rate(probe.get('bit_rate'))}\n"
+                f"Input Color Space: {color_label or 'Auto'}\n"
+                f"Video Range: {range_label or 'Auto'}"
+            )
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
     def offsets(self) -> list[int]:
@@ -461,6 +654,7 @@ class MainWindow(QMainWindow):
         self._rig_profiles: dict[int, dict[str, object]] = {}
         self._plate_numbers: list[int] | None = None
         self._source_probes: list[dict[str, object]] | None = None
+        self._source_overrides: dict[str, dict[str, str | None]] = {}
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_failure: Callable[[], None] | None = None
@@ -526,6 +720,7 @@ class MainWindow(QMainWindow):
 
         self.source_table = SourceTable()
         self.source_table.itemChanged.connect(self._source_item_changed)
+        self.source_table.inputSettingsRequested.connect(self._open_input_settings)
         source_group = QFrame()
         source_group.setObjectName("mediaPanel")
         source_group.setMinimumWidth(250)
@@ -786,6 +981,14 @@ class MainWindow(QMainWindow):
         self._activate_camera_count(len(ordered))
         self._plate_numbers = numbers
         self._source_probes = None
+        cameras = self.config_data["cameras"]
+        self._source_overrides = {
+            path: {
+                "input_color_space": camera.get("input_color_space"),
+                "input_video_range": camera.get("input_video_range"),
+            }
+            for path, camera in zip(ordered, cameras, strict=True)
+        }
         self.source_table.set_paths(ordered)
         self._reset_timing()
         order_note = (
@@ -810,6 +1013,14 @@ class MainWindow(QMainWindow):
                 self.source_status.setText(
                     f"●  {loaded} plates · {order_note}\n"
                     f"SOURCE {source_depth}-bit → MASTER 10/12-bit"
+                    + (
+                        " · INPUT OVERRIDE"
+                        if any(
+                            any(value for value in override.values())
+                            for override in self._source_overrides.values()
+                        )
+                        else ""
+                    )
                 )
             else:
                 self.source_status.setText(
@@ -1173,6 +1384,7 @@ class MainWindow(QMainWindow):
         self._rig_profiles[len(cameras)] = json.loads(json.dumps(raw))
         self._plate_numbers = None
         self._source_probes = None
+        self._source_overrides = {}
         self._tc_alignment = None
         self._tc_alignment_path = None
         self.source_table.blockSignals(True)
@@ -1227,6 +1439,14 @@ class MainWindow(QMainWindow):
         raw = json.loads(json.dumps(self.config_data))
         cameras = raw["cameras"]
         self.source_table.apply_to_cameras(cameras)
+        for path, camera in zip(self.source_table.paths(), cameras, strict=True):
+            override = self._source_overrides.get(path, {})
+            for key in ("input_color_space", "input_video_range"):
+                value = override.get(key)
+                if value:
+                    camera[key] = value
+                else:
+                    camera.pop(key, None)
         output = raw.setdefault("output", {})
         output.update(
             {
@@ -1335,6 +1555,7 @@ class MainWindow(QMainWindow):
         self.source_table.set_paths([""] * self.source_table.rowCount())
         self._plate_numbers = None
         self._source_probes = None
+        self._source_overrides = {}
         self._reset_timing()
 
     def _cleanup_reference_dir(self, path: Path | None) -> None:
@@ -1647,7 +1868,7 @@ class MainWindow(QMainWindow):
         if len(probes) != len(inputs):
             raise ValueError("invalid source probe entries")
         self._source_probes = probes
-        self.source_table.set_probe_data(probes)
+        self.source_table.set_probe_data(probes, self._source_overrides)
         self._update_source_status()
         minimum = min(int(probe["bit_depth"]) for probe in probes)
         if minimum < 10:
@@ -1658,6 +1879,56 @@ class MainWindow(QMainWindow):
             self.preview_note.setText(
                 f"SOURCE {minimum}-bit detected · 10/12-bit master pipeline ready"
             )
+
+    def _open_input_settings(self, rows: list[int]) -> None:
+        valid_rows = sorted(
+            row for row in rows if 0 <= row < self.source_table.rowCount()
+        )
+        if not valid_rows:
+            return
+        paths = self.source_table.paths()
+        selected_paths = [paths[row] for row in valid_rows if paths[row]]
+        if not selected_paths:
+            self._error("Input settings", "Import a plate first")
+            return
+        probes = [
+            self._source_probes[row]
+            if self._source_probes is not None and row < len(self._source_probes)
+            else None
+            for row in valid_rows
+            if paths[row]
+        ]
+        overrides = [
+            self._source_overrides.get(
+                path,
+                {"input_color_space": None, "input_video_range": None},
+            )
+            for path in selected_paths
+        ]
+        dialog = InputSettingsDialog(self, selected_paths, probes, overrides)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        for path in selected_paths:
+            self._source_overrides[path] = dict(values)
+        if self._source_probes:
+            self.source_table.set_probe_data(
+                self._source_probes, self._source_overrides
+            )
+        self._cleanup_reference_dir(self._last_reference_dir)
+        self._last_reference_dir = None
+        self._last_reference_config_path = None
+        self._preview_ready = False
+        self._preview_in_progress = False
+        self._pending_scrub_frame = None
+        self.rig_align_button.setEnabled(False)
+        self._update_source_status()
+        self.preview_note.setText(
+            "Input interpretation updated · create preview to refresh stitched image"
+        )
+        self.statusBar().showMessage(
+            f"Input settings applied to {len(selected_paths)} clip(s)", 8000
+        )
 
     def _write_preview_config(
         self,
@@ -1844,6 +2115,7 @@ class MainWindow(QMainWindow):
             current_paths = self.source_table.paths()
             plate_numbers = self._plate_numbers
             source_probes = self._source_probes
+            source_overrides = self._source_overrides
             tc_alignment = self._tc_alignment
             tc_alignment_path = self._tc_alignment_path
             timeline_range = self.timeline_bar.values()
@@ -1851,8 +2123,9 @@ class MainWindow(QMainWindow):
             self.source_table.set_paths(current_paths)
             self._plate_numbers = plate_numbers
             self._source_probes = source_probes
+            self._source_overrides = source_overrides
             if source_probes:
-                self.source_table.set_probe_data(source_probes)
+                self.source_table.set_probe_data(source_probes, source_overrides)
             self._update_source_status()
             if tc_alignment:
                 self._tc_alignment_path = tc_alignment_path

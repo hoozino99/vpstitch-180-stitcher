@@ -135,6 +135,32 @@ def assess_inputs(
     return DiagnosticReport(tuple(probes), tuple(issues))
 
 
+def interpret_input_probes(
+    probes: list[VideoProbe], config: RigConfig
+) -> list[VideoProbe]:
+    """Apply explicit per-camera source interpretation to detected metadata."""
+
+    interpreted: list[VideoProbe] = []
+    for camera, probe in zip(config.cameras, probes, strict=False):
+        replacements: dict[str, str] = {}
+        if camera.input_color_space:
+            primaries, transfer = {
+                "bt709": ("bt709", "bt709"),
+                "bt2020nc": ("bt2020", "bt2020-10"),
+                "smpte170m": ("smpte170m", "smpte170m"),
+            }[camera.input_color_space]
+            replacements.update(
+                colorspace=camera.input_color_space,
+                color_primaries=primaries,
+                color_trc=transfer,
+            )
+        if camera.input_video_range:
+            replacements["color_range"] = camera.input_video_range
+        interpreted.append(replace(probe, **replacements))
+    interpreted.extend(probes[len(interpreted) :])
+    return interpreted
+
+
 def resolve_passthrough_video(video: Video, probes: list[VideoProbe]) -> Video:
     """Propagate matching input color tags without silently relabelling pixels."""
 

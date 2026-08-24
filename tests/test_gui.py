@@ -8,11 +8,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QToolBar
+from PySide6.QtWidgets import QApplication, QLabel, QToolBar
 
 from vpstitch.config import load_config
 from vpstitch.gui import (
     GUI_MASTER_BIT_DEPTHS,
+    InputSettingsDialog,
     MainWindow,
     TrimRangeBar,
     order_camera_plates,
@@ -105,7 +106,7 @@ def test_gui_applies_detected_source_depth_without_manual_flag() -> None:
     window.source_table.set_paths([str(item["path"]) for item in inputs])
     window._apply_source_probe_payload({"inputs": inputs, "issues": []})
     assert window._source_probes == inputs
-    assert window.source_table.item(0, 4).text() == "8-BIT"
+    assert window.source_table.item(0, 4).text() == "8b AUTO"
     assert "SOURCE 8-bit → MASTER 10/12-bit" in window.source_status.text()
     assert "preview allowed" in window.preview_note.text()
     window.close()
@@ -137,6 +138,49 @@ def test_gui_source_table_keeps_full_paths_while_showing_clip_names(tmp_path: Pa
     assert window.source_table.item(0, 1).text() == "camera-0.mov"
     window._update_source_status()
     assert "5 of 5" in window.source_status.text()
+    window.close()
+    app.processEvents()
+
+
+def test_input_settings_keep_bitrate_read_only_and_persist_interpretation(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    paths = [str(tmp_path / f"P{number:02d}.mov") for number in range(1, 6)]
+    window.source_table.set_paths(paths)
+    probe = {
+        "codec": "h264",
+        "width": 5952,
+        "height": 3968,
+        "fps": 24.0,
+        "pixel_format": "yuv420p",
+        "bit_depth": 8,
+        "bit_rate": 84_300_000,
+        "colorspace": "bt709",
+        "color_range": "tv",
+    }
+    dialog = InputSettingsDialog(
+        window,
+        [paths[0]],
+        [probe],
+        [{"input_color_space": None, "input_video_range": None}],
+    )
+    labels = " ".join(label.text() for label in dialog.findChildren(QLabel))
+    assert "84.3 Mb/s" in labels
+    assert "intrinsic source properties" in labels
+    dialog.color_space.setCurrentIndex(dialog.color_space.findData("bt709"))
+    dialog.video_range.setCurrentIndex(dialog.video_range.findData("tv"))
+    assert dialog.values() == {
+        "input_color_space": "bt709",
+        "input_video_range": "tv",
+    }
+    window._source_overrides[paths[0]] = dialog.values()
+    config = window._collect_config()
+    assert config["cameras"][0]["input_color_space"] == "bt709"
+    assert config["cameras"][0]["input_video_range"] == "tv"
+    assert window.source_table.selectionMode().name == "ExtendedSelection"
+    dialog.close()
     window.close()
     app.processEvents()
 

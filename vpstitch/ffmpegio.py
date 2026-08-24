@@ -53,6 +53,7 @@ class VideoProbe:
     duration_seconds: float | None = None
     frame_count: int | None = None
     timecode: str | None = None
+    bit_rate: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -192,9 +193,9 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration,start_time:format_tags=timecode:"
+                "format=duration,start_time,bit_rate:format_tags=timecode:"
                 "stream=index,codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,"
-                "r_frame_rate,nb_frames,duration,duration_ts,time_base:stream_tags=timecode",
+                "r_frame_rate,nb_frames,duration,duration_ts,time_base,bit_rate:stream_tags=timecode",
                 "-of",
                 "json",
                 str(path),
@@ -250,6 +251,15 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
             None,
         )
     pixel_format = str(video.get("pix_fmt") or base.pixel_format)
+    bit_rate = None
+    for candidate in (video.get("bit_rate"), format_data.get("bit_rate")):
+        try:
+            bit_rate = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if bit_rate > 0:
+            break
+        bit_rate = None
     return replace(
         base,
         codec=str(video.get("codec_name") or base.codec),
@@ -261,6 +271,7 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
         duration_seconds=duration_seconds,
         frame_count=frame_count,
         timecode=timecode or base.timecode,
+        bit_rate=bit_rate,
     )
 
 
@@ -368,8 +379,24 @@ class VideoDecoder:
             filters.extend([f"trim=start_frame={frame_seek}", "setpts=PTS-STARTPTS"])
         if source_fps is None or abs(source_fps - fps) > 0.001:
             filters.append(f"fps={fps}")
-        if output_size is not None:
-            filters.append(f"scale={self.width}:{self.height}:flags=lanczos")
+        if (
+            output_size is not None
+            or camera.input_color_space is not None
+            or camera.input_video_range is not None
+        ):
+            matrix = {
+                "bt709": "bt709",
+                "bt2020nc": "bt2020",
+                "smpte170m": "smpte170m",
+            }.get(camera.input_color_space)
+            scale = f"scale={self.width}:{self.height}:flags=lanczos"
+            if matrix:
+                scale += f":in_color_matrix={matrix}"
+            if camera.input_video_range:
+                scale += f":in_range={camera.input_video_range}"
+            if matrix or camera.input_video_range:
+                scale += ":out_range=full"
+            filters.append(scale)
         if filters:
             command.extend(["-vf", ",".join(filters)])
         command.extend(["-f", "rawvideo", "-pix_fmt", "rgb48le", "pipe:1"])

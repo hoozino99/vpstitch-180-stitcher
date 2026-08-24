@@ -22,7 +22,7 @@ from .imageio import ExrSequenceEncoder, write_png
 from .pipeline import Stitcher
 from .mapcache import MapCache
 from .canvas import analyze_canvas, write_coverage_mask
-from .diagnostics import assess_inputs, resolve_passthrough_video
+from .diagnostics import assess_inputs, interpret_input_probes, resolve_passthrough_video
 from .calibration import CalibrationError, calibrate_checkerboard
 from .rigcalibration import calibrate_rig_rotation, write_calibrated_config
 from .resources import estimate_resources
@@ -170,8 +170,9 @@ def _stitch_video(args: argparse.Namespace) -> None:
         raise ConfigError(f"expected {len(config.cameras)} input videos")
 
     probes = [probe_video(path) for path in args.inputs]
+    interpreted_probes = interpret_input_probes(probes, config)
     diagnostic = assess_inputs(
-        probes,
+        interpreted_probes,
         config,
         allow_low_bit_depth=args.allow_low_bit_depth,
     )
@@ -183,7 +184,10 @@ def _stitch_video(args: argparse.Namespace) -> None:
             print(f"warning: {issue.message}", file=sys.stderr)
     if config.color.mode == "passthrough":
         assert config.video is not None
-        config = replace(config, video=resolve_passthrough_video(config.video, probes))
+        config = replace(
+            config,
+            video=resolve_passthrough_video(config.video, interpreted_probes),
+        )
 
     planned_starts, aligned_frames = _planned_decoder_starts(
         config, args.inputs, args.alignment_plan
@@ -309,7 +313,7 @@ def _extract_reference(args: argparse.Namespace) -> None:
         raise ConfigError("--scale must be greater than 0 and at most 1")
     probes = [probe_video(path) for path in args.inputs]
     report = assess_inputs(
-        probes,
+        interpret_input_probes(probes, config),
         config,
         allow_low_bit_depth=args.allow_low_bit_depth,
     )

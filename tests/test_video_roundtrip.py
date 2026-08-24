@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import json
 
@@ -176,3 +177,39 @@ def test_h264_mp4_is_10bit(tmp_path: Path) -> None:
     probe = probe_video(path)
     assert probe.codec == "h264"
     assert probe.bit_depth == 10
+    assert probe.bit_rate is not None and probe.bit_rate > 0
+
+
+def test_decoder_applies_explicit_video_range_interpretation(tmp_path: Path) -> None:
+    width, height = 320, 180
+    frame = np.full((height, width, 3), 18000, dtype=np.uint16)
+    path = tmp_path / "limited-range.mp4"
+    video = Video(
+        fps=24,
+        frames=1,
+        output_codec="h264-mp4-10",
+        color_primaries="bt709",
+        color_trc="bt709",
+        colorspace="bt709",
+        color_range="tv",
+    )
+    encoder = VideoEncoder(path, width, height, video)
+    encoder.write(frame)
+    encoder.close()
+
+    auto_decoder = VideoDecoder(path, _camera(width, height), 24)
+    auto = auto_decoder.read()
+    auto_decoder.close()
+    full_decoder = VideoDecoder(
+        path,
+        replace(
+            _camera(width, height),
+            input_color_space="bt709",
+            input_video_range="pc",
+        ),
+        24,
+    )
+    full = full_decoder.read()
+    full_decoder.close()
+    assert auto is not None and full is not None
+    assert abs(int(np.median(auto)) - int(np.median(full))) > 500

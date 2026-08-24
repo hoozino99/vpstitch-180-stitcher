@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from vpstitch.config import ConfigError, Video
-from vpstitch.diagnostics import assess_inputs, resolve_passthrough_video
+from vpstitch.config import Camera, ConfigError, Lens, RigConfig, Video
+from vpstitch.diagnostics import (
+    assess_inputs,
+    interpret_input_probes,
+    resolve_passthrough_video,
+)
 from vpstitch.ffmpegio import (
     VideoProbe,
     ffmpeg_executable,
@@ -77,3 +81,24 @@ def test_passthrough_rejects_conflicting_retag() -> None:
         resolve_passthrough_video(
             Video(fps=24, color_primaries="bt709"), [_probe("cam.mov")]
         )
+
+
+def test_input_interpretation_overrides_detected_color_metadata() -> None:
+    camera = Camera(
+        "cam0",
+        5952,
+        3968,
+        0,
+        0,
+        0,
+        Lens("pinhole", 1, 1, 0, 0),
+        input_color_space="bt709",
+        input_video_range="pc",
+    )
+    interpreted = interpret_input_probes(
+        [_probe("cam.mov")], RigConfig(cameras=(camera,))
+    )[0]
+    assert interpreted.colorspace == "bt709"
+    assert interpreted.color_primaries == "bt709"
+    assert interpreted.color_trc == "bt709"
+    assert interpreted.color_range == "pc"

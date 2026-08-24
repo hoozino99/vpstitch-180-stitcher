@@ -45,6 +45,8 @@ class Camera:
     lens: Lens
     colorspace: str | None = None
     frame_offset: int = 0
+    input_color_space: str | None = None
+    input_video_range: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,14 @@ def _lens(raw: dict[str, Any]) -> Lens:
 
 
 def _camera(raw: dict[str, Any]) -> Camera:
+    input_color_space = raw.get("input_color_space")
+    if input_color_space not in {None, "bt709", "bt2020nc", "smpte170m"}:
+        raise ConfigError(
+            "camera.input_color_space must be bt709, bt2020nc, smpte170m, or null"
+        )
+    input_video_range = raw.get("input_video_range")
+    if input_video_range not in {None, "tv", "pc"}:
+        raise ConfigError("camera.input_video_range must be tv, pc, or null")
     return Camera(
         name=str(raw["name"]),
         width=int(raw["width"]),
@@ -140,6 +150,8 @@ def _camera(raw: dict[str, Any]) -> Camera:
         lens=_lens(_expect_dict(raw["lens"], "camera.lens")),
         colorspace=raw.get("colorspace"),
         frame_offset=int(raw.get("frame_offset", 0)),
+        input_color_space=input_color_space,
+        input_video_range=input_video_range,
     )
 
 
