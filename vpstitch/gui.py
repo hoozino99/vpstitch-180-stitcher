@@ -1,0 +1,927 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import tifffile
+from PySide6.QtCore import QProcess, QSettings, Qt
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QStatusBar,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
+
+
+APP_NAME = "VP Stitch"
+VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
+
+
+def preview_dimensions(width: int, height: int, max_width: int = 2048, max_height: int = 900) -> tuple[int, int]:
+    scale = min(1.0, max_width / width, max_height / height)
+    return max(32, int(round(width * scale))), max(32, int(round(height * scale)))
+
+
+def _display_image(array: np.ndarray) -> QImage:
+    image = np.asarray(array[..., :3])
+    if image.dtype == np.uint16:
+        rgb8 = np.right_shift(image, 8).astype(np.uint8)
+    elif image.dtype == np.uint8:
+        rgb8 = image
+    else:
+        values = np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+        # Display-only exposure mapping. It never touches the render pipeline.
+        values = np.clip(values, 0.0, None)
+        values = values / (1.0 + values)
+        rgb8 = np.rint(np.clip(values, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb8 = np.ascontiguousarray(rgb8)
+    height, width, _ = rgb8.shape
+    return QImage(rgb8.data, width, height, rgb8.strides[0], QImage.Format.Format_RGB888).copy()
+
+
+class PreviewView(QGraphicsView):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setScene(QGraphicsScene(self))
+        self._item: QGraphicsPixmapItem | None = None
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setBackgroundBrush(QColor("#090c11"))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty = QLabel("5개 영상을 넣고  PREVIEW  를 누르세요")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setStyleSheet("color:#718096; font-size:16px; letter-spacing:1px;")
+        self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._empty.setParent(self.viewport())
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self._empty.setGeometry(self.viewport().rect())
+        if self._item is not None:
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_array(self, array: np.ndarray) -> None:
+        pixmap = QPixmap.fromImage(_display_image(array))
+        self.scene().clear()
+        self._item = self.scene().addPixmap(pixmap)
+        self.scene().setSceneRect(self._item.boundingRect())
+        self._empty.hide()
+        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def show_message(self, message: str) -> None:
+        self.scene().clear()
+        self._item = None
+        self._empty.setText(message)
+        self._empty.show()
+
+
+class SourceTable(QTableWidget):
+    def __init__(self) -> None:
+        super().__init__(5, 6)
+        self.setHorizontalHeaderLabels(["CAM", "VIDEO", "YAW", "PITCH", "ROLL", "OFFSET"])
+        self.verticalHeader().hide()
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setAlternatingRowColors(True)
+        self.setMinimumHeight(230)
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in range(2, 6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.setColumnWidth(1, 230)
+
+    def set_rig(self, cameras: list[dict[str, object]], paths: list[str] | None = None) -> None:
+        paths = paths or [""] * len(cameras)
+        self.setRowCount(len(cameras))
+        for row, camera in enumerate(cameras):
+            values = [
+                str(camera.get("name", f"cam{row}")),
+                paths[row] if row < len(paths) else "",
+                str(camera.get("yaw_deg", 0.0)),
+                str(camera.get("pitch_deg", 0.0)),
+                str(camera.get("roll_deg", 0.0)),
+                str(camera.get("frame_offset", 0)),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column == 1:
+                    item.setToolTip(value)
+                self.setItem(row, column, item)
+
+    def paths(self) -> list[str]:
+        return [(self.item(row, 1).text().strip() if self.item(row, 1) else "") for row in range(self.rowCount())]
+
+    def set_paths(self, paths: list[str]) -> None:
+        for row, path in enumerate(paths[: self.rowCount()]):
+            item = self.item(row, 1) or QTableWidgetItem()
+            item.setText(path)
+            item.setToolTip(path)
+            self.setItem(row, 1, item)
+
+    def apply_to_cameras(self, cameras: list[dict[str, object]]) -> None:
+        for row, camera in enumerate(cameras):
+            try:
+                camera["yaw_deg"] = float(self.item(row, 2).text())
+                camera["pitch_deg"] = float(self.item(row, 3).text())
+                camera["roll_deg"] = float(self.item(row, 4).text())
+                camera["frame_offset"] = int(self.item(row, 5).text())
+            except (AttributeError, ValueError) as error:
+                raise ValueError(f"Camera {row + 1} orientation/offset is invalid") from error
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME}  —  5-Camera 180°")
+        self.resize(1720, 980)
+        self.setMinimumSize(1280, 760)
+        self.setAcceptDrops(True)
+        self.settings = QSettings("VP-LAB", APP_NAME)
+        self.project_root = Path.cwd()
+        self.config_path: Path | None = None
+        self.config_data: dict[str, object] = {}
+        self.process: QProcess | None = None
+        self._process_success: Callable[[], None] | None = None
+        self._process_output = ""
+        self._last_reference_dir: Path | None = None
+        self._working_dir = self.project_root / ".vpstitch-ui"
+        self._working_dir.mkdir(parents=True, exist_ok=True)
+        self._build_ui()
+        self._apply_style()
+        initial = Path(str(self.settings.value("lastConfig", "")))
+        if not initial.is_file():
+            initial = self.project_root / "configs" / "five_cam_180.sample.json"
+        if initial.is_file():
+            self.load_config(initial)
+        self.statusBar().showMessage("Ready — preview display is 8-bit; final render remains high bit depth")
+
+    def _build_ui(self) -> None:
+        toolbar = QToolBar("Main")
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(toolbar)
+        actions = [
+            ("OPEN CONFIG", self.choose_config),
+            ("SAVE AS", self.save_as),
+            ("CHECK INPUTS", self.check_inputs),
+            ("PREVIEW", self.create_preview),
+            ("AUTO ALIGN", self.auto_align),
+            ("RENDER", self.render),
+            ("CANCEL", self.cancel_task),
+        ]
+        for text, callback in actions:
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            toolbar.addAction(action)
+            if text in {"SAVE AS", "AUTO ALIGN"}:
+                toolbar.addSeparator()
+
+        self.source_table = SourceTable()
+        source_group = QGroupBox("SOURCES  /  LEFT → RIGHT")
+        source_layout = QVBoxLayout(source_group)
+        source_layout.addWidget(self.source_table)
+        source_buttons = QHBoxLayout()
+        choose = QPushButton("SELECT 5 VIDEOS")
+        choose.clicked.connect(self.choose_videos)
+        clear = QPushButton("CLEAR")
+        clear.clicked.connect(lambda: self.source_table.set_paths([""] * 5))
+        source_buttons.addWidget(choose)
+        source_buttons.addWidget(clear)
+        source_layout.addLayout(source_buttons)
+        source_hint = QLabel("파일 5개를 왼쪽→오른쪽 카메라 순서로 드롭할 수도 있습니다.")
+        source_hint.setWordWrap(True)
+        source_hint.setProperty("muted", True)
+        source_layout.addWidget(source_hint)
+
+        self.preview = PreviewView()
+        preview_box = QWidget()
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_header = QHBoxLayout()
+        title = QLabel("PANORAMA PREVIEW")
+        title.setProperty("sectionTitle", True)
+        self.preview_time = QDoubleSpinBox()
+        self.preview_time.setRange(0.0, 86400.0)
+        self.preview_time.setDecimals(3)
+        self.preview_time.setSuffix(" sec")
+        self.preview_time.setValue(0.0)
+        preview_header.addWidget(title)
+        preview_header.addStretch()
+        preview_header.addWidget(QLabel("REFERENCE TIME"))
+        preview_header.addWidget(self.preview_time)
+        preview_layout.addLayout(preview_header)
+        preview_layout.addWidget(self.preview, 1)
+        preview_note = QLabel("DISPLAY PREVIEW ONLY · MASTER PIPELINE: UINT16 / FLOAT32 / OCIO")
+        preview_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_note.setProperty("muted", True)
+        preview_layout.addWidget(preview_note)
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setMinimumWidth(440)
+        settings_scroll.setMaximumWidth(540)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tabs = QTabWidget()
+        tabs.addTab(self._stitch_settings(), "STITCH")
+        tabs.addTab(self._color_settings(), "COLOR")
+        tabs.addTab(self._output_settings(), "OUTPUT")
+        settings_scroll.setWidget(tabs)
+
+        upper = QSplitter(Qt.Orientation.Horizontal)
+        upper.addWidget(source_group)
+        upper.addWidget(preview_box)
+        upper.addWidget(settings_scroll)
+        upper.setSizes([400, 800, 520])
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(5000)
+        self.log.setMinimumHeight(155)
+        self.log.setFont(QFont("Cascadia Mono", 9))
+        log_box = QGroupBox("TASK LOG")
+        log_layout = QVBoxLayout(log_box)
+        log_layout.addWidget(self.log)
+
+        central = QSplitter(Qt.Orientation.Vertical)
+        central.addWidget(upper)
+        central.addWidget(log_box)
+        central.setSizes([790, 190])
+        self.setCentralWidget(central)
+
+        status = QStatusBar()
+        self.task_label = QLabel("IDLE")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedWidth(240)
+        status.addPermanentWidget(self.task_label)
+        status.addPermanentWidget(self.progress)
+        self.setStatusBar(status)
+
+    def _stitch_settings(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        canvas = QGroupBox("CANVAS")
+        form = QFormLayout(canvas)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.canvas_width = QSpinBox()
+        self.canvas_width.setRange(32, MAX_CANVAS_WIDTH)
+        self.canvas_width.setSingleStep(256)
+        self.canvas_height = QSpinBox()
+        self.canvas_height.setRange(32, MAX_CANVAS_HEIGHT)
+        self.canvas_height.setSingleStep(128)
+        self.h_fov = QDoubleSpinBox()
+        self.h_fov.setRange(1.0, 360.0)
+        self.h_fov.setSuffix("°")
+        self.v_fov = QDoubleSpinBox()
+        self.v_fov.setRange(1.0, 179.0)
+        self.v_fov.setSuffix("°")
+        self.center_yaw = QDoubleSpinBox()
+        self.center_yaw.setRange(-180.0, 180.0)
+        self.center_yaw.setSuffix("°")
+        self.center_pitch = QDoubleSpinBox()
+        self.center_pitch.setRange(-89.0, 89.0)
+        self.center_pitch.setSuffix("°")
+        self.seam_feather = QDoubleSpinBox()
+        self.seam_feather.setRange(0.1, 30.0)
+        self.seam_feather.setDecimals(2)
+        self.seam_feather.setSuffix("°")
+        for label, widget in [
+            ("Width", self.canvas_width),
+            ("Height", self.canvas_height),
+            ("Horizontal FOV", self.h_fov),
+            ("Vertical FOV", self.v_fov),
+            ("Center yaw", self.center_yaw),
+            ("Center pitch", self.center_pitch),
+            ("Seam feather", self.seam_feather),
+        ]:
+            form.addRow(label, widget)
+        layout.addWidget(canvas)
+
+        flow = QGroupBox("PARALLAX REFINEMENT")
+        flow_form = QFormLayout(flow)
+        flow_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        flow_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.flow_enabled = QCheckBox("Enable DIS optical flow")
+        self.flow_preset = QComboBox()
+        self.flow_preset.addItems(["ultrafast", "fast", "medium"])
+        self.flow_max = QDoubleSpinBox()
+        self.flow_max.setRange(1.0, 256.0)
+        self.flow_max.setSuffix(" px")
+        flow_form.addRow(self.flow_enabled)
+        flow_form.addRow("Quality", self.flow_preset)
+        flow_form.addRow("Max displacement", self.flow_max)
+        layout.addWidget(flow)
+
+        analyze = QPushButton("ANALYZE COVERAGE / CROP")
+        analyze.clicked.connect(self.analyze_coverage)
+        layout.addWidget(analyze)
+        layout.addStretch()
+        return panel
+
+    def _color_settings(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        color = QGroupBox("COLOR PIPELINE")
+        form = QFormLayout(color)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.color_mode = QComboBox()
+        self.color_mode.addItem("Passthrough original code space", "passthrough")
+        self.color_mode.addItem("OCIO managed", "ocio")
+        self.color_mode.currentIndexChanged.connect(self._update_color_controls)
+        self.ocio_config = QLineEdit()
+        ocio_row = QWidget()
+        ocio_layout = QHBoxLayout(ocio_row)
+        ocio_layout.setContentsMargins(0, 0, 0, 0)
+        ocio_layout.addWidget(self.ocio_config)
+        ocio_button = QPushButton("…")
+        ocio_button.setFixedWidth(34)
+        ocio_button.clicked.connect(self.choose_ocio)
+        ocio_layout.addWidget(ocio_button)
+        self.input_space = QLineEdit()
+        self.working_space = QLineEdit()
+        self.output_space = QLineEdit()
+        self.integer_dither = QCheckBox("TPDF dither when writing integer masters")
+        form.addRow("Mode", self.color_mode)
+        form.addRow("OCIO config", ocio_row)
+        form.addRow("All camera inputs", self.input_space)
+        form.addRow("Working space", self.working_space)
+        form.addRow("Output space", self.output_space)
+        form.addRow(self.integer_dither)
+        layout.addWidget(color)
+        note = QLabel(
+            "OCIO 모드는 리샘플링 전에 모든 카메라를 scene-linear 작업공간으로 변환합니다. "
+            "ACEScg 출력은 EXR half-float를 선택하세요."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+        layout.addStretch()
+        return panel
+
+    def _output_settings(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        output = QGroupBox("MASTER OUTPUT")
+        form = QFormLayout(output)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.output_codec = QComboBox()
+        self.output_codec.addItem("FFV1 · 16-bit RGB lossless", "ffv1-16")
+        self.output_codec.addItem("OpenEXR · half-float sequence", "exr-half-sequence")
+        self.output_codec.addItem("BigTIFF · 16-bit RGB sequence", "tiff16-sequence")
+        self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
+        self.output_codec.addItem("ProRes HQ · 10-bit 4:2:2", "prores-hq")
+        self.output_codec.addItem("HEVC · 10-bit 4:4:4", "hevc-444-10")
+        self.output_codec.currentIndexChanged.connect(self._update_output_hint)
+        self.output_path = QLineEdit()
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.output_path)
+        path_button = QPushButton("…")
+        path_button.setFixedWidth(34)
+        path_button.clicked.connect(self.choose_output)
+        path_layout.addWidget(path_button)
+        self.fps = QDoubleSpinBox()
+        self.fps.setRange(1.0, 240.0)
+        self.fps.setDecimals(3)
+        self.frame_limit = QSpinBox()
+        self.frame_limit.setRange(0, 10_000_000)
+        self.frame_limit.setSpecialValueText("FULL CLIP")
+        form.addRow("Codec", self.output_codec)
+        form.addRow("Destination", path_row)
+        form.addRow("FPS", self.fps)
+        form.addRow("Frame limit", self.frame_limit)
+        layout.addWidget(output)
+        self.output_hint = QLabel()
+        self.output_hint.setWordWrap(True)
+        self.output_hint.setProperty("muted", True)
+        layout.addWidget(self.output_hint)
+        resources = QPushButton("ESTIMATE 20K RESOURCES")
+        resources.clicked.connect(self.estimate_resources)
+        layout.addWidget(resources)
+        layout.addStretch()
+        return panel
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget { background:#11161e; color:#dce4ee; font-family:'Malgun Gothic','Segoe UI'; font-size:12px; }
+            QToolBar { background:#171e28; border:0; border-bottom:1px solid #293241; spacing:3px; padding:7px; }
+            QToolButton { background:#202a37; border:1px solid #334155; border-radius:4px; padding:8px 12px; font-weight:600; }
+            QToolButton:hover { background:#2a394a; border-color:#38bdf8; }
+            QGroupBox { border:1px solid #2b3747; border-radius:6px; margin-top:12px; padding-top:12px; font-weight:600; color:#9fb3c8; }
+            QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 5px; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget { background:#0d1219; border:1px solid #303d4d; border-radius:4px; padding:5px; selection-background-color:#0ea5e9; }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#38bdf8; }
+            QPushButton { background:#243142; border:1px solid #36485e; border-radius:4px; padding:8px 10px; font-weight:600; }
+            QPushButton:hover { background:#2d4056; border-color:#38bdf8; }
+            QPushButton:disabled { color:#5b6775; background:#171d25; }
+            QHeaderView::section { background:#1b2430; color:#8fa5bb; border:0; border-right:1px solid #2b3747; padding:6px; font-weight:600; }
+            QTableWidget { alternate-background-color:#121a24; gridline-color:#253140; }
+            QTabBar::tab { background:#151c26; border:1px solid #2a3747; padding:9px 17px; }
+            QTabBar::tab:selected { color:#38bdf8; border-bottom:2px solid #38bdf8; }
+            QScrollArea { border:0; }
+            QProgressBar { border:1px solid #334155; border-radius:3px; background:#0d1219; text-align:center; }
+            QProgressBar::chunk { background:#0ea5e9; }
+            QLabel[muted='true'] { color:#718096; }
+            QLabel[sectionTitle='true'] { color:#e2e8f0; font-size:14px; font-weight:700; letter-spacing:2px; }
+            QStatusBar { background:#171e28; border-top:1px solid #293241; }
+            """
+        )
+
+    def load_config(self, path: Path) -> None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cameras = raw.get("cameras")
+            if not isinstance(cameras, list) or not cameras:
+                raise ValueError("config has no cameras")
+        except Exception as error:
+            self._error("Config error", str(error))
+            return
+        self.config_path = path
+        self.config_data = raw
+        self.source_table.set_rig(cameras)
+        output = raw.setdefault("output", {})
+        self.canvas_width.setValue(int(output.get("width", 15360)))
+        self.canvas_height.setValue(int(output.get("height", 3968)))
+        self.h_fov.setValue(float(output.get("horizontal_fov_deg", 180.0)))
+        self.v_fov.setValue(float(output.get("vertical_fov_deg", 52.0)))
+        self.center_yaw.setValue(float(output.get("center_yaw_deg", 0.0)))
+        self.center_pitch.setValue(float(output.get("center_pitch_deg", 0.0)))
+        self.seam_feather.setValue(float(output.get("seam_feather_deg", 4.0)))
+        flow = raw.setdefault("flow", {})
+        self.flow_enabled.setChecked(bool(flow.get("enabled", False)))
+        self.flow_preset.setCurrentText(str(flow.get("preset", "medium")))
+        self.flow_max.setValue(float(flow.get("max_displacement_px", 32.0)))
+        color = raw.setdefault("color", {})
+        mode = str(color.get("mode", "passthrough"))
+        self.color_mode.setCurrentIndex(max(0, self.color_mode.findData(mode)))
+        self.ocio_config.setText(str(color.get("ocio_config") or ""))
+        camera_space = next((str(camera.get("colorspace")) for camera in cameras if camera.get("colorspace")), "")
+        self.input_space.setText(camera_space)
+        self.working_space.setText(str(color.get("working_space") or ""))
+        self.output_space.setText(str(color.get("output_space") or ""))
+        self.integer_dither.setChecked(bool(color.get("integer_dither", True)))
+        video = raw.setdefault("video", {"fps": 29.97})
+        codec = str(video.get("output_codec", "ffv1-16"))
+        self.output_codec.setCurrentIndex(max(0, self.output_codec.findData(codec)))
+        self.fps.setValue(float(video.get("fps", 29.97)))
+        self.frame_limit.setValue(int(video.get("frames") or 0))
+        self.settings.setValue("lastConfig", str(path))
+        self.setWindowTitle(f"{APP_NAME}  —  {path.name}")
+        self._update_color_controls()
+        self._update_output_hint()
+        self._append_log(f"Loaded config: {path}")
+
+    def _collect_config(self) -> dict[str, object]:
+        if not self.config_data:
+            raise ValueError("Load a rig config first")
+        raw = json.loads(json.dumps(self.config_data))
+        cameras = raw["cameras"]
+        self.source_table.apply_to_cameras(cameras)
+        output = raw.setdefault("output", {})
+        output.update(
+            {
+                "width": self.canvas_width.value(),
+                "height": self.canvas_height.value(),
+                "horizontal_fov_deg": self.h_fov.value(),
+                "vertical_fov_deg": self.v_fov.value(),
+                "center_yaw_deg": self.center_yaw.value(),
+                "center_pitch_deg": self.center_pitch.value(),
+                "seam_feather_deg": self.seam_feather.value(),
+            }
+        )
+        flow = raw.setdefault("flow", {})
+        flow.update(
+            {
+                "enabled": self.flow_enabled.isChecked(),
+                "algorithm": "dis",
+                "preset": self.flow_preset.currentText(),
+                "max_displacement_px": self.flow_max.value(),
+            }
+        )
+        mode = str(self.color_mode.currentData())
+        if mode == "passthrough":
+            raw["color"] = {
+                "mode": "passthrough",
+                "integer_dither": self.integer_dither.isChecked(),
+                "dither_seed": int(raw.get("color", {}).get("dither_seed", 7349)),
+            }
+            for camera in cameras:
+                camera.pop("colorspace", None)
+        else:
+            required = [self.ocio_config.text(), self.input_space.text(), self.working_space.text(), self.output_space.text()]
+            if not all(value.strip() for value in required):
+                raise ValueError("OCIO config and all three colorspace fields are required")
+            raw["color"] = {
+                "mode": "ocio",
+                "ocio_config": self.ocio_config.text().strip(),
+                "working_space": self.working_space.text().strip(),
+                "output_space": self.output_space.text().strip(),
+                "integer_dither": self.integer_dither.isChecked(),
+                "dither_seed": int(raw.get("color", {}).get("dither_seed", 7349)),
+            }
+            for camera in cameras:
+                camera["colorspace"] = self.input_space.text().strip()
+        video = raw.setdefault("video", {})
+        video.update(
+            {
+                "fps": self.fps.value(),
+                "frames": self.frame_limit.value() or None,
+                "output_codec": str(self.output_codec.currentData()),
+            }
+        )
+        return raw
+
+    def _write_working_config(self) -> Path:
+        raw = self._collect_config()
+        path = self._working_dir / "working-config.json"
+        path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        return path
+
+    def choose_config(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open rig config", str(self.project_root), "JSON (*.json)")
+        if path:
+            self.load_config(Path(path))
+
+    def save_as(self) -> None:
+        try:
+            raw = self._collect_config()
+        except Exception as error:
+            self._error("Cannot save", str(error))
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save rig config",
+            str(self.config_path or self.project_root / "configs" / "rig.json"),
+            "JSON (*.json)",
+        )
+        if path:
+            destination = Path(path)
+            destination.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            self.config_data = raw
+            self.config_path = destination
+            self.settings.setValue("lastConfig", str(destination))
+            self._append_log(f"Saved config: {destination}")
+
+    def choose_videos(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "Select camera videos left to right", str(self.project_root), VIDEO_FILTER)
+        if files:
+            if len(files) != self.source_table.rowCount():
+                self._error("Need five videos", f"Expected {self.source_table.rowCount()} files, selected {len(files)}")
+                return
+            self.source_table.set_paths(files)
+
+    def choose_ocio(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open OCIO config", str(self.project_root), "OCIO config (*.ocio);;All files (*.*)")
+        if path:
+            self.ocio_config.setText(path)
+
+    def choose_output(self) -> None:
+        codec = str(self.output_codec.currentData())
+        if codec.endswith("sequence"):
+            path = QFileDialog.getExistingDirectory(self, "Select empty output directory", str(self.project_root))
+        else:
+            suffix = ".mov" if codec.startswith("prores") else ".mkv"
+            path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self.project_root / f"stitched{suffix}"), "All files (*.*)")
+        if path:
+            self.output_path.setText(path)
+
+    def _validate_sources(self) -> list[str]:
+        paths = self.source_table.paths()
+        if len(paths) != 5 or any(not path for path in paths):
+            raise ValueError("Select all five camera videos")
+        missing = [path for path in paths if not Path(path).is_file()]
+        if missing:
+            raise ValueError("Missing video: " + missing[0])
+        return paths
+
+    def check_inputs(self) -> None:
+        try:
+            config = self._write_working_config()
+            sources = self._validate_sources()
+        except Exception as error:
+            self._error("Input check", str(error))
+            return
+        self._run_cli("CHECK INPUTS", ["probe-inputs", "--config", str(config), *sources])
+
+    def create_preview(self) -> None:
+        try:
+            config = self._write_working_config()
+            sources = self._validate_sources()
+        except Exception as error:
+            self._error("Preview", str(error))
+            return
+        stamp = f"{time.time_ns()}-{os.getpid()}"
+        reference = self._working_dir / f"reference-{stamp}"
+        self._last_reference_dir = reference
+        self.preview.show_message("EXTRACTING SYNCHRONIZED REFERENCE FRAMES …")
+
+        def stitch_reference() -> None:
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            names = [camera["name"] for camera in raw["cameras"]]
+            images = [str(reference / f"{name}.tif") for name in names]
+            width, height = preview_dimensions(self.canvas_width.value(), self.canvas_height.value())
+            preview_path = reference / "stitched-preview.tif"
+
+            def load_preview() -> None:
+                try:
+                    self.preview.set_array(tifffile.imread(preview_path))
+                    self.statusBar().showMessage(f"Preview ready: {width}×{height} (display only)", 10000)
+                except Exception as error:
+                    self._error("Preview load", str(error))
+
+            self.preview.show_message("STITCHING 16-BIT PREVIEW …")
+            self._run_cli(
+                "STITCH PREVIEW",
+                [
+                    "stitch-frame",
+                    "--config",
+                    str(config),
+                    "--output",
+                    str(preview_path),
+                    "--canvas",
+                    f"{width}x{height}",
+                    *images,
+                ],
+                load_preview,
+            )
+
+        self._run_cli(
+            "EXTRACT REFERENCES",
+            [
+                "extract-reference",
+                "--config",
+                str(config),
+                "--time",
+                str(self.preview_time.value()),
+                "--output-dir",
+                str(reference),
+                *sources,
+            ],
+            stitch_reference,
+        )
+
+    def auto_align(self) -> None:
+        if self._last_reference_dir is None:
+            self._error("Auto align", "Create a preview/reference frame first")
+            return
+        try:
+            config = self._write_working_config()
+            raw = json.loads(config.read_text(encoding="utf-8"))
+            images = [str(self._last_reference_dir / f"{camera['name']}.tif") for camera in raw["cameras"]]
+            if any(not Path(path).is_file() for path in images):
+                raise ValueError("Reference frames are missing; create preview again")
+        except Exception as error:
+            self._error("Auto align", str(error))
+            return
+        output = self._working_dir / "calibrated-rig.json"
+        report = self._working_dir / "alignment-report.json"
+
+        def load_alignment() -> None:
+            current_paths = self.source_table.paths()
+            self.load_config(output)
+            self.source_table.set_paths(current_paths)
+            self.statusBar().showMessage("Auto alignment applied — inspect preview, then Save As", 15000)
+
+        self._run_cli(
+            "AUTO ALIGN",
+            [
+                "calibrate-rig",
+                "--config",
+                str(config),
+                "--output",
+                str(output),
+                "--report",
+                str(report),
+                *images,
+            ],
+            load_alignment,
+        )
+
+    def analyze_coverage(self) -> None:
+        try:
+            config = self._write_working_config()
+        except Exception as error:
+            self._error("Coverage", str(error))
+            return
+        mask = self._working_dir / "coverage.png"
+        self._run_cli(
+            "ANALYZE COVERAGE",
+            ["analyze-canvas", "--config", str(config), "--mask", str(mask)],
+        )
+
+    def estimate_resources(self) -> None:
+        try:
+            config = self._write_working_config()
+        except Exception as error:
+            self._error("Resources", str(error))
+            return
+        self._run_cli("ESTIMATE RESOURCES", ["estimate-resources", "--config", str(config)])
+
+    def render(self) -> None:
+        try:
+            config = self._write_working_config()
+            sources = self._validate_sources()
+            output = self.output_path.text().strip()
+            if not output:
+                raise ValueError("Choose a render destination")
+            codec = str(self.output_codec.currentData())
+            if codec.endswith("sequence") and Path(output).exists() and any(Path(output).iterdir()):
+                raise ValueError("Sequence output directory must be empty")
+        except Exception as error:
+            self._error("Render", str(error))
+            return
+        message = (
+            f"Start {self.canvas_width.value()}×{self.canvas_height.value()} render?\n\n"
+            f"Codec: {self.output_codec.currentText()}\nOutput: {output}"
+        )
+        if QMessageBox.question(self, "Start render", message) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_cli(
+            "FINAL RENDER",
+            [
+                "stitch-video",
+                "--config",
+                str(config),
+                "--output",
+                output,
+                "--map-cache",
+                str(self.project_root / ".vpstitch-cache"),
+                *sources,
+            ],
+            lambda: QMessageBox.information(self, "Render complete", f"Output written to:\n{output}"),
+        )
+
+    def _run_cli(self, task: str, arguments: list[str], success: Callable[[], None] | None = None) -> None:
+        if self.process is not None:
+            self._error("Busy", "Another task is already running")
+            return
+        self._process_success = success
+        self._process_output = ""
+        self.process = QProcess(self)
+        self.process.setWorkingDirectory(str(self.project_root))
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._read_process)
+        self.process.finished.connect(self._process_finished)
+        self.task_label.setText(task)
+        self.progress.setRange(0, 0)
+        self._append_log("\n▶ " + task)
+        self._append_log("  vpstitch " + " ".join(f'"{arg}"' if " " in arg else arg for arg in arguments))
+        self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
+
+    def _read_process(self) -> None:
+        if self.process is None:
+            return
+        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        self._process_output += text
+        normalized = text.replace("\r", "\n")
+        for line in normalized.splitlines():
+            if line.strip():
+                self._append_log(line)
+            match = re.search(r"tiles\s+(\d+)/(\d+)", line)
+            if match:
+                done, total = int(match.group(1)), int(match.group(2))
+                self.progress.setRange(0, total)
+                self.progress.setValue(done)
+            frame = re.search(r"frame\s+(\d+)", line)
+            if frame:
+                self.task_label.setText(f"FRAME {frame.group(1)}")
+
+    def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
+        callback = self._process_success
+        process = self.process
+        task = self.task_label.text()
+        self.process = None
+        self._process_success = None
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100 if exit_code == 0 else 0)
+        self.task_label.setText("IDLE" if exit_code == 0 else "FAILED")
+        if process is not None:
+            process.deleteLater()
+        if exit_code == 0:
+            self._append_log(f"✓ {task} complete")
+            if callback:
+                callback()
+        else:
+            self._append_log(f"✕ {task} failed with exit code {exit_code}")
+            self.statusBar().showMessage("Task failed — see Task Log", 10000)
+
+    def cancel_task(self) -> None:
+        if self.process is not None:
+            self._append_log("Cancelling task …")
+            self.process.kill()
+
+    def _append_log(self, text: str) -> None:
+        self.log.appendPlainText(text)
+        scrollbar = self.log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _update_color_controls(self) -> None:
+        enabled = self.color_mode.currentData() == "ocio"
+        for widget in (self.ocio_config, self.input_space, self.working_space, self.output_space):
+            widget.setEnabled(enabled)
+
+    def _update_output_hint(self) -> None:
+        codec = str(self.output_codec.currentData())
+        hints = {
+            "ffv1-16": "권장 장편 마스터: 무손실 16-bit RGB MKV. 파일 크기는 영상 내용에 따라 달라집니다.",
+            "exr-half-sequence": "OCIO scene-linear 권장: 음수와 1 초과 값을 보존합니다. 출력 폴더가 필요합니다.",
+            "tiff16-sequence": "정수 RGB 품질 기준용. 20K/29.97fps는 무압축 기준 분당 약 1.18TiB입니다.",
+            "prores-4444": "편집 호환용 10-bit YUV. 16-bit RGB 보존 마스터는 아닙니다.",
+            "prores-hq": "편집용 10-bit 4:2:2. 크로마 해상도가 줄어듭니다.",
+            "hevc-444-10": "납품/검수용. 15K 이상의 표준 HEVC picture level 한계에 주의하십시오.",
+        }
+        self.output_hint.setText(hints.get(codec, ""))
+
+    def _error(self, title: str, message: str) -> None:
+        self._append_log(f"ERROR: {message}")
+        QMessageBox.critical(self, title, message)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        configs = [path for path in paths if Path(path).suffix.lower() == ".json"]
+        videos = [path for path in paths if Path(path).suffix.lower() in {".mov", ".mp4", ".mkv", ".avi", ".mxf"}]
+        if len(configs) == 1:
+            self.load_config(Path(configs[0]))
+        if videos:
+            if len(videos) == self.source_table.rowCount():
+                self.source_table.set_paths(videos)
+            else:
+                self._error("Drop videos", f"Drop exactly {self.source_table.rowCount()} videos at once")
+        event.acceptProposedAction()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.process is not None:
+            answer = QMessageBox.question(self, "Task running", "Cancel the running task and close?")
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.process.kill()
+            self.process.waitForFinished(3000)
+        event.accept()
+
+
+def main() -> int:
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setApplicationName(APP_NAME)
+        app.setOrganizationName("VP-LAB")
+        window = MainWindow()
+        window.show()
+        return app.exec()
+    except Exception:
+        traceback.print_exc()
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
