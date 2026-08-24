@@ -11,7 +11,7 @@ from typing import Callable
 
 import numpy as np
 import tifffile
-from PySide6.QtCore import QProcess, QSettings, Qt
+from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -53,6 +53,18 @@ from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
 APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
+
+
+def _runtime_root() -> Path:
+    """Return the directory that contains bundled read-only resources."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent.parent / "Resources"))
+    return Path(__file__).resolve().parent.parent
+
+
+def _user_data_root() -> Path:
+    location = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+    return Path(location) if location else Path.home() / "Library" / "Application Support" / "VP-LAB" / APP_NAME
 
 
 def preview_dimensions(width: int, height: int, max_width: int = 2048, max_height: int = 900) -> tuple[int, int]:
@@ -178,15 +190,22 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1280, 760)
         self.setAcceptDrops(True)
         self.settings = QSettings("VP-LAB", APP_NAME)
-        self.project_root = Path.cwd()
+        self.runtime_root = _runtime_root()
+        self.project_root = self.runtime_root if getattr(sys, "frozen", False) else Path.cwd()
+        self.user_data_root = _user_data_root() if getattr(sys, "frozen", False) else self.project_root / ".vpstitch-ui"
+        self.user_data_root.mkdir(parents=True, exist_ok=True)
         self.config_path: Path | None = None
         self.config_data: dict[str, object] = {}
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_output = ""
         self._last_reference_dir: Path | None = None
-        self._working_dir = self.project_root / ".vpstitch-ui"
+        self._working_dir = self.user_data_root / "work"
+        self._cache_dir = self.user_data_root / "cache"
+        self._output_root = self.user_data_root / "renders"
         self._working_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._output_root.mkdir(parents=True, exist_ok=True)
         self._build_ui()
         self._apply_style()
         initial = Path(str(self.settings.value("lastConfig", "")))
@@ -196,12 +215,13 @@ class MainWindow(QMainWindow):
             initial = self.project_root / "configs" / "five_cam_180.sample.json"
         if initial.is_file():
             self.load_config(initial)
-        self.statusBar().showMessage("Ready — preview display is 8-bit; final render remains high bit depth")
+        self.statusBar().showMessage("Ready · preview is display-only; final render stays high bit depth")
 
     def _build_ui(self) -> None:
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.setObjectName("mainToolbar")
         self.addToolBar(toolbar)
         actions = [
             ("OPEN CONFIG", self.choose_config),
@@ -216,17 +236,54 @@ class MainWindow(QMainWindow):
             action = QAction(text, self)
             action.triggered.connect(callback)
             toolbar.addAction(action)
+            tool_button = toolbar.widgetForAction(action)
+            if tool_button is not None:
+                tool_button.setObjectName(
+                    {
+                        "RENDER": "renderAction",
+                        "CANCEL": "cancelAction",
+                        "PREVIEW": "previewAction",
+                    }.get(text, "toolbarAction")
+                )
             if text in {"SAVE AS", "AUTO ALIGN"}:
                 toolbar.addSeparator()
 
+        header = QFrame()
+        header.setObjectName("appHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 14, 18, 14)
+        header_layout.setSpacing(12)
+        mark = QLabel("VP")
+        mark.setObjectName("brandMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(44, 44)
+        header_layout.addWidget(mark)
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(1)
+        app_title = QLabel("VP Stitch")
+        app_title.setObjectName("appTitle")
+        app_subtitle = QLabel("5-camera 180° panorama workstation")
+        app_subtitle.setObjectName("appSubtitle")
+        title_stack.addWidget(app_title)
+        title_stack.addWidget(app_subtitle)
+        header_layout.addLayout(title_stack)
+        header_layout.addStretch()
+        self.status_pill = QLabel("READY")
+        self.status_pill.setObjectName("statusPill")
+        self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(self.status_pill)
+
         self.source_table = SourceTable()
         source_group = QGroupBox("SOURCES  /  LEFT → RIGHT")
+        source_group.setObjectName("card")
         source_layout = QVBoxLayout(source_group)
         source_layout.addWidget(self.source_table)
         source_buttons = QHBoxLayout()
         choose = QPushButton("SELECT 5 VIDEOS")
+        choose.setObjectName("primaryButton")
         choose.clicked.connect(self.choose_videos)
         clear = QPushButton("CLEAR")
+        clear.setObjectName("secondaryButton")
         clear.clicked.connect(lambda: self.source_table.set_paths([""] * 5))
         source_buttons.addWidget(choose)
         source_buttons.addWidget(clear)
@@ -238,6 +295,7 @@ class MainWindow(QMainWindow):
 
         self.preview = PreviewView()
         preview_box = QWidget()
+        preview_box.setObjectName("previewPanel")
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_header = QHBoxLayout()
@@ -260,6 +318,7 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(preview_note)
 
         settings_scroll = QScrollArea()
+        settings_scroll.setObjectName("settingsPanel")
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setMinimumWidth(440)
         settings_scroll.setMaximumWidth(540)
@@ -282,11 +341,18 @@ class MainWindow(QMainWindow):
         self.log.setMinimumHeight(155)
         self.log.setFont(QFont("Cascadia Mono", 9))
         log_box = QGroupBox("TASK LOG")
+        log_box.setObjectName("logCard")
         log_layout = QVBoxLayout(log_box)
         log_layout.addWidget(self.log)
 
         central = QSplitter(Qt.Orientation.Vertical)
-        central.addWidget(upper)
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(14, 14, 14, 8)
+        workspace_layout.setSpacing(12)
+        workspace_layout.addWidget(header)
+        workspace_layout.addWidget(upper, 1)
+        central.addWidget(workspace)
         central.addWidget(log_box)
         central.setSizes([790, 190])
         self.setCentralWidget(central)
@@ -358,6 +424,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(flow)
 
         analyze = QPushButton("ANALYZE COVERAGE / CROP")
+        analyze.setObjectName("secondaryButton")
         analyze.clicked.connect(self.analyze_coverage)
         layout.addWidget(analyze)
         layout.addStretch()
@@ -380,10 +447,12 @@ class MainWindow(QMainWindow):
         ocio_layout.setContentsMargins(0, 0, 0, 0)
         ocio_layout.addWidget(self.ocio_config)
         ocio_button = QPushButton("…")
+        ocio_button.setObjectName("iconButton")
         ocio_button.setFixedWidth(34)
         ocio_button.clicked.connect(self.choose_ocio)
         ocio_layout.addWidget(ocio_button)
         aces_button = QPushButton("USE BUILT-IN ACES 2.0 / REC.709")
+        aces_button.setObjectName("secondaryButton")
         aces_button.clicked.connect(self.apply_aces_preset)
         self.input_space = QLineEdit()
         self.working_space = QLineEdit()
@@ -430,6 +499,7 @@ class MainWindow(QMainWindow):
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.addWidget(self.output_path)
         path_button = QPushButton("…")
+        path_button.setObjectName("iconButton")
         path_button.setFixedWidth(34)
         path_button.clicked.connect(self.choose_output)
         path_layout.addWidget(path_button)
@@ -449,6 +519,7 @@ class MainWindow(QMainWindow):
         self.output_hint.setProperty("muted", True)
         layout.addWidget(self.output_hint)
         resources = QPushButton("ESTIMATE 20K RESOURCES")
+        resources.setObjectName("secondaryButton")
         resources.clicked.connect(self.estimate_resources)
         layout.addWidget(resources)
         layout.addStretch()
@@ -457,27 +528,43 @@ class MainWindow(QMainWindow):
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background:#11161e; color:#dce4ee; font-family:'-apple-system','SF Pro Display','Malgun Gothic','Segoe UI'; font-size:12px; }
-            QToolBar { background:#171e28; border:0; border-bottom:1px solid #293241; spacing:3px; padding:7px; }
-            QToolButton { background:#202a37; border:1px solid #334155; border-radius:4px; padding:8px 12px; font-weight:600; }
-            QToolButton:hover { background:#2a394a; border-color:#38bdf8; }
-            QGroupBox { border:1px solid #2b3747; border-radius:6px; margin-top:12px; padding-top:12px; font-weight:600; color:#9fb3c8; }
-            QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 5px; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget { background:#0d1219; border:1px solid #303d4d; border-radius:4px; padding:5px; selection-background-color:#0ea5e9; }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#38bdf8; }
-            QPushButton { background:#243142; border:1px solid #36485e; border-radius:4px; padding:8px 10px; font-weight:600; }
-            QPushButton:hover { background:#2d4056; border-color:#38bdf8; }
-            QPushButton:disabled { color:#5b6775; background:#171d25; }
-            QHeaderView::section { background:#1b2430; color:#8fa5bb; border:0; border-right:1px solid #2b3747; padding:6px; font-weight:600; }
-            QTableWidget { alternate-background-color:#121a24; gridline-color:#253140; }
-            QTabBar::tab { background:#151c26; border:1px solid #2a3747; padding:9px 17px; }
-            QTabBar::tab:selected { color:#38bdf8; border-bottom:2px solid #38bdf8; }
-            QScrollArea { border:0; }
-            QProgressBar { border:1px solid #334155; border-radius:3px; background:#0d1219; text-align:center; }
-            QProgressBar::chunk { background:#0ea5e9; }
-            QLabel[muted='true'] { color:#718096; }
-            QLabel[sectionTitle='true'] { color:#e2e8f0; font-size:14px; font-weight:700; letter-spacing:2px; }
-            QStatusBar { background:#171e28; border-top:1px solid #293241; }
+            QMainWindow, QWidget { background:#0b1020; color:#e8edf7; font-family:'-apple-system','SF Pro Display','Malgun Gothic','Segoe UI'; font-size:12px; }
+            QToolBar#mainToolbar { background:#11182b; border:0; border-bottom:1px solid #202d4a; spacing:5px; padding:9px 14px; }
+            QToolButton { background:#18233a; color:#b9c6dc; border:1px solid #2b3a5b; border-radius:8px; padding:9px 13px; font-weight:600; }
+            QToolButton:hover { background:#223354; border-color:#7184ff; color:#ffffff; }
+            QToolButton#previewAction { background:#1d2d52; color:#dbe4ff; }
+            QToolButton#renderAction { background:#7657f6; color:#ffffff; border-color:#927aff; }
+            QToolButton#renderAction:hover { background:#876cfb; }
+            QToolButton#cancelAction { background:#291c32; color:#f5b7d1; border-color:#653957; }
+            QFrame#appHeader { background:#111a30; border:1px solid #26375b; border-radius:16px; }
+            QLabel#brandMark { background:#7657f6; color:white; border-radius:12px; font-size:18px; font-weight:800; }
+            QLabel#appTitle { color:#f8faff; font-size:19px; font-weight:750; }
+            QLabel#appSubtitle { color:#8797b7; font-size:11px; }
+            QLabel#statusPill { background:#15342f; color:#77e4bd; border:1px solid #286a5d; border-radius:10px; padding:6px 12px; font-size:10px; font-weight:800; letter-spacing:1px; }
+            QGroupBox { background:#111a30; border:1px solid #26375b; border-radius:14px; margin-top:14px; padding:17px 13px 13px; font-weight:700; color:#aebddd; }
+            QGroupBox::title { subcontrol-origin:margin; left:14px; padding:0 7px; color:#9eadd0; }
+            QFrame#previewPanel { background:#0e1629; border:1px solid #26375b; border-radius:14px; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget { background:#0a1121; border:1px solid #293a5f; border-radius:8px; padding:7px; selection-background-color:#5d4ae8; selection-color:#ffffff; }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#8875ff; }
+            QPushButton { background:#1b2944; color:#dbe4f4; border:1px solid #304568; border-radius:8px; padding:9px 11px; font-weight:700; }
+            QPushButton:hover { background:#263a60; border-color:#8392ff; }
+            QPushButton#primaryButton { background:#7657f6; color:#ffffff; border-color:#927aff; }
+            QPushButton#primaryButton:hover { background:#876cfb; }
+            QPushButton#secondaryButton { background:#17253f; color:#bac9e5; }
+            QPushButton#iconButton { padding:5px 9px; min-width:28px; }
+            QPushButton:disabled { color:#5d6b84; background:#111a2a; border-color:#1e2b45; }
+            QHeaderView::section { background:#17243d; color:#91a4c9; border:0; border-right:1px solid #26375b; padding:8px 6px; font-weight:700; }
+            QTableWidget { alternate-background-color:#101b31; gridline-color:#1d2c4c; }
+            QTableWidget::item:selected { background:#3e397c; color:#ffffff; }
+            QTabWidget::pane { border:0; }
+            QTabBar::tab { background:#111a30; color:#7183a7; border:0; border-bottom:2px solid transparent; padding:10px 15px; font-weight:700; }
+            QTabBar::tab:selected { color:#e7eaff; border-bottom:2px solid #8875ff; }
+            QScrollArea { border:0; background:transparent; }
+            QProgressBar { border:1px solid #293a5f; border-radius:6px; background:#0a1121; text-align:center; color:#cbd7ed; }
+            QProgressBar::chunk { background:#7657f6; border-radius:5px; }
+            QLabel[muted='true'] { color:#7183a7; }
+            QLabel[sectionTitle='true'] { color:#eef0ff; font-size:14px; font-weight:800; letter-spacing:1px; }
+            QStatusBar { background:#11182b; border-top:1px solid #202d4a; color:#8797b7; }
             """
         )
 
@@ -641,10 +728,10 @@ class MainWindow(QMainWindow):
     def choose_output(self) -> None:
         codec = str(self.output_codec.currentData())
         if codec.endswith("sequence"):
-            path = QFileDialog.getExistingDirectory(self, "Select empty output directory", str(self.project_root))
+            path = QFileDialog.getExistingDirectory(self, "Select empty output directory", str(self._output_root))
         else:
             suffix = ".mov" if codec.startswith("prores") else ".mp4" if codec == "h264-mp4-10" else ".mkv"
-            path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self.project_root / f"stitched{suffix}"), "All files (*.*)")
+            path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self._output_root / f"stitched{suffix}"), "All files (*.*)")
         if path:
             self.output_path.setText(path)
 
@@ -808,7 +895,7 @@ class MainWindow(QMainWindow):
                 "--output",
                 output,
                 "--map-cache",
-                str(self.project_root / ".vpstitch-cache"),
+                str(self._cache_dir),
                 *sources,
             ],
             lambda: QMessageBox.information(self, "Render complete", f"Output written to:\n{output}"),
@@ -821,15 +908,24 @@ class MainWindow(QMainWindow):
         self._process_success = success
         self._process_output = ""
         self.process = QProcess(self)
-        self.process.setWorkingDirectory(str(self.project_root))
+        self.process.setWorkingDirectory(str(self._working_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_process)
         self.process.finished.connect(self._process_finished)
         self.task_label.setText(task)
+        self.status_pill.setText(task)
         self.progress.setRange(0, 0)
         self._append_log("\n▶ " + task)
         self._append_log("  vpstitch " + " ".join(f'"{arg}"' if " " in arg else arg for arg in arguments))
-        self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
+        if getattr(sys, "frozen", False):
+            cli_program = Path(sys.executable).with_name("vpstitch-cli")
+            if not cli_program.is_file():
+                self.process = None
+                self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
+                return
+            self.process.start(str(cli_program), arguments)
+        else:
+            self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
 
     def _read_process(self) -> None:
         if self.process is None:
@@ -858,6 +954,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if exit_code == 0 else 0)
         self.task_label.setText("IDLE" if exit_code == 0 else "FAILED")
+        self.status_pill.setText("READY" if exit_code == 0 else "FAILED")
         if process is not None:
             process.deleteLater()
         if exit_code == 0:
@@ -871,6 +968,7 @@ class MainWindow(QMainWindow):
     def cancel_task(self) -> None:
         if self.process is not None:
             self._append_log("Cancelling task …")
+            self.status_pill.setText("CANCELLING")
             self.process.kill()
 
     def _append_log(self, text: str) -> None:

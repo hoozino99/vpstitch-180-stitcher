@@ -104,6 +104,28 @@ macOS에서 Finder로 `.command` 파일을 처음 실행할 때 보안 확인이
 Control-click하여 열기를 선택합니다. 터미널에서 직접 실행할 경우에는 별도 권한
 설정 없이 `.venv/bin/vpstitch-gui`를 실행하면 됩니다.
 
+### 다운로드해서 바로 실행하는 macOS 앱
+
+GitHub의 **Actions → macOS app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면
+Apple Silicon과 Intel Mac용 `.dmg` 및 `.zip`이 생성됩니다. 압축을 풀고
+`VP Stitch.app`을 Applications 폴더로 드래그한 뒤 더블클릭하면 됩니다.
+처음 실행할 때 macOS가 개발자를 확인할 수 없다고 표시하면 앱을
+Control-click하여 **열기**를 선택하거나, 시스템 설정의 **개인정보 보호 및
+보안**에서 실행을 허용하십시오.
+
+앱은 기본 설정·임시 프레임·projection cache를 다음 사용자 폴더에 저장합니다.
+
+```text
+~/Library/Application Support/VP-LAB/VP Stitch/
+```
+
+앱을 실행할 때 Python, FFmpeg, OpenColorIO를 따로 설치할 필요는 없습니다. 앱에
+렌더 CLI와 `imageio-ffmpeg` 실행 파일이 함께 포함됩니다.
+
+macOS/Linux에서 CLI를 직접 사용할 때는 Windows 예시의
+`.venv\\Scripts\\vpstitch.exe`를 `.venv/bin/vpstitch`로 바꾸고, 줄 연결은
+PowerShell의 백틱(`) 대신 역슬래시(`\\`)를 사용하십시오.
+
 ## 정지 프레임 테스트
 
 입력은 카메라 순서대로 16-bit RGB TIFF 또는 half/float EXR을 사용합니다.
