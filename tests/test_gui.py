@@ -78,6 +78,23 @@ def test_gui_loads_sample_rig() -> None:
     app.processEvents()
 
 
+def test_gui_full_plate_fit_updates_manual_canvas_controls() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_config(Path("configs/five_cam_180.sample.json"))
+    old_horizontal_fov = window.h_fov.value()
+
+    window.fit_full_plates()
+
+    assert window.h_fov.value() > old_horizontal_fov
+    assert window.canvas_width.value() <= 20_000
+    assert window.canvas_height.value() <= 6_000
+    assert "FULL PLATES" in window.canvas_ratio.text()
+    assert window._preview_ready is False
+    window.close()
+    app.processEvents()
+
+
 def test_gui_master_outputs_are_limited_to_10_or_12_bit() -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
@@ -310,15 +327,18 @@ def test_gui_preview_config_scales_sources_and_lens_to_fitted_4k(tmp_path: Path)
     window = MainWindow()
     source = Path("configs/drive_5cam_180.prores-hq.json")
     destination = tmp_path / "preview-config.json"
-    scale = window._write_preview_config(source, destination, 3840, 992)
+    preview_width, preview_height = preview_dimensions(20_000, 5_504)
+    scale = window._write_preview_config(
+        source, destination, preview_width, preview_height
+    )
     preview = json.loads(destination.read_text(encoding="utf-8"))
-    assert scale == pytest.approx(0.25)
-    assert preview["output"]["width"] == 3840
-    assert preview["output"]["height"] == 992
-    assert preview["cameras"][0]["width"] == 1488
-    assert preview["cameras"][0]["height"] == 992
-    assert preview["cameras"][0]["lens"]["fx"] == pytest.approx(930.0)
-    assert load_config(destination).cameras[0].width == 1488
+    assert scale == pytest.approx(preview_width / 20_000)
+    assert preview["output"]["width"] == preview_width
+    assert preview["output"]["height"] == preview_height
+    assert preview["cameras"][0]["width"] == round(5952 * scale)
+    assert preview["cameras"][0]["height"] == round(3968 * scale)
+    assert preview["cameras"][0]["lens"]["fx"] == pytest.approx(3720 * scale)
+    assert load_config(destination).cameras[0].width == round(5952 * scale)
     window.close()
     app.processEvents()
 

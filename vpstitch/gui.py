@@ -61,7 +61,8 @@ from PySide6.QtWidgets import (
 
 from .imageio import read_image
 
-from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
+from .canvas import recommend_full_plate_canvas
+from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH, load_config as parse_config
 
 
 APP_NAME = "VP Stitch"
@@ -735,6 +736,7 @@ class MainWindow(QMainWindow):
         self._source_probes: list[dict[str, object]] | None = None
         self._source_overrides: dict[str, dict[str, str | None]] = {}
         self._closing = False
+        self._loading_config = False
         self._import_dialog: QFileDialog | None = None
         self._message_box: QMessageBox | None = None
         self._pending_log_lines: list[str] = []
@@ -848,7 +850,7 @@ class MainWindow(QMainWindow):
         preview_header = QHBoxLayout()
         title = QLabel("PANORAMA PREVIEW")
         title.setProperty("sectionTitle", True)
-        preview_limit = QLabel("UHD 4K MAX  ·  FIT / NO CROP")
+        preview_limit = QLabel("UHD 4K MAX  ·  FULL CANVAS")
         preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
         preview_header.addStretch()
@@ -1164,15 +1166,23 @@ class MainWindow(QMainWindow):
         self.canvas_width = QSpinBox()
         self.canvas_width.setRange(32, MAX_CANVAS_WIDTH)
         self.canvas_width.setSingleStep(256)
+        self.canvas_width.setToolTip(
+            "Manual master canvas width; Preview uses the same ratio"
+        )
         self.canvas_height = QSpinBox()
         self.canvas_height.setRange(32, MAX_CANVAS_HEIGHT)
         self.canvas_height.setSingleStep(128)
+        self.canvas_height.setToolTip(
+            "Manual master canvas height; Preview uses the same ratio"
+        )
         self.h_fov = QDoubleSpinBox()
         self.h_fov.setRange(1.0, 360.0)
         self.h_fov.setSuffix("°")
         self.v_fov = QDoubleSpinBox()
         self.v_fov.setRange(1.0, 179.0)
         self.v_fov.setSuffix("°")
+        self.h_fov.setToolTip("Manual horizontal field of view for Preview and Render")
+        self.v_fov.setToolTip("Manual vertical field of view for Preview and Render")
         self.center_yaw = QDoubleSpinBox()
         self.center_yaw.setRange(-180.0, 180.0)
         self.center_yaw.setSuffix("°")
@@ -1193,6 +1203,16 @@ class MainWindow(QMainWindow):
             ("Seam feather", self.seam_feather),
         ]:
             form.addRow(label, widget)
+        self.canvas_ratio = QLabel()
+        self.canvas_ratio.setProperty("muted", True)
+        form.addRow("Ratio", self.canvas_ratio)
+        for widget in (
+            self.canvas_width,
+            self.canvas_height,
+            self.h_fov,
+            self.v_fov,
+        ):
+            widget.valueChanged.connect(self._canvas_controls_changed)
         layout.addWidget(canvas)
 
         flow = QGroupBox("PARALLAX REFINEMENT")
@@ -1213,8 +1233,18 @@ class MainWindow(QMainWindow):
         flow_form.addRow("Max displacement", self.flow_max)
         layout.addWidget(flow)
 
-        analyze = QPushButton("ANALYZE COVERAGE / CROP")
+        fit_full = QPushButton("FIT FULL PLATES")
+        fit_full.setObjectName("primaryButton")
+        fit_full.setToolTip(
+            "Fit the complete warped plate boundaries with a 3% safety margin"
+        )
+        fit_full.clicked.connect(self.fit_full_plates)
+        layout.addWidget(fit_full)
+        analyze = QPushButton("COVERAGE MASK")
         analyze.setObjectName("secondaryButton")
+        analyze.setToolTip(
+            "Analyze which parts of the current manual canvas contain image data"
+        )
         analyze.clicked.connect(self.analyze_coverage)
         layout.addWidget(analyze)
         layout.addStretch()
@@ -1478,6 +1508,7 @@ class MainWindow(QMainWindow):
         self.source_table.set_rig(cameras)
         self.source_table.blockSignals(False)
         output = raw.setdefault("output", {})
+        self._loading_config = True
         self.canvas_width.setValue(int(output.get("width", 15360)))
         self.canvas_height.setValue(int(output.get("height", 3968)))
         self.h_fov.setValue(float(output.get("horizontal_fov_deg", 180.0)))
@@ -1485,6 +1516,8 @@ class MainWindow(QMainWindow):
         self.center_yaw.setValue(float(output.get("center_yaw_deg", 0.0)))
         self.center_pitch.setValue(float(output.get("center_pitch_deg", 0.0)))
         self.seam_feather.setValue(float(output.get("seam_feather_deg", 4.0)))
+        self._loading_config = False
+        self._update_canvas_ratio()
         flow = raw.setdefault("flow", {})
         self.flow_enabled.setChecked(bool(flow.get("enabled", False)))
         self.flow_preset.setCurrentText(str(flow.get("preset", "medium")))
@@ -1519,6 +1552,52 @@ class MainWindow(QMainWindow):
         self._update_color_controls()
         self._update_output_hint()
         self._append_log(f"Loaded rig profile: {path}")
+
+    def _update_canvas_ratio(self) -> None:
+        width = self.canvas_width.value()
+        height = self.canvas_height.value()
+        ratio = width / max(1, height)
+        self.canvas_ratio.setText(f"{ratio:.3f}:1  ·  MANUAL")
+
+    def _canvas_controls_changed(self) -> None:
+        self._update_canvas_ratio()
+        if self._loading_config or not self.config_data:
+            return
+        self._cleanup_reference_dir(self._last_reference_dir)
+        self._last_reference_dir = None
+        self._last_reference_config_path = None
+        self._preview_ready = False
+        self.rig_align_button.setEnabled(False)
+        self.preview_note.setText(
+            "Canvas changed · create Preview to refresh the complete fitted canvas"
+        )
+
+    def fit_full_plates(self) -> None:
+        try:
+            config_path = self._write_working_config()
+            fitted = recommend_full_plate_canvas(parse_config(config_path))
+        except Exception as error:
+            self._error("Full Plate Fit", str(error))
+            return
+        self._loading_config = True
+        self.canvas_width.setValue(fitted.width)
+        self.canvas_height.setValue(fitted.height)
+        self.h_fov.setValue(fitted.horizontal_fov_deg)
+        self.v_fov.setValue(fitted.vertical_fov_deg)
+        self._loading_config = False
+        self._canvas_controls_changed()
+        self.canvas_ratio.setText(
+            f"{fitted.width / fitted.height:.3f}:1  ·  FULL PLATES"
+        )
+        self._append_log(
+            "Full Plate Fit: "
+            f"{fitted.width}×{fitted.height} · "
+            f"H {fitted.horizontal_fov_deg:.2f}° · V {fitted.vertical_fov_deg:.2f}°"
+        )
+        self.statusBar().showMessage(
+            "Full plate boundaries fitted · create Preview to inspect the uncropped canvas",
+            12000,
+        )
 
     def _collect_config(self) -> dict[str, object]:
         if not self.config_data:
@@ -2139,10 +2218,10 @@ class MainWindow(QMainWindow):
                     self._cleanup_reference_dir(previous_reference)
                     self.rig_align_button.setEnabled(True)
                     self.preview_note.setText(
-                        "Release the playhead to refresh this fitted 4K preview · no crop"
+                        "Release the playhead to refresh this full-canvas 4K preview"
                     )
                     self.statusBar().showMessage(
-                        f"Preview ready: {width}×{height} · fitted, no crop",
+                        f"Preview ready: {width}×{height} · full canvas",
                         10000,
                     )
                     self._finish_preview_frame(timeline_start)
