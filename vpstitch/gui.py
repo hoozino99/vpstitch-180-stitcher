@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -11,7 +12,15 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
-from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtCore import (
+    QCoreApplication,
+    QProcess,
+    QSettings,
+    QStandardPaths,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -59,6 +68,7 @@ APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
+_MACOS_AX_SHIM: ctypes.CDLL | None = None
 GUI_MASTER_BIT_DEPTHS = {
     "prores-hq": 10,
     "prores-4444": 10,
@@ -140,6 +150,61 @@ def preview_dimensions(
 ) -> tuple[int, int]:
     scale = min(1.0, max_width / width, max_height / height)
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _stabilize_macos_accessibility_bridge() -> bool:
+    """Suppress Qt's unstable Cocoa child hierarchy during AX enumeration."""
+    global _MACOS_AX_SHIM
+    if sys.platform != "darwin" or os.environ.get("VPSTITCH_ENABLE_ACCESSIBILITY") == "1":
+        return False
+    try:
+        shim_name = "libvpstitch_macos_ax.dylib"
+        candidates = (
+            _runtime_root() / shim_name,
+            Path(__file__).resolve().parent.parent / ".build" / "macos" / shim_name,
+        )
+        shim_path = next((path for path in candidates if path.is_file()), None)
+        if shim_path is None:
+            return False
+        shim = ctypes.CDLL(str(shim_path))
+        shim.vpstitch_no_accessible_children.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        shim.vpstitch_no_accessible_children.restype = ctypes.c_void_p
+        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        objc.class_getInstanceMethod.restype = ctypes.c_void_p
+        objc.method_getTypeEncoding.argtypes = [ctypes.c_void_p]
+        objc.method_getTypeEncoding.restype = ctypes.c_char_p
+        objc.class_replaceMethod.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+        ]
+        objc.class_replaceMethod.restype = ctypes.c_void_p
+        qns_view = objc.objc_getClass(b"QNSView")
+        if not qns_view:
+            return False
+
+        selector = objc.sel_registerName(b"accessibilityChildren")
+        method = objc.class_getInstanceMethod(qns_view, selector)
+        encoding = objc.method_getTypeEncoding(method) if method else b"@@:"
+        objc.class_replaceMethod(
+            qns_view,
+            selector,
+            ctypes.cast(shim.vpstitch_no_accessible_children, ctypes.c_void_p),
+            encoding,
+        )
+        _MACOS_AX_SHIM = shim
+        return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
 
 
 def _display_image(array: np.ndarray) -> QImage:
@@ -459,6 +524,7 @@ class SourceTable(QTableWidget):
 
     def __init__(self) -> None:
         super().__init__(5, 9)
+        self._active_count = 5
         self.setHorizontalHeaderLabels(
             ["CAM", "CLIP", "TC IN", "FRAMES", "STATUS", "YAW", "PITCH", "ROLL", "OFFSET"]
         )
@@ -507,12 +573,19 @@ class SourceTable(QTableWidget):
         super().keyPressEvent(event)
 
     def set_rig(self, cameras: list[dict[str, object]], paths: list[str] | None = None) -> None:
+        if not 1 <= len(cameras) <= self.rowCount():
+            raise ValueError("camera count exceeds the source table capacity")
         paths = paths or [""] * len(cameras)
-        self.setRowCount(len(cameras))
+        self._active_count = len(cameras)
         table_height = 34 + len(cameras) * self.verticalHeader().defaultSectionSize()
         self.setMinimumHeight(table_height)
         self.setMaximumHeight(table_height)
-        for row, camera in enumerate(cameras):
+        for row in range(self.rowCount()):
+            active = row < self._active_count
+            self.setRowHidden(row, not active)
+            if not active:
+                continue
+            camera = cameras[row]
             values = [
                 f"CAM {row + 1}",
                 paths[row] if row < len(paths) else "",
@@ -526,17 +599,23 @@ class SourceTable(QTableWidget):
             ]
             for column, value in enumerate(values):
                 display_value = Path(value).name if column == 1 and value else value
-                item = QTableWidgetItem(display_value)
+                item = self.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.setItem(row, column, item)
+                item.setText(display_value)
                 if column in {0, 1, 2, 3, 4}:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column == 1:
                     item.setToolTip(value)
                     item.setData(Qt.ItemDataRole.UserRole, value)
-                self.setItem(row, column, item)
+
+    def camera_count(self) -> int:
+        return self._active_count
 
     def paths(self) -> list[str]:
         paths: list[str] = []
-        for row in range(self.rowCount()):
+        for row in range(self.camera_count()):
             item = self.item(row, 1)
             if item is None:
                 paths.append("")
@@ -546,7 +625,7 @@ class SourceTable(QTableWidget):
         return paths
 
     def set_paths(self, paths: list[str]) -> None:
-        for row, path in enumerate(paths[: self.rowCount()]):
+        for row, path in enumerate(paths[: self.camera_count()]):
             item = self.item(row, 1)
             if item is None:
                 item = QTableWidgetItem()
@@ -556,7 +635,7 @@ class SourceTable(QTableWidget):
             item.setData(Qt.ItemDataRole.UserRole, path)
 
     def clear_timing(self) -> None:
-        for row in range(self.rowCount()):
+        for row in range(self.camera_count()):
             for column in (2, 3, 4):
                 item = self.item(row, column)
                 if item is None:
@@ -566,7 +645,7 @@ class SourceTable(QTableWidget):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
     def set_timing(self, inputs: list[dict[str, object]]) -> None:
-        if len(inputs) != self.rowCount():
+        if len(inputs) != self.camera_count():
             raise ValueError("timecode result does not match the source count")
         for row, timing in enumerate(inputs):
             for column, value in (
@@ -591,7 +670,7 @@ class SourceTable(QTableWidget):
         inputs: list[dict[str, object]],
         overrides: dict[str, dict[str, str | None]] | None = None,
     ) -> None:
-        if len(inputs) != self.rowCount():
+        if len(inputs) != self.camera_count():
             raise ValueError("source probe result does not match the source count")
         for row, probe in enumerate(inputs):
             bit_depth = int(probe.get("bit_depth", 0))
@@ -622,7 +701,7 @@ class SourceTable(QTableWidget):
 
     def offsets(self) -> list[int]:
         try:
-            return [int(self.item(row, 8).text()) for row in range(self.rowCount())]
+            return [int(self.item(row, 8).text()) for row in range(self.camera_count())]
         except (AttributeError, ValueError) as error:
             raise ValueError("camera OFFSET values must be whole frames") from error
 
@@ -655,6 +734,14 @@ class MainWindow(QMainWindow):
         self._plate_numbers: list[int] | None = None
         self._source_probes: list[dict[str, object]] | None = None
         self._source_overrides: dict[str, dict[str, str | None]] = {}
+        self._closing = False
+        self._import_dialog: QFileDialog | None = None
+        self._message_box: QMessageBox | None = None
+        self._pending_log_lines: list[str] = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setInterval(50)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.timeout.connect(self._flush_log)
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_failure: Callable[[], None] | None = None
@@ -1000,8 +1087,8 @@ class MainWindow(QMainWindow):
 
     def _update_source_status(self) -> None:
         loaded = sum(bool(path) for path in self.source_table.paths())
-        expected = self.source_table.rowCount()
-        if loaded == self.source_table.rowCount():
+        expected = self.source_table.camera_count()
+        if loaded == self.source_table.camera_count():
             order_note = (
                 f"P{self._plate_numbers[0]:02d} → P{self._plate_numbers[-1]:02d}"
                 if self._plate_numbers
@@ -1538,13 +1625,28 @@ class MainWindow(QMainWindow):
             self._append_log(f"Saved rig profile: {destination}")
 
     def choose_videos(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select P01-P03 or P01-P05 camera plates",
-            str(self.project_root),
-            VIDEO_FILTER,
-        )
+        if self._import_dialog is None:
+            dialog = QFileDialog(self)
+            dialog.setWindowTitle("Select P01-P03 or P01-P05 camera plates")
+            dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+            dialog.setNameFilter(VIDEO_FILTER)
+            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            self._import_dialog = dialog
+        initial_dir = str(self.settings.value("lastImportDir", ""))
+        if not Path(initial_dir).is_dir():
+            initial_dir = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DownloadLocation
+            )
+        if initial_dir:
+            self._import_dialog.setDirectory(initial_dir)
+        if self._import_dialog.exec() != QDialog.DialogCode.Accepted:
+            self._import_dialog.hide()
+            return
+        files = self._import_dialog.selectedFiles()
+        self._import_dialog.hide()
         if files:
+            self.settings.setValue("lastImportDir", str(Path(files[0]).parent))
             try:
                 self._set_video_sources(files)
                 self._analyze_imported_sources()
@@ -1552,7 +1654,7 @@ class MainWindow(QMainWindow):
                 self._error("Import plates", str(error))
 
     def clear_sources(self) -> None:
-        self.source_table.set_paths([""] * self.source_table.rowCount())
+        self.source_table.set_paths([""] * self.source_table.camera_count())
         self._plate_numbers = None
         self._source_probes = None
         self._source_overrides = {}
@@ -1689,7 +1791,7 @@ class MainWindow(QMainWindow):
 
     def _effective_common_frames(self, payload: dict[str, object]) -> int:
         inputs = payload.get("inputs")
-        if not isinstance(inputs, list) or len(inputs) != self.source_table.rowCount():
+        if not isinstance(inputs, list) or len(inputs) != self.source_table.camera_count():
             raise ValueError("timecode result does not match the source count")
         offsets = self.source_table.offsets()
         starts = [
@@ -1862,7 +1964,7 @@ class MainWindow(QMainWindow):
 
     def _apply_source_probe_payload(self, payload: dict[str, object]) -> None:
         inputs = payload.get("inputs")
-        if not isinstance(inputs, list) or len(inputs) != self.source_table.rowCount():
+        if not isinstance(inputs, list) or len(inputs) != self.source_table.camera_count():
             raise ValueError("invalid source probe report")
         probes = [dict(item) for item in inputs if isinstance(item, dict)]
         if len(probes) != len(inputs):
@@ -1882,7 +1984,7 @@ class MainWindow(QMainWindow):
 
     def _open_input_settings(self, rows: list[int]) -> None:
         valid_rows = sorted(
-            row for row in rows if 0 <= row < self.source_table.rowCount()
+            row for row in rows if 0 <= row < self.source_table.camera_count()
         )
         if not valid_rows:
             return
@@ -2203,7 +2305,13 @@ class MainWindow(QMainWindow):
                     "\nSource detail remains 8-bit; the master codec cannot recreate "
                     "missing precision."
                 )
-        if QMessageBox.question(self, "Start render", message) != QMessageBox.StandardButton.Yes:
+        if self._show_message(
+            QMessageBox.Icon.Question,
+            "Start render",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
             return
         arguments = [
             "stitch-video",
@@ -2223,7 +2331,11 @@ class MainWindow(QMainWindow):
         self._run_cli(
             "FINAL RENDER",
             arguments,
-            lambda: QMessageBox.information(self, "Render complete", f"Output written to:\n{output}"),
+            lambda: self._show_message(
+                QMessageBox.Icon.Information,
+                "Render complete",
+                f"Output written to:\n{output}",
+            ),
         )
 
     def _run_cli(
@@ -2233,6 +2345,8 @@ class MainWindow(QMainWindow):
         success: Callable[[], None] | None = None,
         failure: Callable[[], None] | None = None,
     ) -> None:
+        if self._closing:
+            return
         if self.process is not None:
             self._error("Busy", "Another task is already running")
             return
@@ -2279,23 +2393,33 @@ class MainWindow(QMainWindow):
         self.reset_timeline_button.setEnabled(not busy and self._tc_alignment is not None)
 
     def _read_process(self) -> None:
-        if self.process is None:
+        process = self.sender()
+        if self.process is None or (process is not None and process is not self.process):
             return
         text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         normalized = text.replace("\r", "\n")
+        progress_value: tuple[int, int] | None = None
+        frame_value: str | None = None
         for line in normalized.splitlines():
             if line.strip():
                 self._append_log(line)
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
             if match:
-                done, total = int(match.group(1)), int(match.group(2))
-                self.progress.setRange(0, total)
-                self.progress.setValue(done)
+                progress_value = int(match.group(1)), int(match.group(2))
             frame = re.search(r"frame\s+(\d+)", line)
             if frame:
-                self.task_label.setText(f"FRAME {frame.group(1)}")
+                frame_value = frame.group(1)
+        if progress_value is not None:
+            done, total = progress_value
+            self.progress.setRange(0, total)
+            self.progress.setValue(done)
+        if frame_value is not None:
+            self.task_label.setText(f"FRAME {frame_value}")
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
+        sender = self.sender()
+        if self.process is None or (sender is not None and sender is not self.process):
+            return
         callback = self._process_success
         failure = self._process_failure
         process = self.process
@@ -2303,6 +2427,14 @@ class MainWindow(QMainWindow):
         self.process = None
         self._process_success = None
         self._process_failure = None
+        try:
+            process.readyReadStandardOutput.disconnect(self._read_process)
+            process.finished.disconnect(self._process_finished)
+        except (RuntimeError, TypeError):
+            pass
+        if self._closing:
+            process.deleteLater()
+            return
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if exit_code == 0 else 0)
         self.task_label.setText("IDLE" if exit_code == 0 else "FAILED")
@@ -2328,7 +2460,15 @@ class MainWindow(QMainWindow):
             self.process.kill()
 
     def _append_log(self, text: str) -> None:
-        self.log.appendPlainText(text)
+        self._pending_log_lines.append(text)
+        if not self._log_flush_timer.isActive():
+            self._log_flush_timer.start()
+
+    def _flush_log(self) -> None:
+        if not self._pending_log_lines:
+            return
+        lines, self._pending_log_lines = self._pending_log_lines, []
+        self.log.appendPlainText("\n".join(lines))
         scrollbar = self.log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -2350,7 +2490,28 @@ class MainWindow(QMainWindow):
 
     def _error(self, title: str, message: str) -> None:
         self._append_log(f"ERROR: {message}")
-        QMessageBox.critical(self, title, message)
+        self._show_message(QMessageBox.Icon.Critical, title, message)
+
+    def _show_message(
+        self,
+        icon: QMessageBox.Icon,
+        title: str,
+        message: str,
+        buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+        default: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+    ) -> QMessageBox.StandardButton:
+        if self._message_box is None:
+            self._message_box = QMessageBox(self)
+        dialog = self._message_box
+        dialog.setIcon(icon)
+        dialog.setWindowTitle(title)
+        dialog.setText(message)
+        dialog.setStandardButtons(buttons)
+        if buttons & default:
+            dialog.setDefaultButton(default)
+        result = QMessageBox.StandardButton(dialog.exec())
+        dialog.hide()
+        return result
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.mimeData().hasUrls():
@@ -2376,18 +2537,51 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.process is not None:
-            answer = QMessageBox.question(self, "Task running", "Cancel the running task and close?")
+            answer = self._show_message(
+                QMessageBox.Icon.Question,
+                "Task running",
+                "Cancel the running task and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.process.kill()
-            self.process.waitForFinished(3000)
+            self._closing = True
+            self._log_flush_timer.stop()
+            self._pending_log_lines.clear()
+            process = self.process
+            self.process = None
+            self._process_success = None
+            self._process_failure = None
+            try:
+                process.readyReadStandardOutput.disconnect(self._read_process)
+                process.finished.disconnect(self._process_finished)
+            except (RuntimeError, TypeError):
+                pass
+            process.kill()
+            process.waitForFinished(3000)
+            process.deleteLater()
+        else:
+            self._closing = True
+            self._log_flush_timer.stop()
+            self._pending_log_lines.clear()
         event.accept()
+
+
+def _configure_application_attributes() -> None:
+    if sys.platform == "darwin":
+        QCoreApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_DontUseNativeDialogs,
+            True,
+        )
 
 
 def main() -> int:
     try:
+        _configure_application_attributes()
         app = QApplication.instance() or QApplication(sys.argv)
+        _stabilize_macos_accessibility_bridge()
         app.setApplicationName(APP_NAME)
         app.setOrganizationName("VP-LAB")
         window = MainWindow()

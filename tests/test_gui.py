@@ -8,7 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel, QToolBar
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel, QToolBar
 
 from vpstitch.config import load_config
 from vpstitch.gui import (
@@ -142,6 +142,23 @@ def test_gui_source_table_keeps_full_paths_while_showing_clip_names(tmp_path: Pa
     app.processEvents()
 
 
+def test_gui_reuses_import_dialog_to_avoid_macos_native_teardown(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    monkeypatch.setattr(
+        QFileDialog,
+        "exec",
+        lambda _dialog: QDialog.DialogCode.Rejected,
+    )
+    window.choose_videos()
+    first_dialog = window._import_dialog
+    window.choose_videos()
+    assert first_dialog is not None
+    assert window._import_dialog is first_dialog
+    window.close()
+    app.processEvents()
+
+
 def test_input_settings_keep_bitrate_read_only_and_persist_interpretation(
     tmp_path: Path,
 ) -> None:
@@ -189,12 +206,17 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
+    first_camera_item = window.source_table.item(0, 0)
+    fifth_camera_item = window.source_table.item(4, 0)
 
     three = [tmp_path / f"front_P{number:02d}.mov" for number in (3, 1, 2)]
     for path in three:
         path.touch()
     window._set_video_sources([str(path) for path in three])
-    assert window.source_table.rowCount() == 3
+    assert window.source_table.camera_count() == 3
+    assert window.source_table.rowCount() == 5
+    assert all(window.source_table.isRowHidden(row) for row in (3, 4))
+    assert window.source_table.item(0, 0) is first_camera_item
     assert [Path(path).name for path in window.source_table.paths()] == [
         "front_P01.mov",
         "front_P02.mov",
@@ -217,7 +239,11 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     for path in five:
         path.touch()
     window._set_video_sources([str(path) for path in five])
+    assert window.source_table.camera_count() == 5
     assert window.source_table.rowCount() == 5
+    assert all(not window.source_table.isRowHidden(row) for row in range(5))
+    assert window.source_table.item(0, 0) is first_camera_item
+    assert window.source_table.item(4, 0) is fifth_camera_item
     assert [Path(path).name for path in window.source_table.paths()] == [
         f"rear_P{number:02d}.mov" for number in range(1, 6)
     ]

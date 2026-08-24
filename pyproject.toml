@@ -13,7 +13,7 @@ dependencies = [
   "OpenEXR>=3.4",
   "opencv-python-headless>=4.10",
   "opencolorio>=2.4",
-  "PySide6>=6.8",
+  "PySide6==6.11.2",
   "tifffile>=2025.1",
 ]
 

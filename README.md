@@ -173,6 +173,12 @@ Control-click하여 **열기**를 선택하거나, 시스템 설정의 **개인�
 앱을 실행할 때 Python, FFmpeg, OpenColorIO를 따로 설치할 필요는 없습니다. 앱에
 렌더 CLI와 정확한 TC/frame count scan이 가능한 정적 FFmpeg가 함께 포함됩니다.
 
+현재 macOS 앱은 Qt Cocoa의 접근성 계층 조회 중 발생하는 네이티브 크래시를 피하기
+위해 Qt 위젯의 VoiceOver/자동화 하위 트리를 비활성화합니다. 일반 마우스·키보드
+작업과 렌더에는 영향이 없습니다. 접근성 트리가 반드시 필요하면 Terminal에서
+`VPSTITCH_ENABLE_ACCESSIBILITY=1`을 설정해 실행할 수 있지만, Qt 쪽 문제가
+해결되기 전까지는 안정성 모드를 권장합니다.
+
 ### 다운로드해서 바로 실행하는 Windows 앱
 
 GitHub의 **Actions → Windows app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면

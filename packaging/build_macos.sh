@@ -14,6 +14,9 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$BUILD_ROOT"
+AX_SHIM="$BUILD_ROOT/libvpstitch_macos_ax.dylib"
+clang -dynamiclib -O2 -arch "$(uname -m)" \
+  -o "$AX_SHIM" packaging/macos_ax_shim.c
 if [ ! -x "$VENV/bin/python" ]; then
   "$PYTHON_BIN" -m venv "$VENV"
 fi
@@ -36,6 +39,7 @@ COMMON_ARGS="\
   --paths "$ROOT_DIR" \
   --windowed \
   --name "VP Stitch" \
+  --add-binary "$AX_SHIM:." \
   --add-data "configs:configs" \
   packaging/gui_entry.py
 
