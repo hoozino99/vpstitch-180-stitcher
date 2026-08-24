@@ -124,6 +124,9 @@ def parse_probe_output(path: str | Path, text: str) -> VideoProbe:
     timecode_match = re.search(
         r"(?im)^\s*timecode\s*:\s*(\d{1,2}:\d{2}:\d{2}[:;]\d{2})\s*$", text
     )
+    bit_rate_match = re.search(
+        r"(?i)bitrate:\s*([0-9]+(?:\.[0-9]+)?)\s*k(?:bits?/s|b/s)", text
+    )
     fps = float(fps_match.group(1))
     return VideoProbe(
         path=str(path),
@@ -144,6 +147,11 @@ def parse_probe_output(path: str | Path, text: str) -> VideoProbe:
             else max(1, int(round(duration_seconds * fps)))
         ),
         timecode=timecode_match.group(1) if timecode_match else None,
+        bit_rate=(
+            int(round(float(bit_rate_match.group(1)) * 1000))
+            if bit_rate_match
+            else None
+        ),
     )
 
 
@@ -251,15 +259,15 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
             None,
         )
     pixel_format = str(video.get("pix_fmt") or base.pixel_format)
-    bit_rate = None
+    bit_rate = base.bit_rate
     for candidate in (video.get("bit_rate"), format_data.get("bit_rate")):
         try:
-            bit_rate = int(candidate)
+            candidate_rate = int(candidate)
         except (TypeError, ValueError):
             continue
-        if bit_rate > 0:
+        if candidate_rate > 0:
+            bit_rate = candidate_rate
             break
-        bit_rate = None
     return replace(
         base,
         codec=str(video.get("codec_name") or base.codec),

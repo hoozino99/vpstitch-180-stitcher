@@ -59,6 +59,7 @@ def test_parse_ffmpeg_hlg_metadata() -> None:
     assert probe.duration_seconds == 10.01
     assert probe.frame_count == 300
     assert probe.timecode == "01:00:00;00"
+    assert probe.bit_rate == 1_234_000
 
 
 def test_diagnostics_reject_eight_bit_camera() -> None:
