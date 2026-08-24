@@ -137,6 +137,18 @@ class Stitcher:
         progress: Progress | None = None,
     ) -> None:
         sources = [read_image(path) for path in inputs]
+        if Path(output).suffix.lower() == ".png":
+            import cv2
+
+            destination = np.empty(
+                (self.config.output.height, self.config.output.width, 3),
+                dtype=np.uint16,
+            )
+            self.stitch_arrays(sources, destination, progress=progress)
+            bgr = cv2.cvtColor(destination, cv2.COLOR_RGB2BGR)
+            if not cv2.imwrite(str(output), bgr):
+                raise OSError(f"unable to write PNG output: {output}")
+            return
         destination = create_tiff_memmap(
             output,
             (self.config.output.height, self.config.output.width, 3),

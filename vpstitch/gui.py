@@ -51,6 +51,7 @@ from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
 
 
 APP_NAME = "VP Stitch"
+BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 
 
@@ -189,6 +190,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         initial = Path(str(self.settings.value("lastConfig", "")))
+        if not initial.is_file():
+            initial = self.project_root / "configs" / "drive_5cam_180.prores-hq.json"
         if not initial.is_file():
             initial = self.project_root / "configs" / "five_cam_180.sample.json"
         if initial.is_file():
@@ -380,6 +383,8 @@ class MainWindow(QMainWindow):
         ocio_button.setFixedWidth(34)
         ocio_button.clicked.connect(self.choose_ocio)
         ocio_layout.addWidget(ocio_button)
+        aces_button = QPushButton("USE BUILT-IN ACES 2.0 / REC.709")
+        aces_button.clicked.connect(self.apply_aces_preset)
         self.input_space = QLineEdit()
         self.working_space = QLineEdit()
         self.output_space = QLineEdit()
@@ -390,6 +395,7 @@ class MainWindow(QMainWindow):
         form.addRow("Working space", self.working_space)
         form.addRow("Output space", self.output_space)
         form.addRow(self.integer_dither)
+        form.addRow(aces_button)
         layout.addWidget(color)
         note = QLabel(
             "OCIO 모드는 리샘플링 전에 모든 카메라를 scene-linear 작업공간으로 변환합니다. "
@@ -409,11 +415,13 @@ class MainWindow(QMainWindow):
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.output_codec = QComboBox()
+        self.output_codec.addItem("ProRes HQ · 10-bit 4:2:2", "prores-hq")
+        self.output_codec.addItem("DPX · 12-bit RGB sequence", "dpx12-sequence")
+        self.output_codec.addItem("H.264 MP4 · 10-bit 4:2:0", "h264-mp4-10")
+        self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
         self.output_codec.addItem("FFV1 · 16-bit RGB lossless", "ffv1-16")
         self.output_codec.addItem("OpenEXR · half-float sequence", "exr-half-sequence")
         self.output_codec.addItem("BigTIFF · 16-bit RGB sequence", "tiff16-sequence")
-        self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
-        self.output_codec.addItem("ProRes HQ · 10-bit 4:2:2", "prores-hq")
         self.output_codec.addItem("HEVC · 10-bit 4:4:4", "hevc-444-10")
         self.output_codec.currentIndexChanged.connect(self._update_output_hint)
         self.output_path = QLineEdit()
@@ -449,7 +457,7 @@ class MainWindow(QMainWindow):
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background:#11161e; color:#dce4ee; font-family:'Malgun Gothic','Segoe UI'; font-size:12px; }
+            QMainWindow, QWidget { background:#11161e; color:#dce4ee; font-family:'-apple-system','SF Pro Display','Malgun Gothic','Segoe UI'; font-size:12px; }
             QToolBar { background:#171e28; border:0; border-bottom:1px solid #293241; spacing:3px; padding:7px; }
             QToolButton { background:#202a37; border:1px solid #334155; border-radius:4px; padding:8px 12px; font-weight:600; }
             QToolButton:hover { background:#2a394a; border-color:#38bdf8; }
@@ -621,12 +629,21 @@ class MainWindow(QMainWindow):
         if path:
             self.ocio_config.setText(path)
 
+    def apply_aces_preset(self) -> None:
+        self.color_mode.setCurrentIndex(self.color_mode.findData("ocio"))
+        self.ocio_config.setText(BUILTIN_ACES_STUDIO)
+        self.input_space.setText("Camera Rec.709")
+        self.working_space.setText("ACEScg")
+        self.output_space.setText("Gamma 2.4 Encoded Rec.709")
+        self._update_color_controls()
+        self._append_log("Applied built-in ACES 2.0 Studio preset: Camera Rec.709 → ACEScg → Gamma 2.4 Rec.709")
+
     def choose_output(self) -> None:
         codec = str(self.output_codec.currentData())
         if codec.endswith("sequence"):
             path = QFileDialog.getExistingDirectory(self, "Select empty output directory", str(self.project_root))
         else:
-            suffix = ".mov" if codec.startswith("prores") else ".mkv"
+            suffix = ".mov" if codec.startswith("prores") else ".mp4" if codec == "h264-mp4-10" else ".mkv"
             path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self.project_root / f"stitched{suffix}"), "All files (*.*)")
         if path:
             self.output_path.setText(path)
@@ -871,9 +888,11 @@ class MainWindow(QMainWindow):
         hints = {
             "ffv1-16": "권장 장편 마스터: 무손실 16-bit RGB MKV. 파일 크기는 영상 내용에 따라 달라집니다.",
             "exr-half-sequence": "OCIO scene-linear 권장: 음수와 1 초과 값을 보존합니다. 출력 폴더가 필요합니다.",
+            "dpx12-sequence": "VFX/Resolve 교환용 12-bit RGB DPX 시퀀스. 출력 폴더가 필요합니다.",
             "tiff16-sequence": "정수 RGB 품질 기준용. 20K/29.97fps는 무압축 기준 분당 약 1.18TiB입니다.",
             "prores-4444": "편집 호환용 10-bit YUV. 16-bit RGB 보존 마스터는 아닙니다.",
             "prores-hq": "편집용 10-bit 4:2:2. 크로마 해상도가 줄어듭니다.",
+            "h264-mp4-10": "검수용 10-bit H.264 MP4. 15K 마스터 대신 축소 프리뷰에 권장합니다.",
             "hevc-444-10": "납품/검수용. 15K 이상의 표준 HEVC picture level 한계에 주의하십시오.",
         }
         self.output_hint.setText(hints.get(codec, ""))

@@ -5,6 +5,14 @@ import numpy as np
 from .config import Color
 
 
+def load_ocio_config(identifier: str):
+    import PyOpenColorIO as ocio
+
+    if identifier.startswith("ocio://"):
+        return ocio.Config.CreateFromBuiltinConfig(identifier.removeprefix("ocio://"))
+    return ocio.Config.CreateFromFile(identifier)
+
+
 class ColorPipeline:
     """Applies optional OCIO transforms without introducing 8-bit buffers."""
 
@@ -16,7 +24,7 @@ class ColorPipeline:
             import PyOpenColorIO as ocio
 
             try:
-                config = ocio.Config.CreateFromFile(str(settings.ocio_config))
+                config = load_ocio_config(str(settings.ocio_config))
                 self._input_processors = [
                     config.getProcessor(
                         str(space), str(settings.working_space)

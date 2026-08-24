@@ -16,8 +16,10 @@ OUTPUT_CODECS = {
     "ffv1-16",
     "tiff16-sequence",
     "exr-half-sequence",
+    "dpx12-sequence",
     "prores-4444",
     "prores-hq",
+    "h264-mp4-10",
     "hevc-444-10",
 }
 
@@ -155,8 +157,8 @@ def load_config(path: str | Path) -> RigConfig:
 
     out_raw = _expect_dict(root.get("output", {}), "output")
     output = Output(**out_raw)
-    if output.projection != "cylindrical":
-        raise ConfigError("version 0.1 supports cylindrical output only")
+    if output.projection not in {"cylindrical", "rectilinear"}:
+        raise ConfigError("projection must be 'cylindrical' or 'rectilinear'")
     if output.width < 1 or output.height < 1:
         raise ConfigError("output dimensions must be positive")
     if output.width > MAX_CANVAS_WIDTH or output.height > MAX_CANVAS_HEIGHT:

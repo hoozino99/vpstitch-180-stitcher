@@ -120,9 +120,9 @@ class MapCache:
         columns = slice(tile.x, tile.x + tile.width)
         # With output pitch the world longitude varies vertically, so derive it
         # from the same view rotation used to build the maps.
-        from .geometry import cylindrical_world_rays
+        from .geometry import world_rays
 
-        _, longitude = cylindrical_world_rays(tile, self.config.output)
+        _, longitude = world_rays(tile, self.config.output)
         result = []
         for map_x, map_y in self._maps:
             tile_x = np.asarray(map_x[rows, columns])

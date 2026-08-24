@@ -4,7 +4,12 @@ import pytest
 
 from vpstitch.config import ConfigError, Video
 from vpstitch.diagnostics import assess_inputs, resolve_passthrough_video
-from vpstitch.ffmpegio import VideoProbe, parse_probe_output, pixel_format_bit_depth
+from vpstitch.ffmpegio import (
+    VideoProbe,
+    ffmpeg_executable,
+    parse_probe_output,
+    pixel_format_bit_depth,
+)
 
 
 def _probe(path: str, depth: int = 10) -> VideoProbe:
@@ -28,6 +33,11 @@ def test_pixel_format_depth() -> None:
     assert pixel_format_bit_depth("gbrp16le") == 16
     assert pixel_format_bit_depth("yuv420p") == 8
     assert pixel_format_bit_depth("rgb48le") == 16
+
+
+def test_ffmpeg_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VPSTITCH_FFMPEG", "/custom/bin/ffmpeg")
+    assert ffmpeg_executable() == "/custom/bin/ffmpeg"
 
 
 def test_parse_ffmpeg_hlg_metadata() -> None:

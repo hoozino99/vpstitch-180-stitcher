@@ -18,7 +18,7 @@ from .config import (
     RigConfig,
     load_config,
 )
-from .ffmpegio import VideoDecoder, VideoEncoder, probe_video
+from .ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
 from .imageio import ExrSequenceEncoder, TiffSequenceEncoder
 from .pipeline import Stitcher
 from .mapcache import MapCache
@@ -27,6 +27,7 @@ from .diagnostics import assess_inputs, resolve_passthrough_video
 from .calibration import CalibrationError, calibrate_checkerboard
 from .rigcalibration import calibrate_rig_rotation, write_calibrated_config
 from .resources import estimate_resources
+from .color import load_ocio_config
 
 
 def _progress(done: int, total: int) -> None:
@@ -123,6 +124,14 @@ def _stitch_video(args: argparse.Namespace) -> None:
         )
     elif config.video.output_codec == "exr-half-sequence":
         encoder = ExrSequenceEncoder(
+            args.output,
+            config.output.width,
+            config.output.height,
+            config.video,
+            config.color,
+        )
+    elif config.video.output_codec == "dpx12-sequence":
+        encoder = DpxSequenceEncoder(
             args.output,
             config.output.width,
             config.output.height,
@@ -304,7 +313,7 @@ def _list_ocio_spaces(args: argparse.Namespace) -> None:
     try:
         import PyOpenColorIO as ocio
 
-        config = ocio.Config.CreateFromFile(args.ocio_config)
+        config = load_ocio_config(args.ocio_config)
         payload = {
             "config": args.ocio_config,
             "name": config.getName(),
@@ -324,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     frame = subparsers.add_parser("stitch-frame", help="stitch TIFF/EXR still frames")
     frame.add_argument("--config", required=True)
-    frame.add_argument("--output", required=True, help="16-bit RGB BigTIFF")
+    frame.add_argument("--output", required=True, help="16-bit RGB PNG or BigTIFF")
     frame.add_argument("inputs", nargs="+")
     _add_canvas_arguments(frame)
     frame.set_defaults(function=_stitch_frame)

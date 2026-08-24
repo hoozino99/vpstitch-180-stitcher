@@ -2,12 +2,21 @@
 
 ## Desktop GUI
 
-Windows에서 `VP Stitch GUI.bat`를 더블클릭하면 데스크톱 UI가 실행됩니다. 또는
-PowerShell에서 다음 명령을 사용합니다.
+Windows에서는 `VP Stitch GUI.bat`를 더블클릭하거나 PowerShell에서 실행합니다.
 
 ```powershell
 .\.venv\Scripts\vpstitch-gui.exe
 ```
+
+macOS에서는 `VP Stitch GUI.command`를 더블클릭하거나 Terminal에서 실행합니다.
+
+```bash
+.venv/bin/vpstitch-gui
+```
+
+macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합니다. FFmpeg는
+기본적으로 `imageio-ffmpeg`에 포함된 실행 파일을 사용하며, 시스템 FFmpeg를 직접
+지정해야 할 때는 `VPSTITCH_FFMPEG` 환경변수를 설정할 수 있습니다.
 
 권장 작업 순서:
 
@@ -40,6 +49,25 @@ uint16/float32 스티칭 및 FFV1/TIFF/EXR 마스터의 정밀도에는 영향�
 - 결정론적 TPDF 디더링
 - 16-bit lossless FFV1, ProRes 4444/HQ, HEVC 4:4:4 10-bit 출력
 
+## macOS 호환성과 성능
+
+macOS는 지원 대상입니다. 렌더 엔진은 CUDA나 DirectX에 의존하지 않고 Python,
+NumPy, OpenCV, FFmpeg, OpenColorIO를 사용하므로 Apple Silicon과 Intel Mac에서
+동일한 설정 파일과 CLI를 사용할 수 있습니다.
+
+스티칭의 주된 병목은 운영체제보다 다음 항목입니다.
+
+- 출력 해상도와 타일 수
+- 5개 원본의 디코딩 속도와 저장장치 읽기 속도
+- `flow.enabled`를 켰을 때의 CPU optical-flow 분석
+- ProRes/HEVC 인코딩 방식
+
+따라서 같은 CPU·SSD·출력 설정이면 Windows와 macOS의 차이는 크지 않으며, 최신
+Apple Silicon Mac은 일반적인 CPU 기반 렌더에서 충분히 경쟁력 있습니다. 다만 이
+프로젝트는 현재 CUDA/Metal 전용 가속 경로를 사용하지 않으므로 특정 Mac GPU가
+자동으로 전체 렌더를 가속하지는 않습니다. 실제 비교는 동일한 5개 입력과
+`--frames 24` 테스트로 측정해야 합니다.
+
 ## 품질 원칙
 
 `passthrough`는 transfer function이나 primaries를 임의로 바꾸지 않습니다. 하지만 렌즈
@@ -58,10 +86,23 @@ ProRes/HEVC 변환에는 FFmpeg `zscale=dither=error_diffusion`을 명시하여 
 
 ## 설치
 
+Windows PowerShell:
+
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
+
+macOS/Linux Terminal:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e ".[test]"
+```
+
+macOS에서 Finder로 `.command` 파일을 처음 실행할 때 보안 확인이 나오면 파일을
+Control-click하여 열기를 선택합니다. 터미널에서 직접 실행할 경우에는 별도 권한
+설정 없이 `.venv/bin/vpstitch-gui`를 실행하면 됩니다.
 
 ## 정지 프레임 테스트
 
@@ -121,8 +162,10 @@ JSON을 바꾸지 않고 렌더마다 캔버스와 구도를 덮어쓸 수 있�
 - `ffv1-16`: 무손실 `gbrp16le`
 - `tiff16-sequence`: 무손실 16-bit RGB BigTIFF 프레임 시퀀스
 - `exr-half-sequence`: half-float RGB OpenEXR 프레임 시퀀스
+- `dpx12-sequence`: 12-bit RGB DPX 프레임 시퀀스
 - `prores-4444`: ProRes 4444, `yuv444p10le`
 - `prores-hq`: ProRes HQ, `yuv422p10le`
+- `h264-mp4-10`: 10-bit H.264 `yuv420p10le` MP4 검수본
 - `hevc-444-10`: x265 4:4:4 10-bit
 
 15K–20K 무밴딩 기준 마스터에는 `ffv1-16` 또는 `tiff16-sequence`를 권장합니다.
@@ -192,6 +235,11 @@ OCIO 출력이 ACEScg 같은 scene-linear 공간이라면 `exr-half-sequence`를
 RAW로 디베이어된 경우 해당 linear colorspace를 입력으로 지정하십시오.
 
 config에 들어 있는 정확한 색공간 이름은 다음 명령으로 확인할 수 있습니다.
+
+GUI의 `USE BUILT-IN ACES 2.0 / REC.709` 버튼은 설치된 OpenColorIO의 Studio Config를
+사용하여 `Camera Rec.709 → ACEScg → Gamma 2.4 Encoded Rec.709` 작업 설정을 채웁니다.
+외부 `.ocio` 파일 없이 사용할 수 있으며, 프로젝트의 실제 입력 인코딩과 납품 색공간에
+맞게 이름을 변경할 수 있습니다.
 
 ```powershell
 .\.venv\Scripts\vpstitch.exe list-ocio-spaces `

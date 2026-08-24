@@ -25,3 +25,15 @@ def test_gui_loads_sample_rig() -> None:
     assert window.output_codec.currentData() == "ffv1-16"
     window.close()
     app.processEvents()
+
+
+def test_gui_applies_builtin_aces_preset() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.apply_aces_preset()
+    assert window.color_mode.currentData() == "ocio"
+    assert window.ocio_config.text().startswith("ocio://studio-config-")
+    assert window.input_space.text() == "Camera Rec.709"
+    assert window.working_space.text() == "ACEScg"
+    window.close()
+    app.processEvents()

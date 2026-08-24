@@ -136,3 +136,20 @@ def test_float_destination_does_not_clip_extended_range() -> None:
     Stitcher(rig).stitch_arrays(sources, destination)
     assert float(destination.min()) < 0.0
     assert float(destination.max()) > 1.0
+
+
+def test_builtin_aces_studio_config_uri() -> None:
+    pipeline = ColorPipeline(
+        Color(
+            mode="ocio",
+            ocio_config="ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5",
+            working_space="ACEScg",
+            output_space="Gamma 2.4 Encoded Rec.709",
+        ),
+        ["Camera Rec.709"],
+    )
+    source = np.full((4, 5, 3), 0.18, dtype=np.float32)
+    result = pipeline.working_to_output(pipeline.input_to_working(0, source))
+    assert result.dtype == np.float32
+    assert result.shape == source.shape
+    assert np.all(np.isfinite(result))

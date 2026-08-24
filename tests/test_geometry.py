@@ -10,6 +10,7 @@ from vpstitch.geometry import (
     iter_tiles,
     seam_weights,
     tile_count,
+    rectilinear_world_rays,
 )
 
 
@@ -69,6 +70,23 @@ def test_canvas_center_yaw_targets_matching_camera() -> None:
     assert valid[119, 159]
     assert abs(float(map_x[119, 159]) - 319.5) < 1.0
     assert abs(float(map_y[119, 159]) - 239.5) < 1.0
+
+
+def test_rectilinear_center_ray_is_forward() -> None:
+    output = Output(
+        width=320,
+        height=240,
+        horizontal_fov_deg=160,
+        vertical_fov_deg=50,
+        projection="rectilinear",
+        tile_width=320,
+        tile_height=240,
+    )
+    rays, _ = rectilinear_world_rays(Tile(0, 0, 320, 240), output)
+    center = rays[119, 159]
+    assert center[2] > 0.99
+    assert abs(float(center[0])) < 0.01
+    assert abs(float(center[1])) < 0.01
 
 
 def test_seam_weights_are_smooth_and_nonnegative() -> None:

@@ -9,7 +9,7 @@ import pytest
 import tifffile
 
 from vpstitch.config import Camera, Color, Lens, Video
-from vpstitch.ffmpegio import VideoDecoder, VideoEncoder, probe_video
+from vpstitch.ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
 from vpstitch.imageio import ExrSequenceEncoder, TiffSequenceEncoder
 
 
@@ -23,6 +23,7 @@ def _camera(width: int, height: int) -> Camera:
     ("codec", "suffix", "minimum_levels", "maximum_error"),
     [
         ("ffv1-16", ".mkv", 2000, 0),
+        ("prores-hq", ".mov", 800, 512),
         ("prores-4444", ".mov", 1800, 512),
     ],
 )
@@ -58,9 +59,9 @@ def test_high_bit_depth_video_roundtrip(
     assert np.unique(decoded[..., 0]).size >= minimum_levels
     error = np.abs(decoded.astype(np.int32) - frame.astype(np.int32))
     assert int(error.max()) <= maximum_error
-    if codec == "prores-4444":
+    if codec.startswith("prores"):
         probe = probe_video(path)
-        assert probe.bit_depth == 12
+        assert probe.bit_depth == (12 if codec == "prores-4444" else 10)
         assert probe.colorspace == "bt709"
 
 
@@ -110,3 +111,33 @@ def test_decoder_start_time_selects_later_frame(tmp_path: Path) -> None:
     decoder.close()
     assert selected is not None
     assert int(np.median(selected)) == 25000
+
+
+def test_dpx_sequence_is_12bit_rgb(tmp_path: Path) -> None:
+    width, height = 257, 32
+    ramp = np.linspace(0, 65535, width, dtype=np.uint16)
+    frame = np.repeat(ramp[None, :, None], height, axis=0)
+    frame = np.repeat(frame, 3, axis=2)
+    video = Video(fps=24, frames=1, output_codec="dpx12-sequence")
+    directory = tmp_path / "dpx"
+    encoder = DpxSequenceEncoder(directory, width, height, video, Color())
+    encoder.write(frame)
+    encoder.close()
+    probe = probe_video(directory / "frame_000000.dpx")
+    assert probe.bit_depth == 12
+    manifest = json.loads((directory / "vpstitch_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["format"] == "gbrp12le-dpx-sequence"
+    assert manifest["frames"] == 1
+
+
+def test_h264_mp4_is_10bit(tmp_path: Path) -> None:
+    width, height = 320, 180
+    frame = np.full((height, width, 3), 32768, dtype=np.uint16)
+    path = tmp_path / "review.mp4"
+    video = Video(fps=24, frames=1, output_codec="h264-mp4-10")
+    encoder = VideoEncoder(path, width, height, video)
+    encoder.write(frame)
+    encoder.close()
+    probe = probe_video(path)
+    assert probe.codec == "h264"
+    assert probe.bit_depth == 10

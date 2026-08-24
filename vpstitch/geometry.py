@@ -61,6 +61,17 @@ def camera_to_world(camera: Camera) -> np.ndarray:
     return _rot_y(yaw) @ _rot_x(pitch) @ _rot_z(roll)
 
 
+def _apply_view_rotation(
+    rays: np.ndarray, output: Output
+) -> tuple[np.ndarray, np.ndarray]:
+    view_rotation = _rot_y(np.deg2rad(output.center_yaw_deg)) @ _rot_x(
+        np.deg2rad(output.center_pitch_deg)
+    )
+    rays = rays @ view_rotation.T
+    world_longitude = np.arctan2(rays[..., 0], rays[..., 2])
+    return rays, world_longitude
+
+
 def cylindrical_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
     xs = np.arange(tile.x, tile.x + tile.width, dtype=np.float64) + 0.5
     ys = np.arange(tile.y, tile.y + tile.height, dtype=np.float64) + 0.5
@@ -72,18 +83,38 @@ def cylindrical_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.n
     lon, vert = np.meshgrid(local_longitude, vertical)
     rays = np.stack([np.sin(lon), vert, np.cos(lon)], axis=-1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
-    view_rotation = _rot_y(np.deg2rad(output.center_yaw_deg)) @ _rot_x(
-        np.deg2rad(output.center_pitch_deg)
-    )
-    rays = rays @ view_rotation.T
-    world_longitude = np.arctan2(rays[..., 0], rays[..., 2])
-    return rays, world_longitude
+    return _apply_view_rotation(rays, output)
+
+
+def rectilinear_world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
+    """Build rays for a perspective view with straight center lines.
+
+    Rectilinear projection intentionally pushes the unavoidable 180-degree
+    distortion toward the outer edges. It is therefore useful for a driving
+    plate when the center road direction must stay visually natural.
+    """
+    xs = np.arange(tile.x, tile.x + tile.width, dtype=np.float64) + 0.5
+    ys = np.arange(tile.y, tile.y + tile.height, dtype=np.float64) + 0.5
+    horizontal = (xs / output.width - 0.5) * np.deg2rad(output.horizontal_fov_deg)
+    vertical = (ys / output.height - 0.5) * np.deg2rad(output.vertical_fov_deg)
+    horizontal_tangent = np.tan(horizontal)
+    vertical_tangent = np.tan(vertical)
+    x, y = np.meshgrid(horizontal_tangent, vertical_tangent)
+    rays = np.stack([x, y, np.ones_like(x)], axis=-1)
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    return _apply_view_rotation(rays, output)
+
+
+def world_rays(tile: Tile, output: Output) -> tuple[np.ndarray, np.ndarray]:
+    if output.projection == "rectilinear":
+        return rectilinear_world_rays(tile, output)
+    return cylindrical_world_rays(tile, output)
 
 
 def camera_map(
     camera: Camera, tile: Tile, output: Output
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    rays_world, longitude = cylindrical_world_rays(tile, output)
+    rays_world, longitude = world_rays(tile, output)
     rotation = camera_to_world(camera)
     rays_camera = rays_world @ rotation
     x = rays_camera[..., 0]

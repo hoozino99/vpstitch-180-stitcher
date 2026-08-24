@@ -1,18 +1,38 @@
 from __future__ import annotations
 
-import subprocess
+import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from dataclasses import asdict, dataclass
 
 import imageio_ffmpeg
 import numpy as np
 
-from .config import Camera, Video
+from .config import Camera, Color, Video
 
 
 def ffmpeg_executable() -> str:
-    return imageio_ffmpeg.get_ffmpeg_exe()
+    override = os.environ.get("VPSTITCH_FFMPEG", "").strip()
+    if override:
+        return override
+
+    try:
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+    except (OSError, RuntimeError):
+        bundled = ""
+    if bundled and Path(bundled).is_file() and os.access(bundled, os.X_OK):
+        return bundled
+
+    system = shutil.which("ffmpeg")
+    if system:
+        return system
+    raise FileNotFoundError(
+        "FFmpeg was not found. Reinstall imageio-ffmpeg or set VPSTITCH_FFMPEG "
+        "to an ffmpeg executable."
+    )
 
 
 @dataclass(frozen=True)
@@ -198,19 +218,23 @@ def _metadata_args(video: Video) -> list[str]:
 
 
 def _filter_chain(video: Video) -> str:
-    zscale_parameters = ["dither=error_diffusion"]
+    # The encoder input is always full-range RGB48, regardless of the source
+    # clip's original YUV range. Tell zscale both sides explicitly so RGB to
+    # YUV conversion remains deterministic even when metadata is absent.
+    zscale_parameters = ["matrixin=gbr", "rangein=full", "dither=error_diffusion"]
     matrix_names = {
         "bt709": "709",
         "bt2020nc": "2020_ncl",
         "bt2020c": "2020_cl",
         "smpte170m": "170m",
     }
-    if video.colorspace in matrix_names:
-        zscale_parameters.append(f"matrix={matrix_names[video.colorspace]}")
-    if video.color_range:
-        zscale_parameters.append(
-            "range=" + ({"tv": "limited", "pc": "full"}.get(video.color_range, video.color_range))
-        )
+    zscale_parameters.append(f"matrix={matrix_names.get(video.colorspace, '709')}")
+    zscale_parameters.append(
+        "range="
+        + ({"tv": "limited", "pc": "full"}.get(video.color_range, video.color_range)
+           if video.color_range
+           else "limited")
+    )
     filters = ["zscale=" + ":".join(zscale_parameters)]
     parameters: list[str] = []
     if video.color_range:
@@ -304,6 +328,23 @@ class VideoEncoder:
                     "yuv444p10le",
                 ]
             )
+        elif video.output_codec == "h264-mp4-10":
+            command.extend(
+                [
+                    "-vf",
+                    _filter_chain(video),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "slow",
+                    "-crf",
+                    "14",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-movflags",
+                    "+faststart",
+                ]
+            )
         else:
             raise ValueError(f"unsupported output codec: {video.output_codec}")
         command.extend(_metadata_args(video))
@@ -336,3 +377,100 @@ class VideoEncoder:
         return_code = self.process.wait()
         if return_code:
             raise OSError(f"ffmpeg encode failed ({return_code}): {stderr}")
+
+
+class DpxSequenceEncoder:
+    """Writes a 12-bit RGB DPX sequence through FFmpeg."""
+
+    def __init__(
+        self,
+        directory: str | Path,
+        width: int,
+        height: int,
+        video: Video,
+        color: Color,
+    ):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.width = width
+        self.height = height
+        self.video = video
+        self.color = color
+        self.frame_index = 0
+        if any(self.directory.glob("frame_*.dpx")):
+            raise OSError(f"refusing to overwrite existing DPX sequence: {self.directory}")
+        pattern = self.directory / "frame_%06d.dpx"
+        command = [
+            ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-n",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb48le",
+            "-s:v",
+            f"{width}x{height}",
+            "-r",
+            str(video.fps),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-vf",
+            "zscale=dither=error_diffusion,format=gbrp12le",
+            "-c:v",
+            "dpx",
+            "-pix_fmt",
+            "gbrp12le",
+            "-start_number",
+            "0",
+            str(pattern),
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=8 * 1024 * 1024,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        expected = (self.height, self.width, 3)
+        if frame.dtype != np.uint16 or frame.shape != expected:
+            raise ValueError(f"DPX sequence expects uint16 RGB frames with shape {expected}")
+        assert self.process.stdin is not None
+        contiguous = np.ascontiguousarray(frame)
+        self.process.stdin.write(memoryview(contiguous).cast("B"))
+        self.frame_index += 1
+
+    def close(self) -> None:
+        assert self.process.stdin is not None
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
+        stderr = (
+            self.process.stderr.read().decode("utf-8", errors="replace")
+            if self.process.stderr
+            else ""
+        )
+        return_code = self.process.wait()
+        if return_code:
+            raise OSError(f"ffmpeg DPX encode failed ({return_code}): {stderr}")
+        manifest = {
+            "format": "gbrp12le-dpx-sequence",
+            "width": self.width,
+            "height": self.height,
+            "frames": self.frame_index,
+            "fps": self.video.fps,
+            "color": asdict(self.color),
+            "video_color_tags": {
+                "color_primaries": self.video.color_primaries,
+                "color_trc": self.video.color_trc,
+                "colorspace": self.video.colorspace,
+                "color_range": self.video.color_range,
+            },
+        }
+        (self.directory / "vpstitch_manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
