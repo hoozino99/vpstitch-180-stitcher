@@ -57,9 +57,8 @@ class Output:
     center_yaw_deg: float = 0.0
     center_pitch_deg: float = 0.0
     projection: str = "cylindrical"
-    # Fractional vertical compression at the horizontal edges for the
-    # cylindrical_rugby projection. 0.10 means the outermost columns are
-    # 10% shorter vertically than the center columns.
+    # Mild central bulge for the cylindrical_rugby projection. 0.10 makes the
+    # center region slightly larger while tapering the left/right regions.
     rugby_strength: float = 0.0
     tile_width: int = 1024
     tile_height: int = 512

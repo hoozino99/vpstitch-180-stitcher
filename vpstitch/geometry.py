@@ -77,17 +77,21 @@ def _cylindrical_world_rays(
 ) -> tuple[np.ndarray, np.ndarray]:
     xs = np.arange(tile.x, tile.x + tile.width, dtype=np.float64) + 0.5
     ys = np.arange(tile.y, tile.y + tile.height, dtype=np.float64) + 0.5
-    local_longitude = (
-        (xs / output.width - 0.5) * np.deg2rad(output.horizontal_fov_deg)
-    )
+    horizontal_half_fov = np.deg2rad(output.horizontal_fov_deg) * 0.5
+    horizontal_position = (xs / output.width - 0.5) * 2.0
+    if rugby_strength:
+        # A cubic remap makes the center occupy more image width and makes
+        # the outer regions progressively narrower, like a rugby ball.
+        horizontal_position = (
+            horizontal_position + rugby_strength * horizontal_position**3
+        ) / (1.0 + rugby_strength)
+    local_longitude = horizontal_position * horizontal_half_fov
     vertical_extent = np.tan(np.deg2rad(output.vertical_fov_deg) * 0.5)
     vertical = (ys / output.height - 0.5) * (2.0 * vertical_extent)
     lon, vert = np.meshgrid(local_longitude, vertical)
     if rugby_strength:
-        # Keep the frontal center at its original vertical scale while making
-        # the left/right sides progressively shorter. This gives the wide
-        # view a mild rugby-ball profile without changing the center heading.
-        horizontal_half_fov = np.deg2rad(output.horizontal_fov_deg) * 0.5
+        # Apply the matching vertical taper so the full uncropped coverage
+        # also narrows toward the left/right ends.
         normalized_longitude = lon / horizontal_half_fov
         side_scale = 1.0 - rugby_strength * normalized_longitude**2
         vert *= side_scale
