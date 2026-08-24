@@ -20,7 +20,9 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 
 권장 작업 순서:
 
-1. `IMPORT 5 PLATES`에서 왼쪽 카메라부터 오른쪽 카메라 순서로 원본을 선택합니다.
+1. `IMPORT PLATES`에서 `P01–P03` 또는 `P01–P05` 원본을 한 번에 선택합니다. 선택
+   순서와 관계없이 파일명이나 상위 폴더명의 `P01`, `CAM01`, `01` 표기를 인식해
+   1번부터 자동 배치합니다.
 2. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
    공통 구간으로 자동 트림합니다.
 3. 하나의 `SHARED TIMELINE`에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
@@ -32,10 +34,15 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 ### Rig Profile은 무엇인가
 
 앱에서 예전의 `config` 표기는 `Rig Profile`로 바뀌었습니다. 이 파일은 영상마다
-새로 만드는 프로젝트 파일이 아니라 카메라 5대의 렌즈 보정값, 좌우 배치 각도,
+새로 만드는 프로젝트 파일이 아니라 카메라 3대 또는 5대의 렌즈 보정값, 좌우 배치 각도,
 기본 캔버스와 출력 설정을 담은 리그 레시피입니다. 앱을 처음 실행하면 실측
 `Drive 5-Cam` 프로필이 자동으로 로드되므로 같은 리그로 촬영한 P01–P05 플레이트는
 별도 JSON 선택 없이 바로 불러와 작업할 수 있습니다.
+
+P01–P03 세 개만 임포트하면 현재 5카메라 프로필의 좌·중앙·우 카메라를 사용한
+3카메라 작업 레이아웃으로 자동 전환합니다. 전방 3카메라 리그의 실제 렌즈나 물리
+각도가 후방 5카메라 리그와 다르면 전용 3카메라 `Rig Profile`을 열거나 `RIG ALIGN`으로
+보정해야 합니다.
 
 `RIG ALIGN`은 동기화된 Preview 프레임을 분석해 카메라별 yaw/pitch/roll을 미세
 보정합니다. 렌즈 종류와 왜곡값을 영상만 보고 처음부터 자동 생성하는 기능은 아니며,
@@ -57,7 +64,8 @@ uint16/float32 스티칭 및 FFV1/TIFF/EXR 마스터의 정밀도에는 영향�
 - 렌더 시 조절 가능한 캔버스(최대 20000×6000), FOV, 중심 yaw/pitch
 - 메모리를 제한하는 타일 기반 cylindrical projection
 - 고정 리그 투영 맵의 디스크 캐시(프레임마다 삼각함수 재계산 방지)
-- embedded SMPTE TC 기반 5개 플레이트 정렬과 공통 구간 자동 트림
+- embedded SMPTE TC 기반 3개/5개 플레이트 정렬과 공통 구간 자동 트림
+- P01–P03/P01–P05 네이밍 자동 인식 및 1번부터 카메라 순서 배치
 - drop-frame/non-drop-frame 및 24시간 자정 rollover 처리
 - pinhole 및 equidistant fisheye 렌즈 모델
 - float32 feather blending

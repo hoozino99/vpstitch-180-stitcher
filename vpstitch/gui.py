@@ -53,6 +53,48 @@ from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
 APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
+SUPPORTED_CAMERA_COUNTS = (3, 5)
+_EXPLICIT_PLATE_NUMBER = re.compile(
+    r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-5])(?=$|[^0-9])",
+    re.IGNORECASE,
+)
+_BARE_PLATE_NUMBER = re.compile(r"(?:^|[^0-9])0([1-5])(?=$|[^0-9])")
+
+
+def plate_number(path: str | Path) -> int | None:
+    """Read a one-based P01-P05 camera number from a clip or parent folder name."""
+    source = Path(path)
+    components = [source.stem, *(parent.name for parent in source.parents[:3])]
+    for pattern in (_EXPLICIT_PLATE_NUMBER, _BARE_PLATE_NUMBER):
+        for component in components:
+            match = pattern.search(component)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def order_camera_plates(paths: list[str]) -> tuple[list[str], list[int] | None]:
+    """Validate 3/5-plate imports and order recognized P01-P05 names."""
+    if len(paths) not in SUPPORTED_CAMERA_COUNTS:
+        raise ValueError("Select either 3 plates (P01-P03) or 5 plates (P01-P05)")
+
+    detected = [plate_number(path) for path in paths]
+    if all(number is None for number in detected):
+        natural = lambda value: [
+            int(token) if token.isdigit() else token.casefold()
+            for token in re.split(r"(\d+)", Path(value).name)
+        ]
+        return sorted(paths, key=natural), None
+    if any(number is None for number in detected):
+        raise ValueError("Some plate numbers are missing. Name every clip P01-P03 or P01-P05")
+
+    numbers = [int(number) for number in detected if number is not None]
+    expected = list(range(1, len(paths) + 1))
+    if sorted(numbers) != expected:
+        expected_text = ", ".join(f"P{number:02d}" for number in expected)
+        raise ValueError(f"Plate names must contain each of {expected_text} exactly once")
+    ordered = sorted(zip(numbers, paths, strict=True), key=lambda item: item[0])
+    return [path for _, path in ordered], [number for number, _ in ordered]
 
 
 def _runtime_root() -> Path:
@@ -99,7 +141,7 @@ class PreviewView(QGraphicsView):
         self.setBackgroundBrush(QColor("#090c11"))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty = QLabel("5개 영상을 넣고  PREVIEW  를 누르세요")
+        self._empty = QLabel("P01–P03 또는 P01–P05를 넣고  PREVIEW  를 누르세요")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setStyleSheet("color:#7e8793; font-size:13px; letter-spacing:.5px;")
         self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -239,9 +281,12 @@ class SourceTable(QTableWidget):
     def set_rig(self, cameras: list[dict[str, object]], paths: list[str] | None = None) -> None:
         paths = paths or [""] * len(cameras)
         self.setRowCount(len(cameras))
+        table_height = 34 + len(cameras) * self.verticalHeader().defaultSectionSize()
+        self.setMinimumHeight(table_height)
+        self.setMaximumHeight(table_height)
         for row, camera in enumerate(cameras):
             values = [
-                str(camera.get("name", f"cam{row}")),
+                f"CAM {row + 1}",
                 paths[row] if row < len(paths) else "",
                 "—",
                 "—",
@@ -344,6 +389,8 @@ class MainWindow(QMainWindow):
         self.user_data_root.mkdir(parents=True, exist_ok=True)
         self.config_path: Path | None = None
         self.config_data: dict[str, object] = {}
+        self._rig_profiles: dict[int, dict[str, object]] = {}
+        self._plate_numbers: list[int] | None = None
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_output = ""
@@ -380,9 +427,9 @@ class MainWindow(QMainWindow):
         app_title = QLabel("VP Stitch")
         app_title.setObjectName("appTitle")
         top_layout.addWidget(app_title)
-        app_subtitle = QLabel("5-CAMERA 180° PANORAMA")
-        app_subtitle.setObjectName("appSubtitle")
-        top_layout.addWidget(app_subtitle)
+        self.app_subtitle = QLabel("5-CAMERA 180° PANORAMA")
+        self.app_subtitle.setObjectName("appSubtitle")
+        top_layout.addWidget(self.app_subtitle)
         top_layout.addStretch()
         self.profile_label = QLabel("Rig Profile · Loading…")
         self.profile_label.setObjectName("profileLabel")
@@ -422,23 +469,23 @@ class MainWindow(QMainWindow):
         media_title = QLabel("MEDIA POOL")
         media_title.setProperty("sectionTitle", True)
         source_layout.addWidget(media_title)
-        media_hint = QLabel("Import five camera plates in left → right order")
-        media_hint.setWordWrap(True)
-        media_hint.setProperty("muted", True)
-        source_layout.addWidget(media_hint)
+        self.media_hint = QLabel("Import P01–P03 or P01–P05 · auto ordered")
+        self.media_hint.setWordWrap(True)
+        self.media_hint.setProperty("muted", True)
+        source_layout.addWidget(self.media_hint)
         source_layout.addWidget(self.source_table)
         source_buttons = QHBoxLayout()
-        choose = QPushButton("IMPORT 5 PLATES")
-        choose.setObjectName("primaryButton")
-        choose.clicked.connect(self.choose_videos)
+        self.import_button = QPushButton("IMPORT PLATES")
+        self.import_button.setObjectName("primaryButton")
+        self.import_button.clicked.connect(self.choose_videos)
         clear = QPushButton("CLEAR")
         clear.setObjectName("secondaryButton")
         clear.clicked.connect(self.clear_sources)
-        source_buttons.addWidget(choose, 1)
+        source_buttons.addWidget(self.import_button, 1)
         source_buttons.addWidget(clear)
         source_layout.addLayout(source_buttons)
         source_layout.addStretch()
-        self.source_status = QLabel("Drop five clips here · No clips loaded")
+        self.source_status = QLabel("Drop P01–P03 or P01–P05 clips here")
         self.source_status.setObjectName("sourceStatus")
         self.source_status.setWordWrap(True)
         source_layout.addWidget(self.source_status)
@@ -510,7 +557,7 @@ class MainWindow(QMainWindow):
         timing_header = QHBoxLayout()
         timing_title = QLabel("SHARED TIMELINE")
         timing_title.setProperty("sectionTitle", True)
-        self.timing_status = QLabel("TC Align finds the shortest common range across all five cameras")
+        self.timing_status = QLabel("TC Align finds the shortest common range across every camera")
         self.timing_status.setProperty("muted", True)
         timing_header.addWidget(timing_title)
         timing_header.addSpacing(12)
@@ -623,14 +670,68 @@ class MainWindow(QMainWindow):
         self.log_box.setVisible(checked)
         self.jobs_toggle.setText("HIDE JOBS" if checked else "JOBS")
 
+    def _profile_for_count(self, count: int) -> dict[str, object]:
+        if count in self._rig_profiles:
+            return json.loads(json.dumps(self._rig_profiles[count]))
+        if count == 5:
+            for name in ("drive_5cam_180.prores-hq.json", "five_cam_180.sample.json"):
+                path = self.project_root / "configs" / name
+                if not path.is_file():
+                    continue
+                profile = json.loads(path.read_text(encoding="utf-8"))
+                cameras = profile.get("cameras")
+                if isinstance(cameras, list) and len(cameras) == 5:
+                    self._rig_profiles[5] = json.loads(json.dumps(profile))
+                    return profile
+        if count == 3 and 5 in self._rig_profiles:
+            profile = json.loads(json.dumps(self._rig_profiles[5]))
+            cameras = profile["cameras"]
+            profile["cameras"] = [cameras[0], cameras[len(cameras) // 2], cameras[-1]]
+            self._rig_profiles[3] = json.loads(json.dumps(profile))
+            return profile
+        raise ValueError(f"Load a calibrated {count}-camera Rig Profile first")
+
+    def _activate_camera_count(self, count: int) -> None:
+        profile = self._profile_for_count(count)
+        cameras = profile.get("cameras")
+        if not isinstance(cameras, list) or len(cameras) != count:
+            raise ValueError(f"The active Rig Profile does not contain {count} cameras")
+        self.config_data["cameras"] = json.loads(json.dumps(cameras))
+        self.source_table.blockSignals(True)
+        self.source_table.set_rig(self.config_data["cameras"])
+        self.source_table.blockSignals(False)
+        self.app_subtitle.setText(f"{count}-CAMERA 180° PANORAMA")
+        profile_kind = "Auto Profile" if self.config_path and self.config_path.parent == self.project_root / "configs" else "Custom Profile"
+        self.profile_label.setText(f"Drive {count}-Cam · {profile_kind}")
+        self.setWindowTitle(f"{APP_NAME}  —  {count}-Camera 180°")
+
+    def _set_video_sources(self, files: list[str]) -> None:
+        ordered, numbers = order_camera_plates(files)
+        self._activate_camera_count(len(ordered))
+        self._plate_numbers = numbers
+        self.source_table.set_paths(ordered)
+        self._reset_timing()
+        order_note = (
+            f"P{numbers[0]:02d} → P{numbers[-1]:02d}"
+            if numbers
+            else "natural filename order"
+        )
+        self._append_log(f"Imported {len(ordered)} plates · {order_note}")
+
     def _update_source_status(self) -> None:
         loaded = sum(bool(path) for path in self.source_table.paths())
+        expected = self.source_table.rowCount()
         if loaded == self.source_table.rowCount():
-            self.source_status.setText("●  5 of 5 plates ready · ordered left → right")
+            order_note = (
+                f"P{self._plate_numbers[0]:02d} → P{self._plate_numbers[-1]:02d}"
+                if self._plate_numbers
+                else "filename order"
+            )
+            self.source_status.setText(f"●  {loaded} of {expected} plates ready · {order_note}")
         elif loaded:
-            self.source_status.setText(f"●  {loaded} of 5 plates loaded")
+            self.source_status.setText(f"●  {loaded} of {expected} plates loaded")
         else:
-            self.source_status.setText("Drop five clips here · No clips loaded")
+            self.source_status.setText("Drop P01–P03 or P01–P05 clips here")
 
     def _stitch_settings(self) -> QWidget:
         panel = QWidget()
@@ -644,8 +745,8 @@ class MainWindow(QMainWindow):
         profile_title.setProperty("inspectorTitle", True)
         profile_layout.addWidget(profile_title)
         profile_note = QLabel(
-            "Drive 5-Cam loads automatically. It stores lens calibration, camera angles, "
-            "and the 180° output layout."
+            "Drive Rig loads automatically for 3 or 5 plates. It stores lens calibration, "
+            "camera angles, and the 180° output layout."
         )
         profile_note.setWordWrap(True)
         profile_note.setProperty("muted", True)
@@ -962,11 +1063,17 @@ class MainWindow(QMainWindow):
             cameras = raw.get("cameras")
             if not isinstance(cameras, list) or not cameras:
                 raise ValueError("config has no cameras")
+            if len(cameras) not in SUPPORTED_CAMERA_COUNTS:
+                raise ValueError("GUI Rig Profiles must contain either 3 or 5 cameras")
         except Exception as error:
             self._error("Rig profile error", str(error))
             return
         self.config_path = path
         self.config_data = raw
+        if len(cameras) == 5:
+            self._rig_profiles.pop(3, None)
+        self._rig_profiles[len(cameras)] = json.loads(json.dumps(raw))
+        self._plate_numbers = None
         self._tc_alignment = None
         self._tc_alignment_path = None
         self.source_table.blockSignals(True)
@@ -1002,10 +1109,12 @@ class MainWindow(QMainWindow):
         self._reset_timing()
         self.settings.setValue("lastConfig", str(path))
         is_builtin = path.name.startswith("drive_5cam_180") or path.parent == self.project_root / "configs"
-        profile_name = "Drive 5-Cam · Auto Profile" if is_builtin else f"{path.stem} · Custom Profile"
+        count = len(cameras)
+        profile_name = f"Drive {count}-Cam · Auto Profile" if is_builtin else f"{path.stem} · Custom Profile"
         self.profile_label.setText(profile_name)
         self.profile_label.setToolTip(str(path))
-        self.setWindowTitle(f"{APP_NAME}  —  5-Camera 180°")
+        self.app_subtitle.setText(f"{count}-CAMERA 180° PANORAMA")
+        self.setWindowTitle(f"{APP_NAME}  —  {count}-Camera 180°")
         self._update_color_controls()
         self._update_output_hint()
         self._append_log(f"Loaded rig profile: {path}")
@@ -1102,16 +1211,21 @@ class MainWindow(QMainWindow):
             self._append_log(f"Saved rig profile: {destination}")
 
     def choose_videos(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "Select camera videos left to right", str(self.project_root), VIDEO_FILTER)
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select P01-P03 or P01-P05 camera plates",
+            str(self.project_root),
+            VIDEO_FILTER,
+        )
         if files:
-            if len(files) != self.source_table.rowCount():
-                self._error("Need five videos", f"Expected {self.source_table.rowCount()} files, selected {len(files)}")
-                return
-            self.source_table.set_paths(files)
-            self._reset_timing()
+            try:
+                self._set_video_sources(files)
+            except Exception as error:
+                self._error("Import plates", str(error))
 
     def clear_sources(self) -> None:
         self.source_table.set_paths([""] * self.source_table.rowCount())
+        self._plate_numbers = None
         self._reset_timing()
 
     def _reset_timing(self) -> None:
@@ -1132,7 +1246,7 @@ class MainWindow(QMainWindow):
         self.frame_limit.setEnabled(True)
         self.frame_limit.setValue(self._configured_frame_limit)
         self.timeline_duration.setText("0 frames")
-        self.timing_status.setText("TC Align finds the shortest common range across all five cameras")
+        self.timing_status.setText("TC Align finds the shortest common range across every camera")
         self.rig_align_button.setEnabled(False)
         self.preview_note.setText("Display preview · master render remains high bit depth")
         self._update_source_status()
@@ -1297,8 +1411,8 @@ class MainWindow(QMainWindow):
 
     def _validate_sources(self) -> list[str]:
         paths = self.source_table.paths()
-        if len(paths) != 5 or any(not path for path in paths):
-            raise ValueError("Select all five camera videos")
+        if len(paths) not in SUPPORTED_CAMERA_COUNTS or any(not path for path in paths):
+            raise ValueError("Select all 3 or all 5 camera plates")
         missing = [path for path in paths if not Path(path).is_file()]
         if missing:
             raise ValueError("Missing video: " + missing[0])
@@ -1402,11 +1516,14 @@ class MainWindow(QMainWindow):
 
         def load_alignment() -> None:
             current_paths = self.source_table.paths()
+            plate_numbers = self._plate_numbers
             tc_alignment = self._tc_alignment
             tc_alignment_path = self._tc_alignment_path
             timeline_range = self.timeline_bar.values()
             self.load_config(output)
             self.source_table.set_paths(current_paths)
+            self._plate_numbers = plate_numbers
+            self._update_source_status()
             if tc_alignment:
                 self._tc_alignment_path = tc_alignment_path
                 self._apply_alignment_payload(
@@ -1604,11 +1721,10 @@ class MainWindow(QMainWindow):
         if len(configs) == 1:
             self.load_config(Path(configs[0]))
         if videos:
-            if len(videos) == self.source_table.rowCount():
-                self.source_table.set_paths(videos)
-                self._reset_timing()
-            else:
-                self._error("Drop videos", f"Drop exactly {self.source_table.rowCount()} videos at once")
+            try:
+                self._set_video_sources(videos)
+            except Exception as error:
+                self._error("Drop videos", str(error))
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
