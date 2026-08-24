@@ -56,6 +56,13 @@ APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
+GUI_MASTER_BIT_DEPTHS = {
+    "prores-hq": 10,
+    "prores-4444": 10,
+    "h264-mp4-10": 10,
+    "hevc-444-10": 10,
+    "dpx12-sequence": 12,
+}
 _EXPLICIT_PLATE_NUMBER = re.compile(
     r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-5])(?=$|[^0-9])",
     re.IGNORECASE,
@@ -406,6 +413,20 @@ class SourceTable(QTableWidget):
                 item.setText(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
+    def set_probe_data(self, inputs: list[dict[str, object]]) -> None:
+        if len(inputs) != self.rowCount():
+            raise ValueError("source probe result does not match the source count")
+        for row, probe in enumerate(inputs):
+            bit_depth = int(probe.get("bit_depth", 0))
+            pixel_format = str(probe.get("pixel_format") or "unknown")
+            item = self.item(row, 4)
+            if item is None:
+                item = QTableWidgetItem()
+                self.setItem(row, 4, item)
+            item.setText(f"{bit_depth}-BIT")
+            item.setToolTip(f"Detected source: {pixel_format}, {bit_depth}-bit")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
     def offsets(self) -> list[int]:
         try:
             return [int(self.item(row, 8).text()) for row in range(self.rowCount())]
@@ -439,6 +460,7 @@ class MainWindow(QMainWindow):
         self.config_data: dict[str, object] = {}
         self._rig_profiles: dict[int, dict[str, object]] = {}
         self._plate_numbers: list[int] | None = None
+        self._source_probes: list[dict[str, object]] | None = None
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_failure: Callable[[], None] | None = None
@@ -763,6 +785,7 @@ class MainWindow(QMainWindow):
         ordered, numbers = order_camera_plates(files)
         self._activate_camera_count(len(ordered))
         self._plate_numbers = numbers
+        self._source_probes = None
         self.source_table.set_paths(ordered)
         self._reset_timing()
         order_note = (
@@ -781,7 +804,17 @@ class MainWindow(QMainWindow):
                 if self._plate_numbers
                 else "filename order"
             )
-            self.source_status.setText(f"●  {loaded} of {expected} plates ready · {order_note}")
+            if self._source_probes:
+                depths = sorted({int(probe["bit_depth"]) for probe in self._source_probes})
+                source_depth = "/".join(str(depth) for depth in depths)
+                self.source_status.setText(
+                    f"●  {loaded} plates · {order_note}\n"
+                    f"SOURCE {source_depth}-bit → MASTER 10/12-bit"
+                )
+            else:
+                self.source_status.setText(
+                    f"●  {loaded} of {expected} plates ready · detecting source depth…"
+                )
         elif loaded:
             self.source_status.setText(f"●  {loaded} of {expected} plates loaded")
         else:
@@ -930,7 +963,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(color)
         note = QLabel(
             "OCIO 모드는 리샘플링 전에 모든 카메라를 scene-linear 작업공간으로 변환합니다. "
-            "ACEScg 출력은 EXR half-float를 선택하세요."
+            "GUI 마스터 출력은 10/12-bit로 제한됩니다."
         )
         note.setWordWrap(True)
         note.setProperty("muted", True)
@@ -953,8 +986,6 @@ class MainWindow(QMainWindow):
         self.output_codec.addItem("DPX · 12-bit RGB sequence", "dpx12-sequence")
         self.output_codec.addItem("H.264 MP4 · 10-bit 4:2:0", "h264-mp4-10")
         self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
-        self.output_codec.addItem("FFV1 · 16-bit RGB lossless", "ffv1-16")
-        self.output_codec.addItem("OpenEXR · half-float sequence", "exr-half-sequence")
         self.output_codec.addItem("HEVC · 10-bit 4:4:4", "hevc-444-10")
         self.output_codec.currentIndexChanged.connect(self._update_output_hint)
         self.output_path = QLineEdit()
@@ -1141,6 +1172,7 @@ class MainWindow(QMainWindow):
             self._rig_profiles.pop(3, None)
         self._rig_profiles[len(cameras)] = json.loads(json.dumps(raw))
         self._plate_numbers = None
+        self._source_probes = None
         self._tc_alignment = None
         self._tc_alignment_path = None
         self.source_table.blockSignals(True)
@@ -1168,8 +1200,11 @@ class MainWindow(QMainWindow):
         self.output_space.setText(str(color.get("output_space") or ""))
         self.integer_dither.setChecked(bool(color.get("integer_dither", True)))
         video = raw.setdefault("video", {"fps": 29.97})
-        codec = str(video.get("output_codec", "ffv1-16"))
-        self.output_codec.setCurrentIndex(max(0, self.output_codec.findData(codec)))
+        codec = str(video.get("output_codec", "prores-hq"))
+        codec_index = self.output_codec.findData(codec)
+        self.output_codec.setCurrentIndex(
+            self.output_codec.findData("prores-hq") if codec_index < 0 else codec_index
+        )
         self.fps.setValue(float(video.get("fps", 29.97)))
         self._configured_frame_limit = int(video.get("frames") or 0)
         self.frame_limit.setValue(self._configured_frame_limit)
@@ -1237,11 +1272,14 @@ class MainWindow(QMainWindow):
             for camera in cameras:
                 camera["colorspace"] = self.input_space.text().strip()
         video = raw.setdefault("video", {})
+        codec = str(self.output_codec.currentData())
+        if codec not in GUI_MASTER_BIT_DEPTHS:
+            raise ValueError("Master output must use a supported 10-bit or 12-bit codec")
         video.update(
             {
                 "fps": self.fps.value(),
                 "frames": self.frame_limit.value() or None,
-                "output_codec": str(self.output_codec.currentData()),
+                "output_codec": codec,
             }
         )
         return raw
@@ -1289,12 +1327,14 @@ class MainWindow(QMainWindow):
         if files:
             try:
                 self._set_video_sources(files)
+                self._analyze_imported_sources()
             except Exception as error:
                 self._error("Import plates", str(error))
 
     def clear_sources(self) -> None:
         self.source_table.set_paths([""] * self.source_table.rowCount())
         self._plate_numbers = None
+        self._source_probes = None
         self._reset_timing()
 
     def _cleanup_reference_dir(self, path: Path | None) -> None:
@@ -1564,13 +1604,60 @@ class MainWindow(QMainWindow):
         return paths
 
     def check_inputs(self) -> None:
+        self._analyze_imported_sources()
+
+    def _analyze_imported_sources(self) -> None:
         try:
             config = self._write_working_config()
             sources = self._validate_sources()
         except Exception as error:
             self._error("Input check", str(error))
             return
-        self._run_cli("CHECK INPUTS", ["probe-inputs", "--config", str(config), *sources])
+        report = self._working_dir / "input-probe.json"
+        report.unlink(missing_ok=True)
+
+        def apply_probe() -> None:
+            try:
+                self._apply_source_probe_payload(
+                    json.loads(report.read_text(encoding="utf-8"))
+                )
+            except Exception as error:
+                self._error("Input analysis", str(error))
+
+        self._run_cli(
+            "ANALYZE INPUTS",
+            [
+                "probe-inputs",
+                "--allow-low-bit-depth",
+                "--config",
+                str(config),
+                "--output",
+                str(report),
+                *sources,
+            ],
+            apply_probe,
+            lambda: self.source_status.setText("Source analysis failed · open Jobs"),
+        )
+
+    def _apply_source_probe_payload(self, payload: dict[str, object]) -> None:
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, list) or len(inputs) != self.source_table.rowCount():
+            raise ValueError("invalid source probe report")
+        probes = [dict(item) for item in inputs if isinstance(item, dict)]
+        if len(probes) != len(inputs):
+            raise ValueError("invalid source probe entries")
+        self._source_probes = probes
+        self.source_table.set_probe_data(probes)
+        self._update_source_status()
+        minimum = min(int(probe["bit_depth"]) for probe in probes)
+        if minimum < 10:
+            self.preview_note.setText(
+                f"SOURCE {minimum}-bit · preview allowed · master encoded at 10/12-bit"
+            )
+        else:
+            self.preview_note.setText(
+                f"SOURCE {minimum}-bit detected · 10/12-bit master pipeline ready"
+            )
 
     def _write_preview_config(
         self,
@@ -1707,6 +1794,7 @@ class MainWindow(QMainWindow):
 
         arguments = [
             "extract-reference",
+            "--allow-low-bit-depth",
             "--config",
             str(config),
             "--time",
@@ -1755,12 +1843,16 @@ class MainWindow(QMainWindow):
             output.write_text(json.dumps(full_raw, indent=2), encoding="utf-8")
             current_paths = self.source_table.paths()
             plate_numbers = self._plate_numbers
+            source_probes = self._source_probes
             tc_alignment = self._tc_alignment
             tc_alignment_path = self._tc_alignment_path
             timeline_range = self.timeline_bar.values()
             self.load_config(output)
             self.source_table.set_paths(current_paths)
             self._plate_numbers = plate_numbers
+            self._source_probes = source_probes
+            if source_probes:
+                self.source_table.set_probe_data(source_probes)
             self._update_source_status()
             if tc_alignment:
                 self._tc_alignment_path = tc_alignment_path
@@ -1816,6 +1908,8 @@ class MainWindow(QMainWindow):
             if not output:
                 raise ValueError("Choose a render destination")
             codec = str(self.output_codec.currentData())
+            if codec not in GUI_MASTER_BIT_DEPTHS:
+                raise ValueError("Choose a 10-bit or 12-bit master codec")
             if codec.endswith("sequence") and Path(output).exists() and any(Path(output).iterdir()):
                 raise ValueError("Sequence output directory must be empty")
         except Exception as error:
@@ -1825,10 +1919,22 @@ class MainWindow(QMainWindow):
             f"Start {self.canvas_width.value()}×{self.canvas_height.value()} render?\n\n"
             f"Codec: {self.output_codec.currentText()}\nOutput: {output}"
         )
+        if self._source_probes:
+            minimum = min(int(probe["bit_depth"]) for probe in self._source_probes)
+            message += (
+                f"\n\nDetected source: {minimum}-bit → "
+                f"master: {GUI_MASTER_BIT_DEPTHS[codec]}-bit"
+            )
+            if minimum < 10:
+                message += (
+                    "\nSource detail remains 8-bit; the master codec cannot recreate "
+                    "missing precision."
+                )
         if QMessageBox.question(self, "Start render", message) != QMessageBox.StandardButton.Yes:
             return
         arguments = [
             "stitch-video",
+            "--allow-low-bit-depth",
             "--config",
             str(config),
             "--output",
@@ -1961,8 +2067,6 @@ class MainWindow(QMainWindow):
     def _update_output_hint(self) -> None:
         codec = str(self.output_codec.currentData())
         hints = {
-            "ffv1-16": "권장 장편 마스터: 무손실 16-bit RGB MKV. 파일 크기는 영상 내용에 따라 달라집니다.",
-            "exr-half-sequence": "OCIO scene-linear 권장: 음수와 1 초과 값을 보존합니다. 출력 폴더가 필요합니다.",
             "dpx12-sequence": "VFX/Resolve 교환용 12-bit RGB DPX 시퀀스. 출력 폴더가 필요합니다.",
             "prores-4444": "편집 호환용 10-bit YUV. 16-bit RGB 보존 마스터는 아닙니다.",
             "prores-hq": "편집용 10-bit 4:2:2. 크로마 해상도가 줄어듭니다.",
@@ -1992,6 +2096,7 @@ class MainWindow(QMainWindow):
         if videos:
             try:
                 self._set_video_sources(videos)
+                self._analyze_imported_sources()
             except Exception as error:
                 self._error("Drop videos", str(error))
         event.acceptProposedAction()

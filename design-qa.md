@@ -72,11 +72,12 @@ final result: passed
 
 - Removed the duplicate READY indicator and top-level PROFILE action. Profile open/save remains in the Inspector, where its settings live.
 - Removed the separate viewer reference-time input. Playhead navigation now lives only in Shared Timeline.
-- TIFF generation was removed. Preview/reference stills use 16-bit PNG; master output choices remain video, EXR, or DPX.
+- TIFF generation was removed. Preview/reference stills use 16-bit PNG; the GUI exposes only 10-bit video masters or 12-bit DPX.
 
 ### Stability evidence and limits
 
-- Automated suite: 71 tests passed, including pre-allocation decoder scaling, fitted preview configuration, high-resolution inputs behind a 4K canvas, queued playhead refresh, extreme-aspect fit, timeline state, Unicode-safe PNG reference extraction, and rejection of the removed TIFF sequence codec.
+- Automated suite: 73 tests passed, including automatic source-depth display, GUI master restriction to 10/12-bit, pre-allocation decoder scaling, fitted preview configuration, high-resolution inputs behind a 4K canvas, queued playhead refresh, extreme-aspect fit, timeline state, Unicode-safe PNG reference extraction, and rejection of the removed TIFF sequence codec.
+- Real-source verification: the five supplied 5952×3968 H.264 `yuv420p` 8-bit P01–P05 clips were auto-detected, displayed as `SOURCE 8-bit → MASTER 10/12-bit`, and produced a 3840×992 no-crop stitched preview successfully.
 - macOS arm64 app was rebuilt, ad-hoc code signature verified, launched, and remained running after startup.
 - Three earlier native crash reports ended inside macOS accessibility hierarchy inspection while external UI audit tooling queried the Qt window. They do not show an out-of-memory termination. High-resolution workload pressure was addressed separately by pre-decode preview scaling, bounded 4K output, temporary-reference cleanup, and bounded task logging.
 - VoiceOver/accessibility-tree behavior still requires a dedicated physical interaction pass; the native inspection crash means this follow-up does not claim full accessibility certification.

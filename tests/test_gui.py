@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QToolBar
 
 from vpstitch.config import load_config
 from vpstitch.gui import (
+    GUI_MASTER_BIT_DEPTHS,
     MainWindow,
     TrimRangeBar,
     order_camera_plates,
@@ -71,7 +72,42 @@ def test_gui_loads_sample_rig() -> None:
     assert window.source_table.rowCount() == 5
     assert window.canvas_width.value() == 15360
     assert window.canvas_height.value() == 3968
-    assert window.output_codec.currentData() == "ffv1-16"
+    assert window.output_codec.currentData() == "prores-hq"
+    window.close()
+    app.processEvents()
+
+
+def test_gui_master_outputs_are_limited_to_10_or_12_bit() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    codecs = [
+        str(window.output_codec.itemData(index))
+        for index in range(window.output_codec.count())
+    ]
+    assert set(codecs) == set(GUI_MASTER_BIT_DEPTHS)
+    assert {GUI_MASTER_BIT_DEPTHS[codec] for codec in codecs} <= {10, 12}
+    window.close()
+    app.processEvents()
+
+
+def test_gui_applies_detected_source_depth_without_manual_flag() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    inputs = [
+        {
+            "path": f"P{index:02d}.mov",
+            "pixel_format": "yuv420p",
+            "bit_depth": 8,
+        }
+        for index in range(1, 6)
+    ]
+    window._plate_numbers = list(range(1, 6))
+    window.source_table.set_paths([str(item["path"]) for item in inputs])
+    window._apply_source_probe_payload({"inputs": inputs, "issues": []})
+    assert window._source_probes == inputs
+    assert window.source_table.item(0, 4).text() == "8-BIT"
+    assert "SOURCE 8-bit → MASTER 10/12-bit" in window.source_status.text()
+    assert "preview allowed" in window.preview_note.text()
     window.close()
     app.processEvents()
 
