@@ -1,0 +1,107 @@
+{
+  "cameras": [
+    {
+      "name": "P01",
+      "width": 1600,
+      "height": 1067,
+      "yaw_deg": -90.0,
+      "lens": {
+        "model": "pinhole",
+        "fx": 1000.0,
+        "fy": 1000.0,
+        "cx": 800.0,
+        "cy": 533.5,
+        "distortion": [0.0, 0.0, 0.0, 0.0]
+      }
+    },
+    {
+      "name": "P02",
+      "width": 1600,
+      "height": 1067,
+      "yaw_deg": -45.0,
+      "lens": {
+        "model": "pinhole",
+        "fx": 1000.0,
+        "fy": 1000.0,
+        "cx": 800.0,
+        "cy": 533.5,
+        "distortion": [0.0, 0.0, 0.0, 0.0]
+      }
+    },
+    {
+      "name": "P03",
+      "width": 1600,
+      "height": 1067,
+      "yaw_deg": 0.0,
+      "lens": {
+        "model": "pinhole",
+        "fx": 1000.0,
+        "fy": 1000.0,
+        "cx": 800.0,
+        "cy": 533.5,
+        "distortion": [0.0, 0.0, 0.0, 0.0]
+      }
+    },
+    {
+      "name": "P04",
+      "width": 1600,
+      "height": 1067,
+      "yaw_deg": 45.0,
+      "lens": {
+        "model": "pinhole",
+        "fx": 1000.0,
+        "fy": 1000.0,
+        "cx": 800.0,
+        "cy": 533.5,
+        "distortion": [0.0, 0.0, 0.0, 0.0]
+      }
+    },
+    {
+      "name": "P05",
+      "width": 1600,
+      "height": 1067,
+      "yaw_deg": 90.0,
+      "lens": {
+        "model": "pinhole",
+        "fx": 1000.0,
+        "fy": 1000.0,
+        "cx": 800.0,
+        "cy": 533.5,
+        "distortion": [0.0, 0.0, 0.0, 0.0]
+      }
+    }
+  ],
+  "output": {
+    "width": 4096,
+    "height": 1067,
+    "horizontal_fov_deg": 180.0,
+    "vertical_fov_deg": 52.0,
+    "center_yaw_deg": 0.0,
+    "center_pitch_deg": 0.0,
+    "projection": "cylindrical",
+    "tile_width": 512,
+    "tile_height": 256,
+    "seam_feather_deg": 5.0
+  },
+  "color": {
+    "mode": "passthrough",
+    "integer_dither": true,
+    "dither_seed": 7349
+  },
+  "flow": {
+    "enabled": false,
+    "algorithm": "dis",
+    "preset": "medium",
+    "confidence_threshold": 0.35,
+    "max_displacement_px": 32.0
+  },
+  "video": {
+    "fps": 29.97,
+    "frames": null,
+    "output_codec": "ffv1-16",
+    "color_primaries": null,
+    "color_trc": null,
+    "colorspace": null,
+    "color_range": null
+  }
+}
