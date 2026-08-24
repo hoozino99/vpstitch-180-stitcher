@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import tifffile
 from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -46,6 +46,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .imageio import read_image
 
 from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH
 
@@ -109,9 +111,14 @@ def _user_data_root() -> Path:
     return Path(location) if location else Path.home() / "Library" / "Application Support" / "VP-LAB" / APP_NAME
 
 
-def preview_dimensions(width: int, height: int, max_width: int = 2048, max_height: int = 900) -> tuple[int, int]:
+def preview_dimensions(
+    width: int,
+    height: int,
+    max_width: int = 3840,
+    max_height: int = 2160,
+) -> tuple[int, int]:
     scale = min(1.0, max_width / width, max_height / height)
-    return max(32, int(round(width * scale))), max(32, int(round(height * scale)))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
 def _display_image(array: np.ndarray) -> QImage:
@@ -169,28 +176,51 @@ class PreviewView(QGraphicsView):
 
 
 class TrimRangeBar(QWidget):
-    """Compact dual-handle frame range control for the aligned timeline."""
+    """Trim range plus a clearly draggable preview playhead."""
 
     rangeChanged = Signal(int, int)
+    playheadChanged = Signal(int)
+    playheadReleased = Signal(int)
 
     def __init__(self) -> None:
         super().__init__()
         self._maximum = 1
         self._lower = 0
         self._upper = 1
+        self._playhead = 0
         self._active: str | None = None
-        self.setMinimumHeight(32)
+        self.setMinimumHeight(42)
+        self.setToolTip(
+            "Drag the edge caps to trim. Drag the bright playhead to scrub the stitched preview."
+        )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def set_frame_range(self, maximum: int, lower: int = 0, upper: int | None = None) -> None:
+    def set_frame_range(
+        self,
+        maximum: int,
+        lower: int = 0,
+        upper: int | None = None,
+        playhead: int | None = None,
+    ) -> None:
         self._maximum = max(1, int(maximum))
         self._lower = max(0, min(int(lower), self._maximum - 1))
         requested_upper = self._maximum if upper is None else int(upper)
         self._upper = max(self._lower + 1, min(requested_upper, self._maximum))
+        requested_playhead = self._playhead if playhead is None else int(playhead)
+        self._playhead = max(self._lower, min(requested_playhead, self._upper - 1))
         self.update()
 
     def values(self) -> tuple[int, int]:
         return self._lower, self._upper
+
+    def playhead(self) -> int:
+        return self._playhead
+
+    def set_playhead(self, value: int) -> None:
+        value = max(self._lower, min(int(value), self._upper - 1))
+        if value != self._playhead:
+            self._playhead = value
+            self.update()
 
     def _track_bounds(self) -> tuple[float, float, float]:
         left = 14.0
@@ -212,28 +242,38 @@ class TrimRangeBar(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         left, right, center = self._track_bounds()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#343b45") if self.isEnabled() else QColor("#454c56"))
-        painter.drawRoundedRect(left, center - 3.0, right - left, 6.0, 3.0, 3.0)
+        painter.setBrush(QColor("#30363f") if self.isEnabled() else QColor("#292e35"))
+        painter.drawRoundedRect(left, center - 5.0, right - left, 10.0, 5.0, 5.0)
         lower_x = self._position(self._lower)
         upper_x = self._position(self._upper)
-        painter.setBrush(QColor("#5f5b83") if self.isEnabled() else QColor("#4a4957"))
-        painter.drawRoundedRect(lower_x, center - 4.0, upper_x - lower_x, 8.0, 4.0, 4.0)
+        painter.setBrush(QColor("#55516f") if self.isEnabled() else QColor("#3e3d49"))
+        painter.drawRoundedRect(lower_x, center - 6.0, upper_x - lower_x, 12.0, 5.0, 5.0)
         for position in (lower_x, upper_x):
-            painter.setBrush(QColor("#f3efff") if self.isEnabled() else QColor("#8a919b"))
-            painter.drawEllipse(position - 7.0, center - 7.0, 14.0, 14.0)
-            painter.setBrush(QColor("#5f5b83") if self.isEnabled() else QColor("#525761"))
-            painter.drawEllipse(position - 3.0, center - 3.0, 6.0, 6.0)
+            painter.setBrush(QColor("#9b96b8") if self.isEnabled() else QColor("#5d626b"))
+            painter.drawRoundedRect(position - 4.0, center - 14.0, 8.0, 28.0, 3.0, 3.0)
+        playhead_x = self._position(self._playhead)
+        painter.setPen(QColor("#f0eef7") if self.isEnabled() else QColor("#707680"))
+        painter.drawLine(
+            int(playhead_x),
+            int(center - 15.0),
+            int(playhead_x),
+            int(center + 15.0),
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#f0eef7") if self.isEnabled() else QColor("#707680"))
+        painter.drawEllipse(playhead_x - 4.0, center - 18.0, 8.0, 8.0)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if not self.isEnabled():
             return
         position = event.position().x()
-        self._active = (
-            "lower"
-            if abs(position - self._position(self._lower))
-            <= abs(position - self._position(self._upper))
-            else "upper"
-        )
+        distances = {
+            "lower": abs(position - self._position(self._lower)),
+            "upper": abs(position - self._position(self._upper)),
+            "playhead": abs(position - self._position(self._playhead)),
+        }
+        nearest = min(distances, key=distances.get)
+        self._active = nearest if distances[nearest] <= 11.0 else "playhead"
         self._move_active(position)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -242,16 +282,24 @@ class TrimRangeBar(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         del event
+        if self._active == "playhead":
+            self.playheadReleased.emit(self._playhead)
         self._active = None
 
     def _move_active(self, position: float) -> None:
         value = self._value(position)
         if self._active == "lower":
             self._lower = min(max(0, value), self._upper - 1)
+            self._playhead = max(self._lower, self._playhead)
         elif self._active == "upper":
             self._upper = max(self._lower + 1, min(value, self._maximum))
+            self._playhead = min(self._playhead, self._upper - 1)
+        elif self._active == "playhead":
+            self._playhead = max(self._lower, min(value, self._upper - 1))
+            self.playheadChanged.emit(self._playhead)
         self.update()
-        self.rangeChanged.emit(self._lower, self._upper)
+        if self._active in {"lower", "upper"}:
+            self.rangeChanged.emit(self._lower, self._upper)
 
 
 class SourceTable(QTableWidget):
@@ -393,8 +441,12 @@ class MainWindow(QMainWindow):
         self._plate_numbers: list[int] | None = None
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
-        self._process_output = ""
+        self._process_failure: Callable[[], None] | None = None
         self._last_reference_dir: Path | None = None
+        self._last_reference_config_path: Path | None = None
+        self._preview_ready = False
+        self._preview_in_progress = False
+        self._pending_scrub_frame: int | None = None
         self._tc_alignment: dict[str, object] | None = None
         self._tc_alignment_path: Path | None = None
         self._timeline_maximum = 1
@@ -415,7 +467,7 @@ class MainWindow(QMainWindow):
             initial = self.project_root / "configs" / "five_cam_180.sample.json"
         if initial.is_file():
             self.load_config(initial)
-        self.statusBar().showMessage("Ready · preview is display-only; final render stays high bit depth")
+        self.statusBar().showMessage("Ready · preview fits within 4K; final render stays full resolution")
 
     def _build_ui(self) -> None:
         top_bar = QFrame()
@@ -437,14 +489,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.profile_label)
         top_layout.addStretch()
         self.status_pill = QLabel("READY")
-        self.status_pill.setObjectName("statusPill")
-        self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top_layout.addWidget(self.status_pill)
-        profile_button = QPushButton("PROFILE…")
-        profile_button.setObjectName("topButton")
-        profile_button.setToolTip("Open another calibrated rig profile")
-        profile_button.clicked.connect(self.choose_config)
-        top_layout.addWidget(profile_button)
+        self.status_pill.hide()
         self.inspector_toggle = QPushButton("INSPECTOR")
         self.inspector_toggle.setObjectName("topButton")
         self.inspector_toggle.setCheckable(True)
@@ -478,11 +523,11 @@ class MainWindow(QMainWindow):
         self.import_button = QPushButton("IMPORT PLATES")
         self.import_button.setObjectName("primaryButton")
         self.import_button.clicked.connect(self.choose_videos)
-        clear = QPushButton("CLEAR")
-        clear.setObjectName("secondaryButton")
-        clear.clicked.connect(self.clear_sources)
+        self.clear_button = QPushButton("CLEAR")
+        self.clear_button.setObjectName("secondaryButton")
+        self.clear_button.clicked.connect(self.clear_sources)
         source_buttons.addWidget(self.import_button, 1)
-        source_buttons.addWidget(clear)
+        source_buttons.addWidget(self.clear_button)
         source_layout.addLayout(source_buttons)
         source_layout.addStretch()
         self.source_status = QLabel("Drop P01–P03 or P01–P05 clips here")
@@ -499,18 +544,14 @@ class MainWindow(QMainWindow):
         preview_header = QHBoxLayout()
         title = QLabel("PANORAMA PREVIEW")
         title.setProperty("sectionTitle", True)
-        self.preview_time = QDoubleSpinBox()
-        self.preview_time.setRange(0.0, 86400.0)
-        self.preview_time.setDecimals(3)
-        self.preview_time.setSuffix(" sec")
-        self.preview_time.setValue(0.0)
+        preview_limit = QLabel("UHD 4K MAX  ·  FIT / NO CROP")
+        preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
         preview_header.addStretch()
-        preview_header.addWidget(QLabel("REFERENCE TIME"))
-        preview_header.addWidget(self.preview_time)
+        preview_header.addWidget(preview_limit)
         preview_layout.addLayout(preview_header)
         preview_layout.addWidget(self.preview, 1)
-        self.preview_note = QLabel("Display preview · master render remains high bit depth")
+        self.preview_note = QLabel("Fitted preview · UHD 4K max · master render stays full resolution")
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_note.setProperty("muted", True)
         preview_layout.addWidget(self.preview_note)
@@ -521,13 +562,13 @@ class MainWindow(QMainWindow):
         settings_scroll.setMinimumWidth(286)
         settings_scroll.setMaximumWidth(350)
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        tabs = QTabWidget()
-        tabs.setMinimumWidth(0)
-        tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        tabs.addTab(self._stitch_settings(), "RIG")
-        tabs.addTab(self._color_settings(), "COLOR")
-        tabs.addTab(self._output_settings(), "DELIVER")
-        settings_scroll.setWidget(tabs)
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setMinimumWidth(0)
+        self.settings_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.settings_tabs.addTab(self._stitch_settings(), "RIG")
+        self.settings_tabs.addTab(self._color_settings(), "COLOR")
+        self.settings_tabs.addTab(self._output_settings(), "DELIVER")
+        settings_scroll.setWidget(self.settings_tabs)
         self.inspector_panel = QFrame()
         self.inspector_panel.setObjectName("inspectorPanel")
         self.inspector_panel.setMinimumWidth(310)
@@ -570,6 +611,8 @@ class MainWindow(QMainWindow):
         self.timeline_bar = TrimRangeBar()
         self.timeline_bar.setEnabled(False)
         self.timeline_bar.rangeChanged.connect(self._timeline_bar_changed)
+        self.timeline_bar.playheadChanged.connect(self._timeline_playhead_changed)
+        self.timeline_bar.playheadReleased.connect(self._timeline_playhead_released)
         timing_layout.addWidget(self.timeline_bar)
         timing_values = QHBoxLayout()
         self.timeline_in = QSpinBox()
@@ -578,16 +621,27 @@ class MainWindow(QMainWindow):
             widget.setRange(0, 10_000_000)
             widget.setEnabled(False)
             widget.valueChanged.connect(self._timeline_spin_changed)
-        reset_timeline = QPushButton("RESET RANGE")
-        reset_timeline.setObjectName("quietButton")
-        reset_timeline.clicked.connect(self._reset_timeline_range)
+        self.timeline_playhead = QSpinBox()
+        self.timeline_playhead.setRange(0, 10_000_000)
+        self.timeline_playhead.setEnabled(False)
+        self.timeline_playhead.valueChanged.connect(self._timeline_playhead_spin_changed)
+        self.timeline_playhead.editingFinished.connect(self._scrub_preview)
+        self.playhead_time = QLabel("00:00:00.000")
+        self.playhead_time.setObjectName("playheadTime")
+        self.reset_timeline_button = QPushButton("RESET RANGE")
+        self.reset_timeline_button.setObjectName("quietButton")
+        self.reset_timeline_button.clicked.connect(self._reset_timeline_range)
         timing_values.addWidget(QLabel("IN"))
         timing_values.addWidget(self.timeline_in)
         timing_values.addSpacing(10)
         timing_values.addWidget(QLabel("OUT"))
         timing_values.addWidget(self.timeline_out)
+        timing_values.addSpacing(14)
+        timing_values.addWidget(QLabel("PLAYHEAD"))
+        timing_values.addWidget(self.timeline_playhead)
+        timing_values.addWidget(self.playhead_time)
         timing_values.addStretch()
-        timing_values.addWidget(reset_timeline)
+        timing_values.addWidget(self.reset_timeline_button)
         timing_layout.addLayout(timing_values)
 
         action_bar = QFrame()
@@ -901,7 +955,6 @@ class MainWindow(QMainWindow):
         self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
         self.output_codec.addItem("FFV1 · 16-bit RGB lossless", "ffv1-16")
         self.output_codec.addItem("OpenEXR · half-float sequence", "exr-half-sequence")
-        self.output_codec.addItem("BigTIFF · 16-bit RGB sequence", "tiff16-sequence")
         self.output_codec.addItem("HEVC · 10-bit 4:4:4", "hevc-444-10")
         self.output_codec.currentIndexChanged.connect(self._update_output_hint)
         self.output_path = QLineEdit()
@@ -1039,6 +1092,20 @@ class MainWindow(QMainWindow):
             }
             QTabBar::tab:selected { color:#efedf7; border-bottom:2px solid #6d688c; }
             QLabel#durationBadge { color:#aaa5c8; padding:2px 5px; font-weight:700; }
+            QLabel#previewLimit {
+                color:#8f96a1;
+                border:1px solid #303740;
+                border-radius:3px;
+                padding:3px 7px;
+                font-size:9px;
+                font-weight:700;
+            }
+            QLabel#playheadTime {
+                color:#d8d5e6;
+                padding:2px 5px;
+                font-family:'Cascadia Mono','SF Mono','Menlo';
+                font-size:10px;
+            }
             QLabel#sourceStatus { color:#858d98; font-size:10px; }
             QScrollArea { border:0; background:transparent; }
             QSplitter#workspaceSplitter::handle { background:#2a3038; }
@@ -1180,6 +1247,8 @@ class MainWindow(QMainWindow):
         return raw
 
     def _write_working_config(self) -> Path:
+        if self.process is not None:
+            raise ValueError("Another task is already running")
         raw = self._collect_config()
         path = self._working_dir / "working-config.json"
         path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
@@ -1228,10 +1297,28 @@ class MainWindow(QMainWindow):
         self._plate_numbers = None
         self._reset_timing()
 
+    def _cleanup_reference_dir(self, path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            resolved = path.resolve()
+            if (
+                resolved.parent == self._working_dir.resolve()
+                and resolved.name.startswith("reference-")
+            ):
+                shutil.rmtree(resolved, ignore_errors=True)
+        except OSError:
+            pass
+
     def _reset_timing(self) -> None:
+        self._cleanup_reference_dir(self._last_reference_dir)
         self._tc_alignment = None
         self._tc_alignment_path = None
         self._last_reference_dir = None
+        self._last_reference_config_path = None
+        self._preview_ready = False
+        self._preview_in_progress = False
+        self._pending_scrub_frame = None
         self._timeline_maximum = 1
         self.source_table.clear_timing()
         self.timeline_bar.setEnabled(False)
@@ -1243,12 +1330,16 @@ class MainWindow(QMainWindow):
         self.timeline_out.setValue(1)
         self.timeline_in.setEnabled(False)
         self.timeline_out.setEnabled(False)
+        self.timeline_playhead.setRange(0, 0)
+        self.timeline_playhead.setValue(0)
+        self.timeline_playhead.setEnabled(False)
+        self.playhead_time.setText("00:00:00.000")
         self.frame_limit.setEnabled(True)
         self.frame_limit.setValue(self._configured_frame_limit)
         self.timeline_duration.setText("0 frames")
         self.timing_status.setText("TC Align finds the shortest common range across every camera")
         self.rig_align_button.setEnabled(False)
-        self.preview_note.setText("Display preview · master render remains high bit depth")
+        self.preview_note.setText("Fitted preview · UHD 4K max · master render stays full resolution")
         self._update_source_status()
         self._timeline_updating = False
 
@@ -1258,16 +1349,20 @@ class MainWindow(QMainWindow):
         maximum = self._timeline_maximum
         lower = max(0, min(int(lower), maximum - 1))
         upper = max(lower + 1, min(int(upper), maximum))
+        playhead = max(lower, min(self.timeline_playhead.value(), upper - 1))
         self._timeline_updating = True
-        self.timeline_bar.set_frame_range(maximum, lower, upper)
+        self.timeline_bar.set_frame_range(maximum, lower, upper, playhead)
         self.timeline_in.setValue(lower)
         self.timeline_out.setValue(upper)
+        self.timeline_playhead.setRange(lower, upper - 1)
+        self.timeline_playhead.setValue(playhead)
         duration = upper - lower
         self.frame_limit.setValue(duration)
         fps = float(self._tc_alignment["fps"])
         self.timeline_duration.setText(
             f"{duration:,} frames  ·  {duration / fps:,.2f} sec"
         )
+        self._update_playhead_time(playhead)
         self._timeline_updating = False
 
     def _timeline_bar_changed(self, lower: int, upper: int) -> None:
@@ -1277,6 +1372,55 @@ class MainWindow(QMainWindow):
     def _timeline_spin_changed(self) -> None:
         if not self._timeline_updating:
             self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
+
+    def _update_playhead_time(self, frame: int) -> None:
+        fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
+        seconds = frame / max(fps, 0.001)
+        hours = int(seconds // 3600)
+        minutes = int(seconds % 3600 // 60)
+        remaining = seconds % 60
+        self.playhead_time.setText(f"{hours:02d}:{minutes:02d}:{remaining:06.3f}")
+
+    def _set_playhead(self, frame: int) -> None:
+        if not self._tc_alignment:
+            return
+        lower, upper = self.timeline_bar.values()
+        frame = max(lower, min(int(frame), upper - 1))
+        self._timeline_updating = True
+        self.timeline_playhead.setValue(frame)
+        self.timeline_bar.set_playhead(frame)
+        self._update_playhead_time(frame)
+        self._timeline_updating = False
+
+    def _timeline_playhead_changed(self, frame: int) -> None:
+        if not self._timeline_updating:
+            self._set_playhead(frame)
+
+    def _timeline_playhead_spin_changed(self, frame: int) -> None:
+        if not self._timeline_updating:
+            self._set_playhead(frame)
+
+    def _timeline_playhead_released(self, frame: int) -> None:
+        self._set_playhead(frame)
+        self._scrub_preview()
+
+    def _scrub_preview(self) -> None:
+        if not self._tc_alignment:
+            return
+        if self._preview_in_progress:
+            self._pending_scrub_frame = self.timeline_playhead.value()
+            self.preview_note.setText("Preview queued for the latest playhead frame")
+            return
+        if self._preview_ready and self.process is None:
+            self.create_preview()
+
+    def _finish_preview_frame(self, rendered_frame: int) -> None:
+        self._preview_in_progress = False
+        pending = self._pending_scrub_frame
+        self._pending_scrub_frame = None
+        if pending is not None and pending != rendered_frame:
+            self._set_playhead(pending)
+            self.create_preview()
 
     def _reset_timeline_range(self) -> None:
         if self._tc_alignment:
@@ -1336,6 +1480,7 @@ class MainWindow(QMainWindow):
         self.timeline_out.setRange(1, self._timeline_maximum)
         self.timeline_in.setEnabled(True)
         self.timeline_out.setEnabled(True)
+        self.timeline_playhead.setEnabled(True)
         self.timeline_bar.setEnabled(True)
         self.frame_limit.setEnabled(False)
         self._set_timeline_range(
@@ -1427,43 +1572,122 @@ class MainWindow(QMainWindow):
             return
         self._run_cli("CHECK INPUTS", ["probe-inputs", "--config", str(config), *sources])
 
+    def _write_preview_config(
+        self,
+        source: Path,
+        destination: Path,
+        width: int,
+        height: int,
+    ) -> float:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        output = raw["output"]
+        camera_scales = [
+            min(3840 / int(camera["width"]), 2160 / int(camera["height"]))
+            for camera in raw["cameras"]
+        ]
+        scale = min(
+            1.0,
+            width / int(output["width"]),
+            height / int(output["height"]),
+            *camera_scales,
+        )
+        output["width"] = width
+        output["height"] = height
+        output["tile_width"] = min(int(output.get("tile_width", 1024)), width)
+        output["tile_height"] = min(int(output.get("tile_height", 512)), height)
+        for camera in raw["cameras"]:
+            camera["width"] = max(1, int(round(int(camera["width"]) * scale)))
+            camera["height"] = max(1, int(round(int(camera["height"]) * scale)))
+            lens = camera["lens"]
+            for key in ("fx", "fy", "cx", "cy"):
+                lens[key] = float(lens[key]) * scale
+            if lens.get("circle_radius") is not None:
+                lens["circle_radius"] = float(lens["circle_radius"]) * scale
+        flow = raw.get("flow")
+        if isinstance(flow, dict) and flow.get("max_displacement_px") is not None:
+            flow["max_displacement_px"] = max(
+                1.0, float(flow["max_displacement_px"]) * scale
+            )
+        destination.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        return scale
+
     def create_preview(self) -> None:
         try:
             config = self._write_working_config()
             sources = self._validate_sources()
             if self._tc_alignment:
-                selected_frames = self.timeline_out.value() - self.timeline_in.value()
-                reference_frame = int(round(self.preview_time.value() * self.fps.value()))
-                if reference_frame >= selected_frames:
-                    raise ValueError(
-                        "Reference time is outside the selected SHARED TIMELINE range"
-                    )
+                reference_frame = self.timeline_playhead.value()
+                if not self.timeline_in.value() <= reference_frame < self.timeline_out.value():
+                    raise ValueError("Playhead is outside the selected SHARED TIMELINE range")
         except Exception as error:
             self._error("Preview", str(error))
             return
         stamp = f"{time.time_ns()}-{os.getpid()}"
         reference = self._working_dir / f"reference-{stamp}"
-        self._last_reference_dir = reference
+        try:
+            reference.mkdir(parents=True, exist_ok=False)
+            width, height = preview_dimensions(
+                self.canvas_width.value(), self.canvas_height.value()
+            )
+            preview_config = reference / "preview-config.json"
+            preview_scale = self._write_preview_config(
+                config,
+                preview_config,
+                width,
+                height,
+            )
+        except Exception as error:
+            self._cleanup_reference_dir(reference)
+            self._error("Preview setup", str(error))
+            return
+        previous_reference = self._last_reference_dir
+        self._preview_in_progress = True
         self.preview.show_message("EXTRACTING SYNCHRONIZED REFERENCE FRAMES …")
-        timeline_start = self.timeline_in.value() if self._tc_alignment else 0
-        reference_time = self.preview_time.value()
+        timeline_start = self.timeline_playhead.value() if self._tc_alignment else 0
+        reference_time = 0.0
+
+        def preview_failed() -> None:
+            self._preview_in_progress = False
+            self._pending_scrub_frame = None
+            self._cleanup_reference_dir(reference)
+            previous_preview = (
+                previous_reference / "stitched-preview.png"
+                if previous_reference is not None
+                else None
+            )
+            if previous_preview is not None and previous_preview.is_file():
+                try:
+                    self.preview.set_array(read_image(previous_preview))
+                    self.preview_note.setText("Previous preview restored · check Jobs for the error")
+                    return
+                except Exception:
+                    pass
+            self.preview.show_message("PREVIEW FAILED · OPEN JOBS FOR DETAILS")
 
         def stitch_reference() -> None:
-            raw = json.loads(config.read_text(encoding="utf-8"))
+            raw = json.loads(preview_config.read_text(encoding="utf-8"))
             names = [camera["name"] for camera in raw["cameras"]]
-            images = [str(reference / f"{name}.tif") for name in names]
-            width, height = preview_dimensions(self.canvas_width.value(), self.canvas_height.value())
-            preview_path = reference / "stitched-preview.tif"
+            images = [str(reference / f"{name}.png") for name in names]
+            preview_path = reference / "stitched-preview.png"
 
             def load_preview() -> None:
                 try:
-                    self.preview.set_array(tifffile.imread(preview_path))
+                    self.preview.set_array(read_image(preview_path))
+                    self._last_reference_dir = reference
+                    self._last_reference_config_path = preview_config
+                    self._preview_ready = True
+                    self._cleanup_reference_dir(previous_reference)
                     self.rig_align_button.setEnabled(True)
                     self.preview_note.setText(
-                        "Rig Align is ready · it adjusts camera geometry, then refreshes this preview"
+                        "Release the playhead to refresh this fitted 4K preview · no crop"
                     )
-                    self.statusBar().showMessage(f"Preview ready: {width}×{height} (display only)", 10000)
+                    self.statusBar().showMessage(
+                        f"Preview ready: {width}×{height} · fitted, no crop",
+                        10000,
+                    )
+                    self._finish_preview_frame(timeline_start)
                 except Exception as error:
+                    preview_failed()
                     self._error("Preview load", str(error))
 
             self.preview.show_message("STITCHING 16-BIT PREVIEW …")
@@ -1472,14 +1696,13 @@ class MainWindow(QMainWindow):
                 [
                     "stitch-frame",
                     "--config",
-                    str(config),
+                    str(preview_config),
                     "--output",
                     str(preview_path),
-                    "--canvas",
-                    f"{width}x{height}",
                     *images,
                 ],
                 load_preview,
+                preview_failed,
             )
 
         arguments = [
@@ -1490,31 +1713,46 @@ class MainWindow(QMainWindow):
             str(reference_time),
             "--start-frame",
             str(timeline_start),
+            "--scale",
+            f"{preview_scale:.9f}",
             "--output-dir",
             str(reference),
         ]
         if self._tc_alignment_path:
             arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
         arguments.extend(sources)
-        self._run_cli("EXTRACT REFERENCES", arguments, stitch_reference)
+        self._run_cli("EXTRACT REFERENCES", arguments, stitch_reference, preview_failed)
 
     def auto_align(self) -> None:
-        if self._last_reference_dir is None:
+        if self._last_reference_dir is None or self._last_reference_config_path is None:
             self._error("Auto align", "Create a preview/reference frame first")
             return
         try:
             config = self._write_working_config()
-            raw = json.loads(config.read_text(encoding="utf-8"))
-            images = [str(self._last_reference_dir / f"{camera['name']}.tif") for camera in raw["cameras"]]
+            calibration_config = self._last_reference_config_path
+            raw = json.loads(calibration_config.read_text(encoding="utf-8"))
+            images = [
+                str(self._last_reference_dir / f"{camera['name']}.png")
+                for camera in raw["cameras"]
+            ]
             if any(not Path(path).is_file() for path in images):
                 raise ValueError("Reference frames are missing; create preview again")
         except Exception as error:
             self._error("Auto align", str(error))
             return
+        calibration_output = self._working_dir / "calibrated-preview-rig.json"
         output = self._working_dir / "calibrated-rig.json"
         report = self._working_dir / "alignment-report.json"
 
         def load_alignment() -> None:
+            full_raw = json.loads(config.read_text(encoding="utf-8"))
+            solved_raw = json.loads(calibration_output.read_text(encoding="utf-8"))
+            solved = {camera["name"]: camera for camera in solved_raw["cameras"]}
+            for camera in full_raw["cameras"]:
+                rotation = solved[camera["name"]]
+                for key in ("yaw_deg", "pitch_deg", "roll_deg"):
+                    camera[key] = rotation[key]
+            output.write_text(json.dumps(full_raw, indent=2), encoding="utf-8")
             current_paths = self.source_table.paths()
             plate_numbers = self._plate_numbers
             tc_alignment = self._tc_alignment
@@ -1540,9 +1778,9 @@ class MainWindow(QMainWindow):
             [
                 "calibrate-rig",
                 "--config",
-                str(config),
+                str(calibration_config),
                 "--output",
-                str(output),
+                str(calibration_output),
                 "--report",
                 str(report),
                 *images,
@@ -1609,12 +1847,18 @@ class MainWindow(QMainWindow):
             lambda: QMessageBox.information(self, "Render complete", f"Output written to:\n{output}"),
         )
 
-    def _run_cli(self, task: str, arguments: list[str], success: Callable[[], None] | None = None) -> None:
+    def _run_cli(
+        self,
+        task: str,
+        arguments: list[str],
+        success: Callable[[], None] | None = None,
+        failure: Callable[[], None] | None = None,
+    ) -> None:
         if self.process is not None:
             self._error("Busy", "Another task is already running")
             return
         self._process_success = success
-        self._process_output = ""
+        self._process_failure = failure
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(self._working_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -1623,6 +1867,7 @@ class MainWindow(QMainWindow):
         self.task_label.setText(task)
         self.status_pill.setText(task)
         self.cancel_button.setVisible(True)
+        self._set_busy_ui(True)
         self.progress.setRange(0, 0)
         self._append_log("\n▶ " + task)
         self._append_log("  vpstitch " + " ".join(f'"{arg}"' if " " in arg else arg for arg in arguments))
@@ -1631,17 +1876,33 @@ class MainWindow(QMainWindow):
             cli_program = Path(sys.executable).with_name(helper_name)
             if not cli_program.is_file():
                 self.process = None
+                self._process_failure = None
+                self._set_busy_ui(False)
                 self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
+                if failure:
+                    failure()
                 return
             self.process.start(str(cli_program), arguments)
         else:
             self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
 
+    def _set_busy_ui(self, busy: bool) -> None:
+        self.import_button.setEnabled(not busy)
+        self.clear_button.setEnabled(not busy)
+        self.source_table.setEnabled(not busy)
+        self.settings_tabs.setEnabled(not busy)
+        self.tc_align_button.setEnabled(not busy)
+        self.preview_button.setEnabled(not busy)
+        self.render_button.setEnabled(not busy)
+        self.rig_align_button.setEnabled(not busy and self._preview_ready)
+        self.timeline_in.setEnabled(not busy and self._tc_alignment is not None)
+        self.timeline_out.setEnabled(not busy and self._tc_alignment is not None)
+        self.reset_timeline_button.setEnabled(not busy and self._tc_alignment is not None)
+
     def _read_process(self) -> None:
         if self.process is None:
             return
         text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        self._process_output += text
         normalized = text.replace("\r", "\n")
         for line in normalized.splitlines():
             if line.strip():
@@ -1657,15 +1918,18 @@ class MainWindow(QMainWindow):
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
         callback = self._process_success
+        failure = self._process_failure
         process = self.process
         task = self.task_label.text()
         self.process = None
         self._process_success = None
+        self._process_failure = None
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if exit_code == 0 else 0)
         self.task_label.setText("IDLE" if exit_code == 0 else "FAILED")
         self.status_pill.setText("READY" if exit_code == 0 else "FAILED")
         self.cancel_button.setVisible(False)
+        self._set_busy_ui(False)
         if process is not None:
             process.deleteLater()
         if exit_code == 0:
@@ -1675,6 +1939,8 @@ class MainWindow(QMainWindow):
         else:
             self._append_log(f"✕ {task} failed with exit code {exit_code}")
             self.statusBar().showMessage("Task failed — see Task Log", 10000)
+            if failure:
+                failure()
 
     def cancel_task(self) -> None:
         if self.process is not None:
@@ -1698,7 +1964,6 @@ class MainWindow(QMainWindow):
             "ffv1-16": "권장 장편 마스터: 무손실 16-bit RGB MKV. 파일 크기는 영상 내용에 따라 달라집니다.",
             "exr-half-sequence": "OCIO scene-linear 권장: 음수와 1 초과 값을 보존합니다. 출력 폴더가 필요합니다.",
             "dpx12-sequence": "VFX/Resolve 교환용 12-bit RGB DPX 시퀀스. 출력 폴더가 필요합니다.",
-            "tiff16-sequence": "정수 RGB 품질 기준용. 20K/29.97fps는 무압축 기준 분당 약 1.18TiB입니다.",
             "prores-4444": "편집 호환용 10-bit YUV. 16-bit RGB 보존 마스터는 아닙니다.",
             "prores-hq": "편집용 10-bit 4:2:2. 크로마 해상도가 줄어듭니다.",
             "h264-mp4-10": "검수용 10-bit H.264 MP4. 15K 마스터 대신 축소 프리뷰에 권장합니다.",
@@ -1715,6 +1980,10 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.process is not None:
+            self.statusBar().showMessage("Finish or cancel the current task before changing media", 8000)
+            event.ignore()
+            return
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         configs = [path for path in paths if Path(path).suffix.lower() == ".json"]
         videos = [path for path in paths if Path(path).suffix.lower() in {".mov", ".mp4", ".mkv", ".avi", ".mxf"}]

@@ -39,6 +39,15 @@ def test_accepts_prores_h264_mp4_and_dpx_outputs(tmp_path: Path) -> None:
         assert load_config(path).video.output_codec == codec
 
 
+def test_rejects_removed_tiff_sequence_output(tmp_path: Path) -> None:
+    source = json.loads(Path("configs/five_cam_180.sample.json").read_text(encoding="utf-8"))
+    source["video"]["output_codec"] = "tiff16-sequence"
+    path = tmp_path / "removed-tiff-output.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
+    with pytest.raises(ConfigError, match="video.output_codec"):
+        load_config(path)
+
+
 def test_accepts_rectilinear_projection(tmp_path: Path) -> None:
     source = json.loads(Path("configs/five_cam_180.sample.json").read_text(encoding="utf-8"))
     source["output"]["projection"] = "rectilinear"

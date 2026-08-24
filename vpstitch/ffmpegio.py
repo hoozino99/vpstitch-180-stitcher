@@ -333,9 +333,13 @@ class VideoDecoder:
         start_frame: int = 0,
         source_fps: float | None = None,
         exact_frame_seek: bool = False,
+        output_size: tuple[int, int] | None = None,
     ):
         self.camera = camera
-        self.frame_bytes = camera.width * camera.height * 3 * 2
+        self.width, self.height = output_size or (camera.width, camera.height)
+        if self.width < 1 or self.height < 1:
+            raise ValueError("decoder output size must be positive")
+        self.frame_bytes = self.width * self.height * 3 * 2
         self._buffer = bytearray(self.frame_bytes)
         if start_frame < 0:
             raise ValueError("decoder start_frame cannot be negative")
@@ -364,6 +368,8 @@ class VideoDecoder:
             filters.extend([f"trim=start_frame={frame_seek}", "setpts=PTS-STARTPTS"])
         if source_fps is None or abs(source_fps - fps) > 0.001:
             filters.append(f"fps={fps}")
+        if output_size is not None:
+            filters.append(f"scale={self.width}:{self.height}:flags=lanczos")
         if filters:
             command.extend(["-vf", ",".join(filters)])
         command.extend(["-f", "rawvideo", "-pix_fmt", "rgb48le", "pipe:1"])
@@ -379,7 +385,7 @@ class VideoDecoder:
         if not _read_exact(self.process.stdout, self._buffer):
             return None
         frame = np.frombuffer(self._buffer, dtype="<u2").reshape(
-            self.camera.height, self.camera.width, 3
+            self.height, self.width, 3
         )
         return frame.copy() if copy else frame
 
@@ -449,7 +455,7 @@ class VideoEncoder:
         if video.output_codec == "hevc-444-10" and width * height > 35_651_584:
             raise ValueError(
                 "hevc-444-10 output exceeds the largest standard HEVC picture level; "
-                "use ffv1-16, tiff16-sequence, exr-half-sequence, or ProRes"
+                "use ffv1-16, exr-half-sequence, or ProRes"
             )
         command = [
             ffmpeg_executable(),

@@ -26,7 +26,8 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 2. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
    공통 구간으로 자동 트림합니다.
 3. 하나의 `SHARED TIMELINE`에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
-4. 고정 피사체가 잘 보이는 시각을 선택하고 `PREVIEW`를 누릅니다.
+4. 고정 피사체가 잘 보이는 시각을 플레이헤드로 선택하고 `PREVIEW`를 누릅니다.
+   첫 프리뷰 이후에는 플레이헤드를 끌어 놓을 때 해당 프레임을 다시 스티칭해 확인합니다.
 5. 공간적인 리그 각도 보정이 필요하면 `RIG ALIGN`을 실행합니다. 보정이 끝나면
    결과 프리뷰가 자동으로 다시 생성됩니다.
 6. Inspector에서 캔버스·OCIO·출력 코덱을 설정하고 `RENDER`를 누릅니다.
@@ -51,7 +52,10 @@ Media Pool과 기술값은 기본 화면에서 분리되어 있고, 필요할 �
 `JOBS` 패널에서만 확인합니다.
 
 GUI 프리뷰는 모니터 표시를 위한 8-bit 축소 영상일 뿐입니다. 프리뷰 표시가 최종
-uint16/float32 스티칭 및 FFV1/TIFF/EXR 마스터의 정밀도에는 영향을 주지 않습니다.
+uint16/float32 스티칭 및 FFV1/EXR 마스터의 정밀도에는 영향을 주지 않습니다.
+프리뷰는 원본 종횡비를 유지한 채 UHD 4K(3840×2160) 안에 맞추므로 크롭이나 늘어남이
+없습니다. 프리뷰용 카메라 입력도 같은 비율로 먼저 축소해 메모리 사용량을 제한하며,
+최종 렌더는 Rig Profile에 지정된 전체 해상도로 처리합니다.
 이 프로그램은 VideoStitch Studio의 소스코드나 UI 자산을 사용한 개조판이 아니라,
 독립적으로 구현된 스티칭 엔진과 데스크톱 UI입니다.
 
@@ -113,7 +117,7 @@ VideoToolbox/D3D11VA는 16-bit/float 처리 품질과 코덱 지원이 장비마
 밴딩 방지를 위한 권장 마스터 출력은 다음 순서입니다.
 
 1. FFV1 `gbrp16le` MKV: RGB 16-bit 무손실 중간 마스터
-2. half-float EXR 이미지 시퀀스: VFX 파이프라인용(다음 버전의 스트리밍 writer 대상)
+2. half-float EXR 이미지 시퀀스: VFX 파이프라인용
 3. ProRes 4444 10-bit: 고품질 실무 교환 포맷
 4. HEVC 10-bit: 검수/배포용이며 마스터로는 비추천
 
@@ -208,7 +212,7 @@ CLI에서 정렬 계획만 JSON으로 확인할 수도 있습니다.
 ```powershell
 .\.venv\Scripts\vpstitch.exe stitch-frame `
   --config configs\five_cam_180.sample.json `
-  --output output\stitched.tif `
+  --output output\stitched.png `
   cam0.tif cam1.tif cam2.tif cam3.tif cam4.tif
 ```
 
@@ -219,7 +223,7 @@ JSON을 바꾸지 않고 렌더마다 캔버스와 구도를 덮어쓸 수 있�
   --config configs\five_cam_180.sample.json `
   --canvas 18000x5000 --h-fov 180 --v-fov 52 `
   --center-yaw 0 --center-pitch -2 `
-  --output output\stitched.tif `
+  --output output\stitched.png `
   cam0.tif cam1.tif cam2.tif cam3.tif cam4.tif
 ```
 
@@ -257,7 +261,6 @@ JSON을 바꾸지 않고 렌더마다 캔버스와 구도를 덮어쓸 수 있�
 `video.output_codec`에서 선택합니다.
 
 - `ffv1-16`: 무손실 `gbrp16le`
-- `tiff16-sequence`: 무손실 16-bit RGB BigTIFF 프레임 시퀀스
 - `exr-half-sequence`: half-float RGB OpenEXR 프레임 시퀀스
 - `dpx12-sequence`: 12-bit RGB DPX 프레임 시퀀스
 - `prores-4444`: ProRes 4444, `yuv444p10le`
@@ -265,15 +268,13 @@ JSON을 바꾸지 않고 렌더마다 캔버스와 구도를 덮어쓸 수 있�
 - `h264-mp4-10`: 10-bit H.264 `yuv420p10le` MP4 검수본
 - `hevc-444-10`: x265 4:4:4 10-bit
 
-15K–20K 무밴딩 기준 마스터에는 `ffv1-16` 또는 `tiff16-sequence`를 권장합니다.
-TIFF 시퀀스는 RGB→YUV 변환과 10-bit 양자화를 완전히 피하고, 출력 폴더에 FPS와
-컬러 설정을 담은 `vpstitch_manifest.json`을 함께 생성합니다. 출력 경로에는 파일이
-아닌 폴더를 지정합니다.
+15K–20K 무밴딩 기준 영상 마스터에는 `ffv1-16`을 권장합니다. VFX 프레임 교환이
+필요한 경우에만 `exr-half-sequence` 또는 `dpx12-sequence`를 선택합니다.
 
 ```json
 "video": {
   "fps": 29.97,
-  "output_codec": "tiff16-sequence"
+  "output_codec": "ffv1-16"
 }
 ```
 
@@ -284,7 +285,7 @@ TIFF 시퀀스는 RGB→YUV 변환과 10-bit 양자화를 완전히 피하고, �
 
 OCIO 출력이 ACEScg 같은 scene-linear 공간이라면 `exr-half-sequence`를 사용하십시오.
 이 경로는 0 미만과 1을 넘는 highlight 값을 클리핑하지 않고 half-float RGB로
-기록합니다. 반대로 TIFF/FFV1/ProRes/HEVC 정수 출력은 최종 출력 공간이 0–1 범위에
+기록합니다. 반대로 FFV1/ProRes/HEVC 정수 출력은 최종 출력 공간이 0–1 범위에
 들어오는 Log 또는 display-referred 공간일 때 사용해야 합니다.
 
 20K 작업 전에는 예상 자원을 확인할 수 있습니다.
@@ -387,7 +388,7 @@ scene-linear 작업공간으로 변환한 뒤 렌즈 투영과 블렌딩을 수�
 고정되어 있고 거리가 충분한 디테일이 많을수록 좋습니다. 사람이나 자동차가 화면의
 대부분을 차지하는 프레임은 피하십시오.
 
-원본 영상에서 동일 시각의 16-bit TIFF를 추출할 수 있습니다. 설정의 카메라별
+원본 영상에서 동일 시각의 16-bit PNG 기준 프레임을 추출할 수 있습니다. 설정의 카메라별
 `frame_offset`도 적용됩니다.
 
 ```powershell
@@ -402,8 +403,8 @@ scene-linear 작업공간으로 변환한 뒤 렌즈 투영과 블렌딩을 수�
   --config configs\five_cam_180.sample.json `
   --output configs\five_cam_180.calibrated.json `
   --report output\rig-alignment.json `
-  reference\cam0.tif reference\cam1.tif reference\cam2.tif `
-  reference\cam3.tif reference\cam4.tif
+  reference\cam0.png reference\cam1.png reference\cam2.png `
+  reference\cam3.png reference\cam4.png
 ```
 
 이 명령은 원본 컬러 데이터를 변환하지 않습니다. 분석용 축소 이미지에서 SIFT
@@ -420,7 +421,7 @@ scene-linear 작업공간으로 변환한 뒤 렌즈 투영과 블렌딩을 수�
 ## 실제 Drive P01–P05 검증 기록
 
 실제 5대 주행 소스는 `5952x3968`, `24 fps`, H.264 `yuv420p` 8-bit, BT.709 계열로
-검출되었습니다. 따라서 16-bit TIFF, FFV1 또는 ProRes 422 HQ로 내보내도 소스에 없는
+검출되었습니다. 따라서 FFV1 또는 ProRes 422 HQ로 내보내도 소스에 없는
 10-bit 정보가 새로 생기지는 않습니다. 품질 제한을 명시적으로 인정하고 작업할 때만
 `--allow-low-bit-depth`를 사용하십시오.
 

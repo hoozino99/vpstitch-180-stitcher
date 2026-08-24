@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import cv2
 
 from vpstitch.cli import main
 from vpstitch.config import Camera, Lens, Video
@@ -161,3 +162,69 @@ def test_five_video_cli_roundtrip_is_16bit_and_smooth(
     assert np.unique(first[..., 0]).size > 900
     assert np.count_nonzero(first == 0) == 0
     assert np.mean(second[..., 2]) > np.mean(first[..., 2])
+
+
+def test_extract_reference_scales_before_writing_preview_frame(
+    tmp_path: Path, monkeypatch
+) -> None:
+    width, height = 64, 32
+    camera = _source_camera(2, width, height)
+    source = tmp_path / "cam.mkv"
+    encoder = VideoEncoder(
+        source,
+        width,
+        height,
+        Video(fps=24, frames=1, output_codec="ffv1-16"),
+    )
+    encoder.write(_world_gradient(camera, 0))
+    encoder.close()
+    config = {
+        "cameras": [
+            {
+                "name": camera.name,
+                "width": width,
+                "height": height,
+                "yaw_deg": 0,
+                "lens": {
+                    "model": "pinhole",
+                    "fx": camera.lens.fx,
+                    "fy": camera.lens.fy,
+                    "cx": camera.lens.cx,
+                    "cy": camera.lens.cy,
+                },
+            }
+        ],
+        "output": {"width": 64, "height": 32, "horizontal_fov_deg": 72},
+        "color": {"mode": "passthrough"},
+        "video": {"fps": 24, "frames": 1, "output_codec": "ffv1-16"},
+    }
+    config_path = tmp_path / "rig.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    output = tmp_path / "references"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vpstitch",
+            "extract-reference",
+            "--config",
+            str(config_path),
+            "--time",
+            "0",
+            "--scale",
+            "0.5",
+            "--output-dir",
+            str(output),
+            str(source),
+        ],
+    )
+    assert main() == 0
+    reference_bgr = cv2.imread(
+        str(output / f"{camera.name}.png"), cv2.IMREAD_UNCHANGED
+    )
+    assert reference_bgr is not None
+    reference = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2RGB)
+    assert reference.shape == (16, 32, 3)
+    assert reference.dtype == np.uint16
+    manifest = json.loads((output / "reference_manifest.json").read_text())
+    assert manifest["reference_scale"] == 0.5

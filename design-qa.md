@@ -51,3 +51,38 @@ Post-fix evidence shows no clipped labels or values at 1298 × 768 or 1487 × 10
 - P3: platform-specific Windows font rendering should be inspected from the CI artifact on a physical Windows display.
 
 final result: passed
+
+## Stability / Timeline Follow-up
+
+- Date: 2026-08-24
+- Before screenshot: `/tmp/vpstitch-stability-audit/01-current-workspace.png`
+- Updated screenshot: `/tmp/vpstitch-stability-audit/02-updated-workspace-1298.png`
+- Same-viewport comparison: `/tmp/vpstitch-stability-audit/03-comparison.png`
+- Viewport: 1298 × 768 px for both sides
+
+### Workflow audit
+
+1. Import plates — unchanged and healthy. P01–P03/P01–P05 recognition and one-based ordering remain visible in the Media Pool.
+2. TC alignment and range trim — clearer. Rectangular IN/OUT caps now read as range boundaries instead of ambiguous dots.
+3. Preview inspection — clearer and safer. A separate bright playhead, frame field, and time display communicate scrubbing; releasing the playhead refreshes an existing stitched preview. If a refresh is already running, the latest requested frame is queued instead of lost.
+4. High-resolution preview — bounded. Preview output fits within 3840 × 2160 while retaining the canvas aspect ratio with no crop. Every camera decode is independently covered by the same UHD bound even when the output canvas is already 4K; scaling occurs before Python allocates each frame. The master render remains at configured resolution.
+5. Rig alignment and render — unchanged. The future `RIG ALIGN` → `STITCH` naming idea is recorded in `PRODUCT_NOTES.md` and intentionally not applied yet.
+
+### Consolidation
+
+- Removed the duplicate READY indicator and top-level PROFILE action. Profile open/save remains in the Inspector, where its settings live.
+- Removed the separate viewer reference-time input. Playhead navigation now lives only in Shared Timeline.
+- TIFF generation was removed. Preview/reference stills use 16-bit PNG; master output choices remain video, EXR, or DPX.
+
+### Stability evidence and limits
+
+- Automated suite: 71 tests passed, including pre-allocation decoder scaling, fitted preview configuration, high-resolution inputs behind a 4K canvas, queued playhead refresh, extreme-aspect fit, timeline state, Unicode-safe PNG reference extraction, and rejection of the removed TIFF sequence codec.
+- macOS arm64 app was rebuilt, ad-hoc code signature verified, launched, and remained running after startup.
+- Three earlier native crash reports ended inside macOS accessibility hierarchy inspection while external UI audit tooling queried the Qt window. They do not show an out-of-memory termination. High-resolution workload pressure was addressed separately by pre-decode preview scaling, bounded 4K output, temporary-reference cleanup, and bounded task logging.
+- VoiceOver/accessibility-tree behavior still requires a dedicated physical interaction pass; the native inspection crash means this follow-up does not claim full accessibility certification.
+
+### Visual result
+
+The viewer remains dominant at the minimum practical viewport. The new timeline has a clear selected range, distinct trim caps, a visible playhead, and consolidated controls without text clipping. No new P0–P2 visual issue was found in the same-viewport comparison.
+
+follow-up result: passed with accessibility verification noted above

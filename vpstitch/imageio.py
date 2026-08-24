@@ -19,7 +19,8 @@ def read_image(path: str | Path) -> np.ndarray:
         image = tifffile.imread(path)
     else:
         os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-        bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        encoded = np.fromfile(path, dtype=np.uint8)
+        bgr = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
         if bgr is None:
             raise OSError(f"unable to read image: {path}")
         image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -28,71 +29,15 @@ def read_image(path: str | Path) -> np.ndarray:
     return np.ascontiguousarray(image[..., :3])
 
 
-def create_tiff_memmap(path: str | Path, shape: tuple[int, int, int]) -> np.memmap:
+def write_png(path: str | Path, image: np.ndarray) -> None:
+    """Write an RGB PNG through a Unicode-safe path on macOS and Windows."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    return tifffile.memmap(
-        path,
-        shape=shape,
-        dtype=np.uint16,
-        photometric="rgb",
-        bigtiff=True,
-    )
-
-
-class TiffSequenceEncoder:
-    """Writes an exact uint16 RGB master sequence without a YUV conversion."""
-
-    def __init__(
-        self,
-        directory: str | Path,
-        width: int,
-        height: int,
-        video: Video,
-        color: Color,
-    ):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.width = width
-        self.height = height
-        self.video = video
-        self.color = color
-        self.frame_index = 0
-
-    def write(self, frame: np.ndarray) -> None:
-        expected = (self.height, self.width, 3)
-        if frame.dtype != np.uint16 or frame.shape != expected:
-            raise ValueError(f"TIFF sequence expects uint16 RGB frames with shape {expected}")
-        path = self.directory / f"frame_{self.frame_index:06d}.tif"
-        if path.exists():
-            raise OSError(f"refusing to overwrite existing sequence frame: {path}")
-        tifffile.imwrite(
-            path,
-            frame,
-            photometric="rgb",
-            bigtiff=True,
-            metadata=None,
-        )
-        self.frame_index += 1
-
-    def close(self) -> None:
-        manifest = {
-            "format": "uint16-rgb-bigtiff-sequence",
-            "width": self.width,
-            "height": self.height,
-            "frames": self.frame_index,
-            "fps": self.video.fps,
-            "color": asdict(self.color),
-            "video_color_tags": {
-                "color_primaries": self.video.color_primaries,
-                "color_trc": self.video.color_trc,
-                "colorspace": self.video.colorspace,
-                "color_range": self.video.color_range,
-            },
-        }
-        (self.directory / "vpstitch_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    success, encoded = cv2.imencode(".png", bgr)
+    if not success:
+        raise OSError(f"unable to encode PNG: {path}")
+    encoded.tofile(path)
 
 
 class ExrSequenceEncoder:

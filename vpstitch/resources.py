@@ -64,7 +64,7 @@ def estimate_resources(config: RigConfig) -> ResourceEstimate:
         sequence_per_minute = int(output_frame * config.video.fps * 60.0)
     notes = [
         "Projection cache size is independent of clip duration.",
-        "TIFF sequence storage is uncompressed worst-case data size.",
+        "The sequence figure is an uncompressed RGB-equivalent worst-case size.",
         "FFV1/ProRes sizes depend on image content and cannot be predicted exactly.",
     ]
     if config.video and config.video.output_codec == "hevc-444-10":

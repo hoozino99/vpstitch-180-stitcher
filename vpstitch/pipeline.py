@@ -16,7 +16,7 @@ from .geometry import (
     seam_weights,
     tile_count,
 )
-from .imageio import create_tiff_memmap, read_image
+from .imageio import read_image, write_png
 from .flow import refine_adjacent_overlaps
 from .mapcache import MapCache
 
@@ -137,21 +137,11 @@ class Stitcher:
         progress: Progress | None = None,
     ) -> None:
         sources = [read_image(path) for path in inputs]
-        if Path(output).suffix.lower() == ".png":
-            import cv2
-
-            destination = np.empty(
-                (self.config.output.height, self.config.output.width, 3),
-                dtype=np.uint16,
-            )
-            self.stitch_arrays(sources, destination, progress=progress)
-            bgr = cv2.cvtColor(destination, cv2.COLOR_RGB2BGR)
-            if not cv2.imwrite(str(output), bgr):
-                raise OSError(f"unable to write PNG output: {output}")
-            return
-        destination = create_tiff_memmap(
-            output,
+        if Path(output).suffix.lower() != ".png":
+            raise ValueError("still-frame output must use the .png extension")
+        destination = np.empty(
             (self.config.output.height, self.config.output.width, 3),
+            dtype=np.uint16,
         )
         self.stitch_arrays(sources, destination, progress=progress)
-        destination.flush()
+        write_png(output, destination)

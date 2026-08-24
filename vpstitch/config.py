@@ -14,7 +14,6 @@ MAX_CANVAS_WIDTH = 20_000
 MAX_CANVAS_HEIGHT = 6_000
 OUTPUT_CODECS = {
     "ffv1-16",
-    "tiff16-sequence",
     "exr-half-sequence",
     "dpx12-sequence",
     "prores-4444",
@@ -224,6 +223,6 @@ def load_config(path: str | Path) -> RigConfig:
         ):
             raise ConfigError(
                 "hevc-444-10 canvas exceeds the largest standard HEVC picture level; "
-                "use ffv1-16, tiff16-sequence, exr-half-sequence, or ProRes for this canvas"
+                "use ffv1-16, exr-half-sequence, or ProRes for this canvas"
             )
     return RigConfig(cameras=cameras, output=output, color=color, flow=flow, video=video)

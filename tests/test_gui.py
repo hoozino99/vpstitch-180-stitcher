@@ -40,15 +40,28 @@ def test_camera_plate_import_rejects_incomplete_numbering() -> None:
 
 
 def test_preview_dimensions_preserve_canvas_aspect() -> None:
-    assert preview_dimensions(15360, 3968) == (2048, 529)
-    assert preview_dimensions(20000, 6000) == (2048, 614)
+    assert preview_dimensions(15360, 3968) == (3840, 992)
+    assert preview_dimensions(20000, 6000) == (3840, 1152)
+    assert preview_dimensions(20000, 32) == (3840, 6)
 
 
 def test_timeline_track_is_vertically_centered() -> None:
     app = QApplication.instance() or QApplication([])
     timeline = TrimRangeBar()
-    timeline.resize(800, 32)
-    assert timeline._track_bounds()[2] == 16.0
+    timeline.resize(800, 42)
+    assert timeline._track_bounds()[2] == 21.0
+
+
+def test_timeline_has_distinct_trim_range_and_playhead() -> None:
+    app = QApplication.instance() or QApplication([])
+    timeline = TrimRangeBar()
+    timeline.set_frame_range(100, 10, 80, 40)
+    assert timeline.values() == (10, 80)
+    assert timeline.playhead() == 40
+    timeline.set_playhead(72)
+    assert timeline.playhead() == 72
+    timeline.set_frame_range(100, 20, 60)
+    assert timeline.playhead() == 59
 
 
 def test_gui_loads_sample_rig() -> None:
@@ -178,8 +191,78 @@ def test_gui_common_timeline_controls_frame_range() -> None:
     window.timeline_out.setRange(1, 100)
     window._set_timeline_range(10, 80)
     assert window.timeline_bar.values() == (10, 80)
+    assert window.timeline_bar.playhead() == 10
+    assert window.timeline_playhead.value() == 10
     assert window.frame_limit.value() == 70
     assert "70 frames" in window.timeline_duration.text()
+    window.close()
+    app.processEvents()
+
+
+def test_gui_preview_config_scales_sources_and_lens_to_fitted_4k(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    source = Path("configs/drive_5cam_180.prores-hq.json")
+    destination = tmp_path / "preview-config.json"
+    scale = window._write_preview_config(source, destination, 3840, 992)
+    preview = json.loads(destination.read_text(encoding="utf-8"))
+    assert scale == pytest.approx(0.25)
+    assert preview["output"]["width"] == 3840
+    assert preview["output"]["height"] == 992
+    assert preview["cameras"][0]["width"] == 1488
+    assert preview["cameras"][0]["height"] == 992
+    assert preview["cameras"][0]["lens"]["fx"] == pytest.approx(930.0)
+    assert load_config(destination).cameras[0].width == 1488
+    window.close()
+    app.processEvents()
+
+
+def test_gui_preview_caps_large_camera_inputs_when_canvas_is_already_4k(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    raw = json.loads(
+        Path("configs/drive_5cam_180.prores-hq.json").read_text(encoding="utf-8")
+    )
+    raw["output"]["width"] = 3840
+    raw["output"]["height"] = 2160
+    source = tmp_path / "4k-output-high-res-inputs.json"
+    source.write_text(json.dumps(raw), encoding="utf-8")
+    destination = tmp_path / "preview-config.json"
+    scale = window._write_preview_config(source, destination, 3840, 2160)
+    preview = json.loads(destination.read_text(encoding="utf-8"))
+    assert scale == pytest.approx(2160 / 3968)
+    assert preview["output"]["width"] == 3840
+    assert preview["output"]["height"] == 2160
+    assert preview["cameras"][0]["width"] == 3240
+    assert preview["cameras"][0]["height"] == 2160
+    window.close()
+    app.processEvents()
+
+
+def test_gui_queues_latest_playhead_during_preview(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window._set_timeline_range(0, 100)
+    window._preview_ready = True
+    window._preview_in_progress = True
+    window._set_playhead(42)
+    window._scrub_preview()
+    assert window._pending_scrub_frame == 42
+    refreshed: list[int] = []
+    monkeypatch.setattr(
+        window,
+        "create_preview",
+        lambda: refreshed.append(window.timeline_playhead.value()),
+    )
+    window._finish_preview_frame(10)
+    assert refreshed == [42]
+    assert window._pending_scrub_frame is None
     window.close()
     app.processEvents()
 

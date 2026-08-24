@@ -6,11 +6,10 @@ import json
 import numpy as np
 import OpenEXR
 import pytest
-import tifffile
 
 from vpstitch.config import Camera, Color, Lens, Video
 from vpstitch.ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
-from vpstitch.imageio import ExrSequenceEncoder, TiffSequenceEncoder
+from vpstitch.imageio import ExrSequenceEncoder, read_image, write_png
 
 
 def _camera(width: int, height: int) -> Camera:
@@ -65,23 +64,6 @@ def test_high_bit_depth_video_roundtrip(
         assert probe.colorspace == "bt709"
 
 
-def test_tiff_sequence_is_exact_uint16_rgb(tmp_path: Path) -> None:
-    width, height = 257, 19
-    generator = np.random.default_rng(17)
-    frame = generator.integers(0, 65536, (height, width, 3), dtype=np.uint16)
-    video = Video(fps=23.976, frames=1, output_codec="tiff16-sequence")
-    encoder = TiffSequenceEncoder(tmp_path / "sequence", width, height, video, Color())
-    encoder.write(frame)
-    encoder.close()
-    decoded = tifffile.imread(tmp_path / "sequence" / "frame_000000.tif")
-    np.testing.assert_array_equal(decoded, frame)
-    manifest = json.loads(
-        (tmp_path / "sequence" / "vpstitch_manifest.json").read_text(encoding="utf-8")
-    )
-    assert manifest["format"] == "uint16-rgb-bigtiff-sequence"
-    assert manifest["frames"] == 1
-
-
 def test_exr_sequence_preserves_half_float_extended_range(tmp_path: Path) -> None:
     width, height = 11, 7
     frame = np.linspace(-0.5, 4.0, width * height * 3, dtype=np.float16).reshape(
@@ -96,6 +78,15 @@ def test_exr_sequence_preserves_half_float_extended_range(tmp_path: Path) -> Non
     np.testing.assert_array_equal(pixels, frame)
     assert float(pixels.min()) < 0.0
     assert float(pixels.max()) > 1.0
+
+
+def test_png_reference_roundtrip_supports_unicode_paths(tmp_path: Path) -> None:
+    frame = np.random.default_rng(8).integers(
+        0, 65536, (19, 31, 3), dtype=np.uint16
+    )
+    path = tmp_path / "기준 프레임" / "카메라 01.png"
+    write_png(path, frame)
+    np.testing.assert_array_equal(read_image(path), frame)
 
 
 def test_decoder_start_time_selects_later_frame(tmp_path: Path) -> None:
@@ -134,6 +125,27 @@ def test_decoder_start_frame_selects_exact_frame(tmp_path: Path) -> None:
     decoder.close()
     assert selected is not None
     assert int(np.median(selected)) == 55000
+
+
+def test_decoder_downscales_reference_frame_before_python_allocation(tmp_path: Path) -> None:
+    width, height = 128, 64
+    path = tmp_path / "preview-scale.mkv"
+    video = Video(fps=24, frames=1, output_codec="ffv1-16")
+    encoder = VideoEncoder(path, width, height, video)
+    encoder.write(np.full((height, width, 3), 32000, dtype=np.uint16))
+    encoder.close()
+    decoder = VideoDecoder(
+        path,
+        _camera(width, height),
+        24,
+        output_size=(32, 16),
+    )
+    scaled = decoder.read()
+    decoder.close()
+    assert scaled is not None
+    assert scaled.shape == (16, 32, 3)
+    assert scaled.nbytes == 16 * 32 * 3 * 2
+    assert int(np.median(scaled)) == pytest.approx(32000, abs=16)
 
 
 def test_dpx_sequence_is_12bit_rgb(tmp_path: Path) -> None:
