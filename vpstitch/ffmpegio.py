@@ -5,8 +5,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from fractions import Fraction
 
 import imageio_ffmpeg
 import numpy as np
@@ -48,6 +50,9 @@ class VideoProbe:
     color_primaries: str | None
     color_trc: str | None
     colorspace: str | None
+    duration_seconds: float | None = None
+    frame_count: int | None = None
+    timecode: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -105,43 +110,217 @@ def parse_probe_output(path: str | Path, text: str) -> VideoProbe:
         )
         if shorthand:
             matrix = primaries = transfer = shorthand
+    duration_match = re.search(
+        r"Duration:\s*(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)", text
+    )
+    duration_seconds = None
+    if duration_match:
+        duration_seconds = (
+            int(duration_match.group(1)) * 3600
+            + int(duration_match.group(2)) * 60
+            + float(duration_match.group(3))
+        )
+    timecode_match = re.search(
+        r"(?im)^\s*timecode\s*:\s*(\d{1,2}:\d{2}:\d{2}[:;]\d{2})\s*$", text
+    )
+    fps = float(fps_match.group(1))
     return VideoProbe(
         path=str(path),
         codec=codec_match.group(1),
         pixel_format=pixel_format,
         width=int(size_match.group(1)),
         height=int(size_match.group(2)),
-        fps=float(fps_match.group(1)),
+        fps=fps,
         bit_depth=pixel_format_bit_depth(pixel_format),
         color_range=color_range,
         color_primaries=primaries,
         color_trc=transfer,
         colorspace=matrix,
+        duration_seconds=duration_seconds,
+        frame_count=(
+            None
+            if duration_seconds is None
+            else max(1, int(round(duration_seconds * fps)))
+        ),
+        timecode=timecode_match.group(1) if timecode_match else None,
     )
 
 
-def probe_video(path: str | Path) -> VideoProbe:
+def ffprobe_executable() -> str | None:
+    override = os.environ.get("VPSTITCH_FFPROBE", "").strip()
+    if override:
+        return override
+    ffmpeg = Path(ffmpeg_executable())
+    name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).with_name(name))
+    candidates.append(ffmpeg.with_name(name))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which("ffprobe")
+
+
+def _fraction_rate(value: object) -> float | None:
+    if not isinstance(value, str) or value in {"", "0/0", "N/A"}:
+        return None
+    try:
+        result = float(Fraction(value))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return result if result > 0.0 else None
+
+
+def _tag_value(tags: object, key: str) -> str | None:
+    if not isinstance(tags, dict):
+        return None
+    for name, value in tags.items():
+        if str(name).lower() == key.lower() and value:
+            return str(value)
+    return None
+
+
+def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProbe:
+    executable = ffprobe_executable()
+    if not executable:
+        return base
+    try:
+        process = subprocess.run(
+            [
+                executable,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,start_time:format_tags=timecode:"
+                "stream=index,codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,"
+                "r_frame_rate,nb_frames,duration,duration_ts,time_base:stream_tags=timecode",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        return base
+    if process.returncode:
+        return base
+    try:
+        payload = json.loads(process.stdout.decode("utf-8", errors="replace"))
+        streams = payload.get("streams", [])
+        video = next(stream for stream in streams if stream.get("codec_type") == "video")
+        format_data = payload.get("format", {})
+    except (json.JSONDecodeError, StopIteration, TypeError, AttributeError):
+        return base
+
+    fps = (
+        _fraction_rate(video.get("avg_frame_rate"))
+        or _fraction_rate(video.get("r_frame_rate"))
+        or base.fps
+    )
+    duration_seconds = None
+    for candidate in (video.get("duration"), format_data.get("duration")):
+        try:
+            duration_seconds = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if duration_seconds >= 0.0:
+            break
+        duration_seconds = None
+    frame_count = None
+    try:
+        frame_count = int(video.get("nb_frames"))
+    except (TypeError, ValueError):
+        pass
+    if not frame_count and duration_seconds is not None:
+        frame_count = max(1, int(round(duration_seconds * fps)))
+
+    timecode = _tag_value(video.get("tags"), "timecode")
+    if not timecode:
+        timecode = _tag_value(format_data.get("tags"), "timecode")
+    if not timecode:
+        timecode = next(
+            (
+                value
+                for stream in streams
+                if (value := _tag_value(stream.get("tags"), "timecode"))
+            ),
+            None,
+        )
+    pixel_format = str(video.get("pix_fmt") or base.pixel_format)
+    return replace(
+        base,
+        codec=str(video.get("codec_name") or base.codec),
+        pixel_format=pixel_format,
+        width=int(video.get("width") or base.width),
+        height=int(video.get("height") or base.height),
+        fps=fps,
+        bit_depth=pixel_format_bit_depth(pixel_format),
+        duration_seconds=duration_seconds,
+        frame_count=frame_count,
+        timecode=timecode or base.timecode,
+    )
+
+
+def _count_video_frames(path: str | Path) -> int:
+    process = subprocess.run(
+        [
+            ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-f",
+            "null",
+            "-",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    output = process.stdout.decode("utf-8", errors="replace")
+    counts = [int(value) for value in re.findall(r"(?m)^frame=(\d+)\s*$", output)]
+    if process.returncode or not counts or counts[-1] < 1:
+        detail = process.stderr.decode("utf-8", errors="replace").strip()
+        raise OSError(f"unable to count video frames: {path}: {detail}")
+    return counts[-1]
+
+
+def probe_video(path: str | Path, *, count_frames: bool = False) -> VideoProbe:
     process = subprocess.run(
         [ffmpeg_executable(), "-hide_banner", "-i", str(path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         check=False,
     )
-    return parse_probe_output(path, process.stderr.decode("utf-8", errors="replace"))
+    base = parse_probe_output(path, process.stderr.decode("utf-8", errors="replace"))
+    result = _enhance_probe_with_ffprobe(path, base)
+    if count_frames:
+        result = replace(result, frame_count=_count_video_frames(path))
+    return result
 
 
-def _read_exact(stream, size: int) -> bytearray | None:
-    buffer = bytearray(size)
+def _read_exact(stream, buffer: bytearray) -> bool:
     view = memoryview(buffer)
     offset = 0
-    while offset < size:
+    while offset < len(buffer):
         count = stream.readinto(view[offset:])
         if not count:
             if offset == 0:
-                return None
-            raise OSError(f"truncated raw frame: {offset} of {size} bytes")
+                return False
+            raise OSError(f"truncated raw frame: {offset} of {len(buffer)} bytes")
         offset += count
-    return buffer
+    return True
 
 
 class VideoDecoder:
@@ -151,51 +330,58 @@ class VideoDecoder:
         camera: Camera,
         fps: float,
         start_time: float | None = None,
+        start_frame: int = 0,
+        source_fps: float | None = None,
+        exact_frame_seek: bool = False,
     ):
         self.camera = camera
         self.frame_bytes = camera.width * camera.height * 3 * 2
+        self._buffer = bytearray(self.frame_bytes)
+        if start_frame < 0:
+            raise ValueError("decoder start_frame cannot be negative")
+        if start_time is not None and start_time < 0.0:
+            raise ValueError("decoder start_time cannot be negative")
+        seek_fps = source_fps or fps
+        frame_seek = start_frame + max(camera.frame_offset, 0)
+        if exact_frame_seek and start_time is not None:
+            frame_seek += int(round(start_time * seek_fps))
+        seek_time = (start_time or 0.0) + frame_seek / seek_fps
         command = [
             ffmpeg_executable(),
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(path),
         ]
-        if start_time is not None:
-            if start_time < 0.0:
-                raise ValueError("decoder start_time cannot be negative")
-            # Output-side seeking is frame-accurate. This is slower on long-GOP
-            # media but reference extraction must favor synchronization.
-            command.extend(["-ss", f"{start_time:.9f}"])
-        command.extend([
-            "-an",
-            "-sn",
-            "-vf",
-            f"fps={fps}",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb48le",
-            "pipe:1",
-        ])
+        if seek_time > 0.0 and not exact_frame_seek:
+            # Input-side accurate seeking jumps to the nearest keyframe and then
+            # decodes/discards up to the exact requested timestamp. It avoids
+            # reading every leading frame for long aligned plates.
+            command.extend(["-ss", f"{seek_time:.9f}", "-accurate_seek"])
+        command.extend(["-i", str(path)])
+        command.extend(["-an", "-sn"])
+        filters: list[str] = []
+        if exact_frame_seek and frame_seek > 0:
+            filters.extend([f"trim=start_frame={frame_seek}", "setpts=PTS-STARTPTS"])
+        if source_fps is None or abs(source_fps - fps) > 0.001:
+            filters.append(f"fps={fps}")
+        if filters:
+            command.extend(["-vf", ",".join(filters)])
+        command.extend(["-f", "rawvideo", "-pix_fmt", "rgb48le", "pipe:1"])
         self.process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=8 * 1024 * 1024,
         )
-        for _ in range(max(camera.frame_offset, 0)):
-            self.read()
 
-    def read(self) -> np.ndarray | None:
+    def read(self, *, copy: bool = True) -> np.ndarray | None:
         assert self.process.stdout is not None
-        data = _read_exact(self.process.stdout, self.frame_bytes)
-        if data is None:
+        if not _read_exact(self.process.stdout, self._buffer):
             return None
-        return np.frombuffer(data, dtype="<u2").reshape(
+        frame = np.frombuffer(self._buffer, dtype="<u2").reshape(
             self.camera.height, self.camera.width, 3
         )
+        return frame.copy() if copy else frame
 
     def close(self) -> None:
         if self.process.stdout:

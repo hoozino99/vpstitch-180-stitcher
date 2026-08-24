@@ -103,6 +103,24 @@ def test_five_video_cli_roundtrip_is_16bit_and_smooth(
     }
     config_path = tmp_path / "rig.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
+    alignment_path = tmp_path / "alignment.json"
+    alignment_path.write_text(
+        json.dumps(
+            {
+                "fps": 24.0,
+                "common_frames": 2,
+                "inputs": [
+                    {
+                        "path": str(path),
+                        "skip_frames": 0,
+                        "frame_count": 2,
+                    }
+                    for path in source_paths
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     output_path = tmp_path / "stitched.mkv"
     arguments = [
         "vpstitch",
@@ -113,6 +131,8 @@ def test_five_video_cli_roundtrip_is_16bit_and_smooth(
         str(output_path),
         "--map-cache",
         str(tmp_path / "maps"),
+        "--alignment-plan",
+        str(alignment_path),
         *[str(path) for path in source_paths],
     ]
     monkeypatch.setattr(sys, "argv", arguments)

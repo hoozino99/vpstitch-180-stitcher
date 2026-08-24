@@ -113,6 +113,29 @@ def test_decoder_start_time_selects_later_frame(tmp_path: Path) -> None:
     assert int(np.median(selected)) == 25000
 
 
+def test_decoder_start_frame_selects_exact_frame(tmp_path: Path) -> None:
+    width, height = 64, 32
+    path = tmp_path / "seek-frame.mkv"
+    video = Video(fps=2, frames=3, output_codec="ffv1-16")
+    encoder = VideoEncoder(path, width, height, video)
+    for value in (5000, 25000, 55000):
+        encoder.write(np.full((height, width, 3), value, dtype=np.uint16))
+    encoder.close()
+    assert probe_video(path, count_frames=True).frame_count == 3
+    decoder = VideoDecoder(
+        path,
+        _camera(width, height),
+        2,
+        start_frame=2,
+        source_fps=2,
+        exact_frame_seek=True,
+    )
+    selected = decoder.read()
+    decoder.close()
+    assert selected is not None
+    assert int(np.median(selected)) == 55000
+
+
 def test_dpx_sequence_is_12bit_rgb(tmp_path: Path) -> None:
     width, height = 257, 32
     ramp = np.linspace(0, 65535, width, dtype=np.uint16)

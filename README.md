@@ -22,9 +22,12 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 
 1. `SELECT 5 VIDEOS`에서 왼쪽 카메라부터 오른쪽 카메라 순서로 원본을 선택합니다.
 2. `CHECK INPUTS`로 해상도·FPS·10-bit 이상·컬러 태그를 검사합니다.
-3. 고정 피사체가 잘 보이는 시각을 선택하고 `PREVIEW`를 누릅니다.
-4. 필요하면 `AUTO ALIGN`을 실행하고 프리뷰를 다시 확인합니다.
-5. 캔버스·OCIO·출력 코덱을 설정하고 `RENDER`를 누릅니다.
+3. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
+   공통 구간으로 자동 트림합니다.
+4. 하나의 `COMMON TC RANGE` 바에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
+5. 고정 피사체가 잘 보이는 시각을 선택하고 `PREVIEW`를 누릅니다.
+6. 공간적인 리그 각도 보정이 필요하면 `RIG ALIGN`을 실행합니다.
+7. 캔버스·OCIO·출력 코덱을 설정하고 `RENDER`를 누릅니다.
 
 GUI 프리뷰는 모니터 표시를 위한 8-bit 축소 영상일 뿐입니다. 프리뷰 표시가 최종
 uint16/float32 스티칭 및 FFV1/TIFF/EXR 마스터의 정밀도에는 영향을 주지 않습니다.
@@ -40,6 +43,8 @@ uint16/float32 스티칭 및 FFV1/TIFF/EXR 마스터의 정밀도에는 영향�
 - 렌더 시 조절 가능한 캔버스(최대 20000×6000), FOV, 중심 yaw/pitch
 - 메모리를 제한하는 타일 기반 cylindrical projection
 - 고정 리그 투영 맵의 디스크 캐시(프레임마다 삼각함수 재계산 방지)
+- embedded SMPTE TC 기반 5개 플레이트 정렬과 공통 구간 자동 트림
+- drop-frame/non-drop-frame 및 24시간 자정 rollover 처리
 - pinhole 및 equidistant fisheye 렌즈 모델
 - float32 feather blending
 - 선택형 DIS optical-flow 중첩부 보정과 forward/backward confidence fallback
@@ -67,6 +72,15 @@ Apple Silicon Mac은 일반적인 CPU 기반 렌더에서 충분히 경쟁력 �
 프로젝트는 현재 CUDA/Metal 전용 가속 경로를 사용하지 않으므로 특정 Mac GPU가
 자동으로 전체 렌더를 가속하지는 않습니다. 실제 비교는 동일한 5개 입력과
 `--frames 24` 테스트로 측정해야 합니다.
+
+15K~20K 출력, OCIO 또는 optical flow를 사용하면 Apple Silicon에서도 CPU·메모리·SSD
+부하가 크게 걸리는 정상적인 오프라인 렌더입니다. 현재는 타일 처리, 디스크 기반 투영
+맵 재사용, decoder frame-buffer 재사용, bounded 메모리, TC/트림 시작점의 정확한
+frame-index trim이 적용되어 있습니다.
+가장 큰 속도 개선은 `flow.enabled=false`로 먼저 렌더하고, 반복 작업에서는 동일한
+projection cache를 유지하며, 프리뷰를 작은 canvas로 확인한 뒤 마스터를 렌더하는 것입니다.
+VideoToolbox/D3D11VA는 16-bit/float 처리 품질과 코덱 지원이 장비마다 달라 자동으로
+강제하지 않습니다.
 
 ## 품질 원칙
 
@@ -120,11 +134,50 @@ Control-click하여 **열기**를 선택하거나, 시스템 설정의 **개인�
 ```
 
 앱을 실행할 때 Python, FFmpeg, OpenColorIO를 따로 설치할 필요는 없습니다. 앱에
-렌더 CLI와 `imageio-ffmpeg` 실행 파일이 함께 포함됩니다.
+렌더 CLI와 정확한 TC/frame count scan이 가능한 정적 FFmpeg가 함께 포함됩니다.
+
+### 다운로드해서 바로 실행하는 Windows 앱
+
+GitHub의 **Actions → Windows app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면
+`VP-Stitch-Windows-*.zip`이 생성됩니다. 압축을 푼 폴더 안의 `VP Stitch.exe`를
+실행하면 되며 Python, FFmpeg, OpenColorIO를 따로 설치할 필요가 없습니다. Windows
+배포 ZIP은 아직 코드 서명되지 않았으므로 SmartScreen이 표시되면 파일 출처를 확인한
+후 실행을 허용하십시오.
 
 macOS/Linux에서 CLI를 직접 사용할 때는 Windows 예시의
 `.venv\\Scripts\\vpstitch.exe`를 `.venv/bin/vpstitch`로 바꾸고, 줄 연결은
 PowerShell의 백틱(`) 대신 역슬래시(`\\`)를 사용하십시오.
+
+## SMPTE TC 정렬과 공통 듀레이션
+
+GUI의 `TC ALIGN`은 video stream, container 또는 QuickTime `tmcd` metadata의
+timecode를 읽습니다. 가장 늦게 시작한 플레이트를 공통 시작점으로 선택하고, 앞서
+시작한 플레이트는 필요한 프레임만큼 건너뜁니다. 이후 남아 있는 프레임 수가 가장
+짧은 플레이트를 공통 OUT으로 사용하므로 앞뒤로 1~3프레임 차이가 있어도 출력 길이가
+자동으로 맞습니다. TC가 없거나 FPS가 서로 다르면 추측하지 않고 오류로 표시합니다.
+가장 짧은 구간을 프레임 단위로 확정하기 위해 번들 FFmpeg가 실제 video frame을
+decode/count하므로 대용량·고해상도 원본에서는 TC ALIGN에 시간이 걸릴 수 있습니다.
+
+CLI에서 정렬 계획만 JSON으로 확인할 수도 있습니다.
+
+```powershell
+.\.venv\Scripts\vpstitch.exe align-timecode `
+  --config configs\five_cam_180.sample.json `
+  --output output\timecode-alignment.json `
+  cam0.mov cam1.mov cam2.mov cam3.mov cam4.mov
+```
+
+공통 타임라인에서 추가로 48프레임을 건너뛰고 240프레임만 렌더하려면 다음과 같이
+실행합니다.
+
+```powershell
+.\.venv\Scripts\vpstitch.exe stitch-video `
+  --config configs\five_cam_180.sample.json `
+  --alignment-plan output\timecode-alignment.json `
+  --start-frame 48 --frames 240 `
+  --output output\stitched.mkv `
+  cam0.mov cam1.mov cam2.mov cam3.mov cam4.mov
+```
 
 ## 정지 프레임 테스트
 

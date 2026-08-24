@@ -42,6 +42,8 @@ def test_ffmpeg_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_parse_ffmpeg_hlg_metadata() -> None:
     text = """
+      Duration: 00:00:10.01, start: 0.000000, bitrate: 1234 kb/s
+        timecode        : 01:00:00;00
       Stream #0:0: Video: prores (HQ), yuv422p10le(tv, bt2020nc/bt2020/arib-std-b67, progressive), 5952x3968, 29.97 fps
     """
     probe = parse_probe_output("cam0.mov", text)
@@ -50,6 +52,9 @@ def test_parse_ffmpeg_hlg_metadata() -> None:
     assert probe.colorspace == "bt2020nc"
     assert probe.color_primaries == "bt2020"
     assert probe.color_trc == "arib-std-b67"
+    assert probe.duration_seconds == 10.01
+    assert probe.frame_count == 300
+    assert probe.timecode == "01:00:00;00"
 
 
 def test_diagnostics_reject_eight_bit_camera() -> None:

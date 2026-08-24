@@ -11,7 +11,7 @@ from typing import Callable
 
 import numpy as np
 import tifffile
-from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt
+from PySide6.QtCore import QProcess, QSettings, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -126,10 +126,98 @@ class PreviewView(QGraphicsView):
         self._empty.show()
 
 
+class TrimRangeBar(QWidget):
+    """Compact dual-handle frame range control for the aligned timeline."""
+
+    rangeChanged = Signal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._maximum = 1
+        self._lower = 0
+        self._upper = 1
+        self._active: str | None = None
+        self.setMinimumHeight(42)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_frame_range(self, maximum: int, lower: int = 0, upper: int | None = None) -> None:
+        self._maximum = max(1, int(maximum))
+        self._lower = max(0, min(int(lower), self._maximum - 1))
+        requested_upper = self._maximum if upper is None else int(upper)
+        self._upper = max(self._lower + 1, min(requested_upper, self._maximum))
+        self.update()
+
+    def values(self) -> tuple[int, int]:
+        return self._lower, self._upper
+
+    def _track_bounds(self) -> tuple[float, float, float]:
+        left = 14.0
+        right = max(left + 1.0, float(self.width()) - 14.0)
+        return left, right, (left + right) / 2.0
+
+    def _position(self, value: int) -> float:
+        left, right, _ = self._track_bounds()
+        return left + (right - left) * value / self._maximum
+
+    def _value(self, position: float) -> int:
+        left, right, _ = self._track_bounds()
+        ratio = min(1.0, max(0.0, (position - left) / (right - left)))
+        return int(round(ratio * self._maximum))
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        left, right, center = self._track_bounds()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#1b2944") if self.isEnabled() else QColor("#151d2d"))
+        painter.drawRoundedRect(left, center - 3.0, right - left, 6.0, 3.0, 3.0)
+        lower_x = self._position(self._lower)
+        upper_x = self._position(self._upper)
+        painter.setBrush(QColor("#7657f6") if self.isEnabled() else QColor("#3c4660"))
+        painter.drawRoundedRect(lower_x, center - 4.0, upper_x - lower_x, 8.0, 4.0, 4.0)
+        for position in (lower_x, upper_x):
+            painter.setBrush(QColor("#f4f1ff") if self.isEnabled() else QColor("#70798c"))
+            painter.drawEllipse(position - 7.0, center - 7.0, 14.0, 14.0)
+            painter.setBrush(QColor("#7657f6") if self.isEnabled() else QColor("#3c4660"))
+            painter.drawEllipse(position - 3.0, center - 3.0, 6.0, 6.0)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if not self.isEnabled():
+            return
+        position = event.position().x()
+        self._active = (
+            "lower"
+            if abs(position - self._position(self._lower))
+            <= abs(position - self._position(self._upper))
+            else "upper"
+        )
+        self._move_active(position)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._active:
+            self._move_active(event.position().x())
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        del event
+        self._active = None
+
+    def _move_active(self, position: float) -> None:
+        value = self._value(position)
+        if self._active == "lower":
+            self._lower = min(max(0, value), self._upper - 1)
+        elif self._active == "upper":
+            self._upper = max(self._lower + 1, min(value, self._maximum))
+        self.update()
+        self.rangeChanged.emit(self._lower, self._upper)
+
+
 class SourceTable(QTableWidget):
     def __init__(self) -> None:
-        super().__init__(5, 6)
-        self.setHorizontalHeaderLabels(["CAM", "VIDEO", "YAW", "PITCH", "ROLL", "OFFSET"])
+        super().__init__(5, 9)
+        self.setHorizontalHeaderLabels(
+            ["CAM", "VIDEO", "TC IN", "FRAMES", "SKIP", "YAW", "PITCH", "ROLL", "OFFSET"]
+        )
         self.verticalHeader().hide()
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setAlternatingRowColors(True)
@@ -137,7 +225,7 @@ class SourceTable(QTableWidget):
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in range(2, 6):
+        for column in range(2, 9):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.setColumnWidth(1, 230)
 
@@ -148,6 +236,9 @@ class SourceTable(QTableWidget):
             values = [
                 str(camera.get("name", f"cam{row}")),
                 paths[row] if row < len(paths) else "",
+                "—",
+                "—",
+                "—",
                 str(camera.get("yaw_deg", 0.0)),
                 str(camera.get("pitch_deg", 0.0)),
                 str(camera.get("roll_deg", 0.0)),
@@ -155,7 +246,7 @@ class SourceTable(QTableWidget):
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column == 0:
+                if column in {0, 1, 2, 3, 4}:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column == 1:
                     item.setToolTip(value)
@@ -166,18 +257,52 @@ class SourceTable(QTableWidget):
 
     def set_paths(self, paths: list[str]) -> None:
         for row, path in enumerate(paths[: self.rowCount()]):
-            item = self.item(row, 1) or QTableWidgetItem()
+            item = self.item(row, 1)
+            if item is None:
+                item = QTableWidgetItem()
+                self.setItem(row, 1, item)
             item.setText(path)
             item.setToolTip(path)
-            self.setItem(row, 1, item)
+
+    def clear_timing(self) -> None:
+        for row in range(self.rowCount()):
+            for column in (2, 3, 4):
+                item = self.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.setItem(row, column, item)
+                item.setText("—")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+    def set_timing(self, inputs: list[dict[str, object]]) -> None:
+        if len(inputs) != self.rowCount():
+            raise ValueError("timecode result does not match the source count")
+        for row, timing in enumerate(inputs):
+            for column, value in (
+                (2, timing.get("timecode", "—")),
+                (3, timing.get("frame_count", "—")),
+                (4, timing.get("skip_frames", "—")),
+            ):
+                item = self.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.setItem(row, column, item)
+                item.setText(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+    def offsets(self) -> list[int]:
+        try:
+            return [int(self.item(row, 8).text()) for row in range(self.rowCount())]
+        except (AttributeError, ValueError) as error:
+            raise ValueError("camera OFFSET values must be whole frames") from error
 
     def apply_to_cameras(self, cameras: list[dict[str, object]]) -> None:
         for row, camera in enumerate(cameras):
             try:
-                camera["yaw_deg"] = float(self.item(row, 2).text())
-                camera["pitch_deg"] = float(self.item(row, 3).text())
-                camera["roll_deg"] = float(self.item(row, 4).text())
-                camera["frame_offset"] = int(self.item(row, 5).text())
+                camera["yaw_deg"] = float(self.item(row, 5).text())
+                camera["pitch_deg"] = float(self.item(row, 6).text())
+                camera["roll_deg"] = float(self.item(row, 7).text())
+                camera["frame_offset"] = int(self.item(row, 8).text())
             except (AttributeError, ValueError) as error:
                 raise ValueError(f"Camera {row + 1} orientation/offset is invalid") from error
 
@@ -200,6 +325,11 @@ class MainWindow(QMainWindow):
         self._process_success: Callable[[], None] | None = None
         self._process_output = ""
         self._last_reference_dir: Path | None = None
+        self._tc_alignment: dict[str, object] | None = None
+        self._tc_alignment_path: Path | None = None
+        self._timeline_maximum = 1
+        self._configured_frame_limit = 0
+        self._timeline_updating = False
         self._working_dir = self.user_data_root / "work"
         self._cache_dir = self.user_data_root / "cache"
         self._output_root = self.user_data_root / "renders"
@@ -227,8 +357,9 @@ class MainWindow(QMainWindow):
             ("OPEN CONFIG", self.choose_config),
             ("SAVE AS", self.save_as),
             ("CHECK INPUTS", self.check_inputs),
+            ("TC ALIGN", self.align_timecode),
             ("PREVIEW", self.create_preview),
-            ("AUTO ALIGN", self.auto_align),
+            ("RIG ALIGN", self.auto_align),
             ("RENDER", self.render),
             ("CANCEL", self.cancel_task),
         ]
@@ -245,7 +376,7 @@ class MainWindow(QMainWindow):
                         "PREVIEW": "previewAction",
                     }.get(text, "toolbarAction")
                 )
-            if text in {"SAVE AS", "AUTO ALIGN"}:
+            if text in {"SAVE AS", "TC ALIGN", "RIG ALIGN"}:
                 toolbar.addSeparator()
 
         header = QFrame()
@@ -274,8 +405,10 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.status_pill)
 
         self.source_table = SourceTable()
+        self.source_table.itemChanged.connect(self._source_item_changed)
         source_group = QGroupBox("SOURCES  /  LEFT → RIGHT")
         source_group.setObjectName("card")
+        source_group.setMinimumWidth(560)
         source_layout = QVBoxLayout(source_group)
         source_layout.addWidget(self.source_table)
         source_buttons = QHBoxLayout()
@@ -284,14 +417,58 @@ class MainWindow(QMainWindow):
         choose.clicked.connect(self.choose_videos)
         clear = QPushButton("CLEAR")
         clear.setObjectName("secondaryButton")
-        clear.clicked.connect(lambda: self.source_table.set_paths([""] * 5))
+        clear.clicked.connect(self.clear_sources)
+        tc_align = QPushButton("TC ALIGN & TRIM")
+        tc_align.setObjectName("syncButton")
+        tc_align.clicked.connect(self.align_timecode)
         source_buttons.addWidget(choose)
+        source_buttons.addWidget(tc_align)
         source_buttons.addWidget(clear)
         source_layout.addLayout(source_buttons)
         source_hint = QLabel("파일 5개를 왼쪽→오른쪽 카메라 순서로 드롭할 수도 있습니다.")
         source_hint.setWordWrap(True)
         source_hint.setProperty("muted", True)
         source_layout.addWidget(source_hint)
+
+        timing_panel = QFrame()
+        timing_panel.setObjectName("timingPanel")
+        timing_layout = QVBoxLayout(timing_panel)
+        timing_layout.setContentsMargins(12, 10, 12, 10)
+        timing_layout.setSpacing(6)
+        timing_header = QHBoxLayout()
+        timing_title = QLabel("COMMON TC RANGE")
+        timing_title.setProperty("sectionTitle", True)
+        self.timing_status = QLabel("TC ALIGN을 누르면 공통 구간을 계산합니다")
+        self.timing_status.setProperty("muted", True)
+        timing_header.addWidget(timing_title)
+        timing_header.addStretch()
+        timing_header.addWidget(self.timing_status)
+        timing_layout.addLayout(timing_header)
+        self.timeline_bar = TrimRangeBar()
+        self.timeline_bar.setEnabled(False)
+        self.timeline_bar.rangeChanged.connect(self._timeline_bar_changed)
+        timing_layout.addWidget(self.timeline_bar)
+        timing_values = QHBoxLayout()
+        self.timeline_in = QSpinBox()
+        self.timeline_out = QSpinBox()
+        for widget in (self.timeline_in, self.timeline_out):
+            widget.setRange(0, 10_000_000)
+            widget.setEnabled(False)
+            widget.valueChanged.connect(self._timeline_spin_changed)
+        self.timeline_duration = QLabel("0 frames")
+        self.timeline_duration.setObjectName("durationBadge")
+        reset_timeline = QPushButton("FULL RANGE")
+        reset_timeline.setObjectName("secondaryButton")
+        reset_timeline.clicked.connect(self._reset_timeline_range)
+        timing_values.addWidget(QLabel("IN"))
+        timing_values.addWidget(self.timeline_in)
+        timing_values.addWidget(QLabel("OUT"))
+        timing_values.addWidget(self.timeline_out)
+        timing_values.addWidget(self.timeline_duration)
+        timing_values.addStretch()
+        timing_values.addWidget(reset_timeline)
+        timing_layout.addLayout(timing_values)
+        source_layout.addWidget(timing_panel)
 
         self.preview = PreviewView()
         preview_box = QWidget()
@@ -333,7 +510,7 @@ class MainWindow(QMainWindow):
         upper.addWidget(source_group)
         upper.addWidget(preview_box)
         upper.addWidget(settings_scroll)
-        upper.setSizes([400, 800, 520])
+        upper.setSizes([590, 650, 480])
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -550,6 +727,8 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background:#263a60; border-color:#8392ff; }
             QPushButton#primaryButton { background:#7657f6; color:#ffffff; border-color:#927aff; }
             QPushButton#primaryButton:hover { background:#876cfb; }
+            QPushButton#syncButton { background:#173d43; color:#8ff0df; border-color:#2e736e; }
+            QPushButton#syncButton:hover { background:#20545a; border-color:#65d9ca; }
             QPushButton#secondaryButton { background:#17253f; color:#bac9e5; }
             QPushButton#iconButton { padding:5px 9px; min-width:28px; }
             QPushButton:disabled { color:#5d6b84; background:#111a2a; border-color:#1e2b45; }
@@ -559,6 +738,8 @@ class MainWindow(QMainWindow):
             QTabWidget::pane { border:0; }
             QTabBar::tab { background:#111a30; color:#7183a7; border:0; border-bottom:2px solid transparent; padding:10px 15px; font-weight:700; }
             QTabBar::tab:selected { color:#e7eaff; border-bottom:2px solid #8875ff; }
+            QFrame#timingPanel { background:#0c1528; border:1px solid #263b5f; border-radius:10px; }
+            QLabel#durationBadge { background:#182844; color:#aebfff; border:1px solid #304a78; border-radius:8px; padding:6px 10px; font-weight:700; }
             QScrollArea { border:0; background:transparent; }
             QProgressBar { border:1px solid #293a5f; border-radius:6px; background:#0a1121; text-align:center; color:#cbd7ed; }
             QProgressBar::chunk { background:#7657f6; border-radius:5px; }
@@ -579,7 +760,11 @@ class MainWindow(QMainWindow):
             return
         self.config_path = path
         self.config_data = raw
+        self._tc_alignment = None
+        self._tc_alignment_path = None
+        self.source_table.blockSignals(True)
         self.source_table.set_rig(cameras)
+        self.source_table.blockSignals(False)
         output = raw.setdefault("output", {})
         self.canvas_width.setValue(int(output.get("width", 15360)))
         self.canvas_height.setValue(int(output.get("height", 3968)))
@@ -605,7 +790,9 @@ class MainWindow(QMainWindow):
         codec = str(video.get("output_codec", "ffv1-16"))
         self.output_codec.setCurrentIndex(max(0, self.output_codec.findData(codec)))
         self.fps.setValue(float(video.get("fps", 29.97)))
-        self.frame_limit.setValue(int(video.get("frames") or 0))
+        self._configured_frame_limit = int(video.get("frames") or 0)
+        self.frame_limit.setValue(self._configured_frame_limit)
+        self._reset_timing()
         self.settings.setValue("lastConfig", str(path))
         self.setWindowTitle(f"{APP_NAME}  —  {path.name}")
         self._update_color_controls()
@@ -710,6 +897,164 @@ class MainWindow(QMainWindow):
                 self._error("Need five videos", f"Expected {self.source_table.rowCount()} files, selected {len(files)}")
                 return
             self.source_table.set_paths(files)
+            self._reset_timing()
+
+    def clear_sources(self) -> None:
+        self.source_table.set_paths([""] * self.source_table.rowCount())
+        self._reset_timing()
+
+    def _reset_timing(self) -> None:
+        self._tc_alignment = None
+        self._tc_alignment_path = None
+        self._timeline_maximum = 1
+        self.source_table.clear_timing()
+        self.timeline_bar.setEnabled(False)
+        self.timeline_bar.set_frame_range(1)
+        self._timeline_updating = True
+        self.timeline_in.setRange(0, 1)
+        self.timeline_out.setRange(0, 1)
+        self.timeline_in.setValue(0)
+        self.timeline_out.setValue(1)
+        self.timeline_in.setEnabled(False)
+        self.timeline_out.setEnabled(False)
+        self.frame_limit.setEnabled(True)
+        self.frame_limit.setValue(self._configured_frame_limit)
+        self.timeline_duration.setText("0 frames")
+        self.timing_status.setText("TC ALIGN을 누르면 공통 구간을 계산합니다")
+        self._timeline_updating = False
+
+    def _set_timeline_range(self, lower: int, upper: int) -> None:
+        if not self._tc_alignment:
+            return
+        maximum = self._timeline_maximum
+        lower = max(0, min(int(lower), maximum - 1))
+        upper = max(lower + 1, min(int(upper), maximum))
+        self._timeline_updating = True
+        self.timeline_bar.set_frame_range(maximum, lower, upper)
+        self.timeline_in.setValue(lower)
+        self.timeline_out.setValue(upper)
+        duration = upper - lower
+        self.frame_limit.setValue(duration)
+        fps = float(self._tc_alignment["fps"])
+        self.timeline_duration.setText(
+            f"{duration:,} frames  ·  {duration / fps:,.2f} sec"
+        )
+        self._timeline_updating = False
+
+    def _timeline_bar_changed(self, lower: int, upper: int) -> None:
+        if not self._timeline_updating:
+            self._set_timeline_range(lower, upper)
+
+    def _timeline_spin_changed(self) -> None:
+        if not self._timeline_updating:
+            self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
+
+    def _reset_timeline_range(self) -> None:
+        if self._tc_alignment:
+            self._set_timeline_range(0, self._timeline_maximum)
+
+    def _effective_common_frames(self, payload: dict[str, object]) -> int:
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, list) or len(inputs) != self.source_table.rowCount():
+            raise ValueError("timecode result does not match the source count")
+        offsets = self.source_table.offsets()
+        starts = [
+            int(item["skip_frames"]) + offset
+            for item, offset in zip(inputs, offsets, strict=True)
+        ]
+        normalization = -min(0, min(starts))
+        available = min(
+            int(item["frame_count"]) - (start + normalization)
+            for item, start in zip(inputs, starts, strict=True)
+        )
+        if available < 1:
+            raise ValueError("camera OFFSET values leave no common aligned range")
+        return available
+
+    def _source_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 8 or not self._tc_alignment or self._timeline_updating:
+            return
+        try:
+            lower, upper = self.timeline_bar.values()
+            self._timeline_maximum = self._effective_common_frames(self._tc_alignment)
+            self._timeline_updating = True
+            self.timeline_in.setRange(0, self._timeline_maximum - 1)
+            self.timeline_out.setRange(1, self._timeline_maximum)
+            self._timeline_updating = False
+            self._set_timeline_range(
+                min(lower, self._timeline_maximum - 1),
+                min(upper, self._timeline_maximum),
+            )
+        except Exception as error:
+            self._timeline_updating = False
+            self.timing_status.setText(f"OFFSET ERROR · {error}")
+
+    def _apply_alignment_payload(
+        self,
+        payload: dict[str, object],
+        lower: int = 0,
+        upper: int | None = None,
+    ) -> None:
+        inputs = payload["inputs"]
+        common_frames = int(payload["common_frames"])
+        if not isinstance(inputs, list) or common_frames < 1:
+            raise ValueError("invalid timecode alignment report")
+        self._tc_alignment = payload
+        self.source_table.set_timing(inputs)
+        self._timeline_maximum = self._effective_common_frames(payload)
+        self.fps.setValue(float(payload["fps"]))
+        self.timeline_in.setRange(0, self._timeline_maximum - 1)
+        self.timeline_out.setRange(1, self._timeline_maximum)
+        self.timeline_in.setEnabled(True)
+        self.timeline_out.setEnabled(True)
+        self.timeline_bar.setEnabled(True)
+        self.frame_limit.setEnabled(False)
+        self._set_timeline_range(
+            0 if lower < 0 else lower,
+            self._timeline_maximum if upper is None else upper,
+        )
+        timeline_tc = str(payload["timeline_timecode"])
+        self.timing_status.setText(f"START {timeline_tc}  ·  SHORTEST PLATE LOCK")
+
+    def align_timecode(self) -> None:
+        try:
+            config = self._write_working_config()
+            sources = self._validate_sources()
+        except Exception as error:
+            self._error("TC align", str(error))
+            return
+        report = self._working_dir / "timecode-alignment.json"
+        report.unlink(missing_ok=True)
+
+        def apply_alignment() -> None:
+            try:
+                payload = json.loads(report.read_text(encoding="utf-8"))
+                self._tc_alignment_path = report
+                self._apply_alignment_payload(payload)
+                timeline_tc = str(payload["timeline_timecode"])
+                common_frames = self._timeline_maximum
+                self.timing_status.setText(
+                    f"START {timeline_tc}  ·  SHORTEST PLATE LOCK"
+                )
+                self.statusBar().showMessage(
+                    f"TC aligned at {timeline_tc} · {common_frames:,} common frames",
+                    15000,
+                )
+            except Exception as error:
+                self._error("TC align", str(error))
+
+        self._run_cli(
+            "TC ALIGN",
+            [
+                "align-timecode",
+                "--config",
+                str(config),
+                "--output",
+                str(report),
+                *sources,
+            ],
+            apply_alignment,
+        )
 
     def choose_ocio(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open OCIO config", str(self.project_root), "OCIO config (*.ocio);;All files (*.*)")
@@ -757,6 +1102,13 @@ class MainWindow(QMainWindow):
         try:
             config = self._write_working_config()
             sources = self._validate_sources()
+            if self._tc_alignment:
+                selected_frames = self.timeline_out.value() - self.timeline_in.value()
+                reference_frame = int(round(self.preview_time.value() * self.fps.value()))
+                if reference_frame >= selected_frames:
+                    raise ValueError(
+                        "Reference time is outside the selected COMMON TC RANGE"
+                    )
         except Exception as error:
             self._error("Preview", str(error))
             return
@@ -764,6 +1116,8 @@ class MainWindow(QMainWindow):
         reference = self._working_dir / f"reference-{stamp}"
         self._last_reference_dir = reference
         self.preview.show_message("EXTRACTING SYNCHRONIZED REFERENCE FRAMES …")
+        timeline_start = self.timeline_in.value() if self._tc_alignment else 0
+        reference_time = self.preview_time.value()
 
         def stitch_reference() -> None:
             raw = json.loads(config.read_text(encoding="utf-8"))
@@ -795,20 +1149,21 @@ class MainWindow(QMainWindow):
                 load_preview,
             )
 
-        self._run_cli(
-            "EXTRACT REFERENCES",
-            [
-                "extract-reference",
-                "--config",
-                str(config),
-                "--time",
-                str(self.preview_time.value()),
-                "--output-dir",
-                str(reference),
-                *sources,
-            ],
-            stitch_reference,
-        )
+        arguments = [
+            "extract-reference",
+            "--config",
+            str(config),
+            "--time",
+            str(reference_time),
+            "--start-frame",
+            str(timeline_start),
+            "--output-dir",
+            str(reference),
+        ]
+        if self._tc_alignment_path:
+            arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
+        arguments.extend(sources)
+        self._run_cli("EXTRACT REFERENCES", arguments, stitch_reference)
 
     def auto_align(self) -> None:
         if self._last_reference_dir is None:
@@ -828,8 +1183,18 @@ class MainWindow(QMainWindow):
 
         def load_alignment() -> None:
             current_paths = self.source_table.paths()
+            tc_alignment = self._tc_alignment
+            tc_alignment_path = self._tc_alignment_path
+            timeline_range = self.timeline_bar.values()
             self.load_config(output)
             self.source_table.set_paths(current_paths)
+            if tc_alignment:
+                self._tc_alignment_path = tc_alignment_path
+                self._apply_alignment_payload(
+                    tc_alignment,
+                    timeline_range[0],
+                    timeline_range[1],
+                )
             self.statusBar().showMessage("Auto alignment applied — inspect preview, then Save As", 15000)
 
         self._run_cli(
@@ -886,18 +1251,23 @@ class MainWindow(QMainWindow):
         )
         if QMessageBox.question(self, "Start render", message) != QMessageBox.StandardButton.Yes:
             return
+        arguments = [
+            "stitch-video",
+            "--config",
+            str(config),
+            "--output",
+            output,
+            "--map-cache",
+            str(self._cache_dir),
+            "--start-frame",
+            str(self.timeline_in.value() if self._tc_alignment else 0),
+        ]
+        if self._tc_alignment_path:
+            arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
+        arguments.extend(sources)
         self._run_cli(
             "FINAL RENDER",
-            [
-                "stitch-video",
-                "--config",
-                str(config),
-                "--output",
-                output,
-                "--map-cache",
-                str(self._cache_dir),
-                *sources,
-            ],
+            arguments,
             lambda: QMessageBox.information(self, "Render complete", f"Output written to:\n{output}"),
         )
 
@@ -918,7 +1288,8 @@ class MainWindow(QMainWindow):
         self._append_log("\n▶ " + task)
         self._append_log("  vpstitch " + " ".join(f'"{arg}"' if " " in arg else arg for arg in arguments))
         if getattr(sys, "frozen", False):
-            cli_program = Path(sys.executable).with_name("vpstitch-cli")
+            helper_name = "vpstitch-cli.exe" if os.name == "nt" else "vpstitch-cli"
+            cli_program = Path(sys.executable).with_name(helper_name)
             if not cli_program.is_file():
                 self.process = None
                 self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
@@ -1012,6 +1383,7 @@ class MainWindow(QMainWindow):
         if videos:
             if len(videos) == self.source_table.rowCount():
                 self.source_table.set_paths(videos)
+                self._reset_timing()
             else:
                 self._error("Drop videos", f"Drop exactly {self.source_table.rowCount()} videos at once")
         event.acceptProposedAction()

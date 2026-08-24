@@ -37,3 +37,49 @@ def test_gui_applies_builtin_aces_preset() -> None:
     assert window.working_space.text() == "ACEScg"
     window.close()
     app.processEvents()
+
+
+def test_gui_common_timeline_controls_frame_range() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tc_alignment = {
+        "fps": 24.0,
+        "common_frames": 100,
+        "timeline_timecode": "01:00:00:00",
+    }
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window._set_timeline_range(10, 80)
+    assert window.timeline_bar.values() == (10, 80)
+    assert window.frame_limit.value() == 70
+    assert "70 frames" in window.timeline_duration.text()
+    window.close()
+    app.processEvents()
+
+
+def test_gui_tc_alignment_keeps_manual_camera_offset() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.source_table.item(0, 8).setText("2")
+    inputs = [
+        {
+            "path": f"cam{index}.mov",
+            "timecode": "01:00:00:00",
+            "frame_count": 100,
+            "skip_frames": 0,
+        }
+        for index in range(5)
+    ]
+    window._apply_alignment_payload(
+        {
+            "fps": 24.0,
+            "common_frames": 100,
+            "timeline_timecode": "01:00:00:00",
+            "inputs": inputs,
+        }
+    )
+    assert window.source_table.item(0, 8).text() == "2"
+    assert window._timeline_maximum == 98
+    window.close()
+    app.processEvents()

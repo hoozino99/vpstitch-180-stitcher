@@ -28,6 +28,7 @@ from .calibration import CalibrationError, calibrate_checkerboard
 from .rigcalibration import calibrate_rig_rotation, write_calibrated_config
 from .resources import estimate_resources
 from .color import load_ocio_config
+from .timecode import align_by_timecode
 
 
 def _progress(done: int, total: int) -> None:
@@ -85,6 +86,72 @@ def _add_canvas_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _load_alignment_plan(
+    path: str | None,
+    inputs: list[str],
+    fps: float,
+) -> tuple[list[int], list[int], int] | None:
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        plan_inputs = payload["inputs"]
+        common_frames = int(payload["common_frames"])
+        plan_fps = float(payload["fps"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ConfigError(f"invalid alignment plan {path}: {error}") from error
+    if not isinstance(plan_inputs, list) or len(plan_inputs) != len(inputs):
+        raise ConfigError("alignment plan input count does not match render inputs")
+    if abs(plan_fps - fps) > 0.001:
+        raise ConfigError("alignment plan fps does not match the render config")
+    skips: list[int] = []
+    counts: list[int] = []
+    for source, item in zip(inputs, plan_inputs, strict=True):
+        if not isinstance(item, dict):
+            raise ConfigError("alignment plan input entry is invalid")
+        try:
+            planned_path = Path(str(item["path"])).resolve()
+            skip = int(item["skip_frames"])
+            count = int(item["frame_count"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ConfigError(f"invalid alignment plan input: {error}") from error
+        if planned_path != Path(source).resolve():
+            raise ConfigError(
+                f"alignment plan source mismatch: expected {planned_path}, got {source}"
+            )
+        if skip < 0 or count < 1 or skip >= count:
+            raise ConfigError(f"invalid alignment range for {source}")
+        skips.append(skip)
+        counts.append(count)
+    if common_frames < 1:
+        raise ConfigError("alignment plan has no common frames")
+    return skips, counts, common_frames
+
+
+def _planned_decoder_starts(
+    config: RigConfig,
+    inputs: list[str],
+    alignment_path: str | None,
+) -> tuple[list[int] | None, int | None]:
+    assert config.video is not None
+    plan = _load_alignment_plan(alignment_path, inputs, config.video.fps)
+    if plan is None:
+        return None, None
+    plan_skips, frame_counts, _ = plan
+    starts = [
+        skip + camera.frame_offset
+        for skip, camera in zip(plan_skips, config.cameras, strict=True)
+    ]
+    normalization = -min(0, min(starts))
+    starts = [start + normalization for start in starts]
+    available = min(
+        count - start for count, start in zip(frame_counts, starts, strict=True)
+    )
+    if available < 1:
+        raise ConfigError("manual camera offsets leave no common aligned range")
+    return starts, available
+
+
 def _stitch_frame(args: argparse.Namespace) -> None:
     config = _apply_canvas_overrides(load_config(args.config), args)
     if len(args.inputs) != len(config.cameras):
@@ -119,12 +186,42 @@ def _stitch_video(args: argparse.Namespace) -> None:
         assert config.video is not None
         config = replace(config, video=resolve_passthrough_video(config.video, probes))
 
+    planned_starts, aligned_frames = _planned_decoder_starts(
+        config, args.inputs, args.alignment_plan
+    )
+    if aligned_frames is not None:
+        available = aligned_frames - args.start_frame
+        if available < 1:
+            raise ConfigError("--start-frame is outside the aligned common range")
+        if config.video.frames is None:
+            config = replace(config, video=replace(config.video, frames=available))
+        elif config.video.frames > available:
+            raise ConfigError(
+                f"requested {config.video.frames} frames, but only {available} aligned frames remain"
+            )
+
     cache = MapCache(config, args.map_cache).open(progress=_progress)
     stitcher = Stitcher(config, map_cache=cache)
-    decoders = [
-        VideoDecoder(path, camera, config.video.fps)
-        for path, camera in zip(args.inputs, config.cameras, strict=True)
-    ]
+    decoders = []
+    for index, (path, camera, probe) in enumerate(
+        zip(args.inputs, config.cameras, probes, strict=True)
+    ):
+        if planned_starts is None:
+            decoder_camera = camera
+            decoder_start = args.start_frame
+        else:
+            decoder_camera = replace(camera, frame_offset=0)
+            decoder_start = planned_starts[index] + args.start_frame
+        decoders.append(
+            VideoDecoder(
+                path,
+                decoder_camera,
+                config.video.fps,
+                start_frame=decoder_start,
+                source_fps=probe.fps,
+                exact_frame_seek=True,
+            )
+        )
     if config.video.output_codec == "tiff16-sequence":
         encoder = TiffSequenceEncoder(
             args.output,
@@ -170,8 +267,24 @@ def _stitch_video(args: argparse.Namespace) -> None:
         frame_index = 0
         try:
             while config.video.frames is None or frame_index < config.video.frames:
-                sources = [decoder.read() for decoder in decoders]
+                # Each decoder owns a persistent frame buffer. The stitcher
+                # consumes all five before the next read, so avoid allocating
+                # and copying another 16-bit full frame per camera here.
+                sources = [decoder.read(copy=False) for decoder in decoders]
                 if any(source is None for source in sources):
+                    if (
+                        config.video.frames is not None
+                        and frame_index < config.video.frames
+                    ):
+                        ended = [
+                            config.cameras[index].name
+                            for index, source in enumerate(sources)
+                            if source is None
+                        ]
+                        raise OSError(
+                            "input ended before the requested frame count: "
+                            + ", ".join(ended)
+                        )
                     break
                 print(f"frame {frame_index}")
                 stitcher.stitch_arrays(
@@ -212,10 +325,33 @@ def _extract_reference(args: argparse.Namespace) -> None:
         raise ConfigError("input preflight failed: " + " | ".join(errors))
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    decoders = [
-        VideoDecoder(path, camera, config.video.fps, start_time=args.time)
-        for path, camera in zip(args.inputs, config.cameras, strict=True)
-    ]
+    planned_starts, aligned_frames = _planned_decoder_starts(
+        config, args.inputs, args.alignment_plan
+    )
+    reference_frame = int(round(args.time * config.video.fps))
+    requested_frame = args.start_frame + reference_frame
+    if aligned_frames is not None and requested_frame >= aligned_frames:
+        raise ConfigError("reference time is outside the aligned common range")
+    decoders = []
+    for index, (path, camera, probe) in enumerate(
+        zip(args.inputs, config.cameras, probes, strict=True)
+    ):
+        if planned_starts is None:
+            decoder_camera = camera
+            decoder_start = requested_frame
+        else:
+            decoder_camera = replace(camera, frame_offset=0)
+            decoder_start = planned_starts[index] + requested_frame
+        decoders.append(
+            VideoDecoder(
+                path,
+                decoder_camera,
+                config.video.fps,
+                start_frame=decoder_start,
+                source_fps=probe.fps,
+                exact_frame_seek=True,
+            )
+        )
     written: list[str] = []
     try:
         for decoder, camera in zip(decoders, config.cameras, strict=True):
@@ -277,6 +413,31 @@ def _probe_inputs(args: argparse.Namespace) -> None:
     if args.output:
         Path(args.output).write_text(payload, encoding="utf-8")
     print(payload)
+
+
+def _align_timecode(args: argparse.Namespace) -> None:
+    probes = [probe_video(path, count_frames=True) for path in args.inputs]
+    if args.config:
+        config = load_config(args.config)
+        if len(probes) != len(config.cameras):
+            raise ConfigError(
+                f"Config expects {len(config.cameras)} cameras, got {len(probes)}."
+            )
+        if config.video is not None and any(
+            abs(probe.fps - config.video.fps) > 0.001 for probe in probes
+        ):
+            raise ConfigError(
+                f"input fps does not match configured {config.video.fps:g} fps"
+            )
+    alignment = align_by_timecode(probes)
+    payload = {
+        **alignment.to_dict(),
+        "probes": [probe.to_dict() for probe in probes],
+    }
+    encoded = json.dumps(payload, indent=2)
+    if args.output:
+        Path(args.output).write_text(encoded, encoding="utf-8")
+    print(encoded)
 
 
 def _pattern(value: str) -> tuple[int, int]:
@@ -354,9 +515,19 @@ def build_parser() -> argparse.ArgumentParser:
     video.add_argument("--output", required=True)
     video.add_argument("--map-cache", default=".vpstitch-cache")
     video.add_argument(
+        "--alignment-plan",
+        help="JSON generated by align-timecode; applies per-source TC skips",
+    )
+    video.add_argument(
         "--frames",
         type=int,
         help="limit the render to this many frames without changing the config file",
+    )
+    video.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="skip this many frames on the aligned common timeline",
     )
     video.add_argument(
         "--allow-low-bit-depth",
@@ -374,6 +545,16 @@ def build_parser() -> argparse.ArgumentParser:
     reference.add_argument("--config", required=True)
     reference.add_argument("--time", type=float, required=True, help="timeline seconds")
     reference.add_argument("--output-dir", required=True)
+    reference.add_argument(
+        "--alignment-plan",
+        help="JSON generated by align-timecode; applies per-source TC skips",
+    )
+    reference.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="additional frame offset on the aligned common timeline",
+    )
     reference.add_argument(
         "--allow-low-bit-depth",
         action="store_true",
@@ -410,6 +591,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument("inputs", nargs="+")
     probe.set_defaults(function=_probe_inputs)
+
+    timecode = subparsers.add_parser(
+        "align-timecode",
+        help="read embedded SMPTE timecode and calculate the common clip range",
+    )
+    timecode.add_argument("--config", help="optional rig config for count/fps validation")
+    timecode.add_argument("--output", help="optional alignment JSON path")
+    timecode.add_argument("inputs", nargs="+")
+    timecode.set_defaults(function=_align_timecode)
 
     calibration = subparsers.add_parser(
         "calibrate-lens", help="calibrate pinhole/fisheye intrinsics from checkerboards"
