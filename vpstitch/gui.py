@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QCoreApplication,
     QProcess,
     QSettings,
+    QSize,
     QStandardPaths,
     Qt,
     QTimer,
@@ -847,26 +848,38 @@ class ProjectManagerDialog(QDialog):
         self.projects.setHeaderLabels(["PROJECT", "LOCATION"])
         self.projects.setRootIsDecorated(False)
         self.projects.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.projects.itemDoubleClicked.connect(lambda _item, _column: self.open_selected())
+        self.projects.itemActivated.connect(lambda _item, _column: self.open_selected())
         self.projects.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.projects.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.projects, 1)
         actions = QHBoxLayout()
         self.new_project_button = QPushButton("NEW PROJECT")
         self.new_project_button.setObjectName("primaryButton")
+        self.new_project_button.setAutoDefault(False)
         self.new_project_button.clicked.connect(self.create_project)
         open_button = QPushButton("OPEN…")
         open_button.setObjectName("secondaryButton")
+        open_button.setAutoDefault(False)
         open_button.clicked.connect(self.open_existing)
-        selected_button = QPushButton("OPEN SELECTED")
-        selected_button.setObjectName("primaryButton")
-        selected_button.clicked.connect(self.open_selected)
+        self.open_selected_button = QPushButton("OPEN SELECTED")
+        self.open_selected_button.setObjectName("primaryButton")
+        self.open_selected_button.setAutoDefault(False)
+        self.open_selected_button.clicked.connect(self.open_selected)
         actions.addWidget(self.new_project_button)
         actions.addWidget(open_button)
         actions.addStretch()
-        actions.addWidget(selected_button)
+        actions.addWidget(self.open_selected_button)
         layout.addLayout(actions)
+        self.projects.itemSelectionChanged.connect(self._update_open_selected_state)
         self._load_recents()
+        self._update_open_selected_state()
+
+    def _update_open_selected_state(self) -> None:
+        has_selection = self.projects.currentItem() is not None
+        self.open_selected_button.setEnabled(has_selection)
+        self.open_selected_button.setDefault(has_selection)
+        if has_selection:
+            self.projects.setFocus()
 
     def _recent_paths(self) -> list[str]:
         value = self.settings.value("recentProjects", [])
@@ -897,6 +910,7 @@ class ProjectManagerDialog(QDialog):
         values = [str(path), *[item for item in self._recent_paths() if item != str(path)]]
         self.settings.setValue("lastProject", str(path))
         self.settings.setValue("recentProjects", values[:12])
+        self.settings.sync()
 
     def create_project(self) -> None:
         dialog = QDialog(self)
@@ -1112,6 +1126,8 @@ class MainWindow(QMainWindow):
         self._apply_project_defaults()
         self._refresh_media_tree()
         self._update_project_header()
+        if self._auto_workflows_enabled:
+            self._restore_active_timeline()
         self.statusBar().showMessage("Ready · preview fits within 4K; final render stays full resolution")
 
     def _open_project_store(self, project_path: Path | None) -> ProjectStore:
@@ -1193,29 +1209,47 @@ class MainWindow(QMainWindow):
         self.new_bin_button.clicked.connect(self.create_media_bin)
         media_header.addWidget(self.new_bin_button)
         source_layout.addLayout(media_header)
-        self.media_hint = QLabel("Plate Set = Timeline · double-click to open")
+        self.media_hint = QLabel(
+            "One Plate Set contains 3 or 5 camera plates · double-click to open"
+        )
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
         source_layout.addWidget(self.media_hint)
 
         self.media_tree = QTreeWidget()
         self.media_tree.setObjectName("mediaTree")
+        self.media_tree.setAccessibleName("Plate Set media pool")
+        self.media_tree.setAccessibleDescription(
+            "Folders contain named Plate Sets. Each Plate Set contains three or five camera plates."
+        )
         self.media_tree.setHeaderHidden(True)
         self.media_tree.setIndentation(16)
         self.media_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.media_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.media_tree.customContextMenuRequested.connect(self._media_tree_menu)
-        self.media_tree.itemDoubleClicked.connect(self._media_item_activated)
+        self.media_tree.itemActivated.connect(self._media_item_activated)
         self.media_tree.setMinimumHeight(180)
+        self.rename_plate_set_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_F2), self.media_tree
+        )
+        self.rename_plate_set_shortcut.activated.connect(self.rename_media_item)
         source_layout.addWidget(self.media_tree, 1)
 
-        active_plates_title = QLabel("ACTIVE PLATE SET")
-        active_plates_title.setProperty("inspectorTitle", True)
-        source_layout.addWidget(active_plates_title)
+        self.active_plates_title = QLabel("ACTIVE PLATE SET · NONE")
+        self.active_plates_title.setProperty("inspectorTitle", True)
+        self.active_plates_title.setWordWrap(True)
+        source_layout.addWidget(self.active_plates_title)
         source_layout.addWidget(self.source_table)
         source_buttons = QHBoxLayout()
-        self.import_button = QPushButton("IMPORT PLATES")
+        self.import_button = QPushButton("NEW PLATE SET")
         self.import_button.setObjectName("primaryButton")
+        self.import_button.setAccessibleName("New Plate Set")
+        self.import_button.setAccessibleDescription(
+            "Choose three or five camera plates and give the Plate Set a name"
+        )
+        self.import_button.setToolTip(
+            "Create one named Plate Set from P06-P08 or P01-P05 camera plates"
+        )
         self.import_button.clicked.connect(self.choose_videos)
         self.clear_button = QPushButton("CLEAR")
         self.clear_button.setObjectName("secondaryButton")
@@ -1255,9 +1289,13 @@ class MainWindow(QMainWindow):
         preview_header = QHBoxLayout()
         title = QLabel("PANORAMA PREVIEW")
         title.setProperty("sectionTitle", True)
+        self.preview_context = QLabel("NO PLATE SET OPEN")
+        self.preview_context.setProperty("muted", True)
         preview_limit = QLabel("UHD 4K MAX  ·  FULL CANVAS")
         preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
+        preview_header.addSpacing(12)
+        preview_header.addWidget(self.preview_context)
         preview_header.addStretch()
         preview_header.addWidget(preview_limit)
         preview_layout.addLayout(preview_header)
@@ -1317,11 +1355,11 @@ class MainWindow(QMainWindow):
         timing_layout.setContentsMargins(12, 7, 12, 7)
         timing_layout.setSpacing(2)
         timing_header = QHBoxLayout()
-        timing_title = QLabel("SHARED TIMELINE")
-        timing_title.setProperty("sectionTitle", True)
+        self.timing_title = QLabel("TIMELINE RANGE · NO PLATE SET")
+        self.timing_title.setProperty("sectionTitle", True)
         self.timing_status = QLabel("TC Align finds the shortest common range across every camera")
         self.timing_status.setProperty("muted", True)
-        timing_header.addWidget(timing_title)
+        timing_header.addWidget(self.timing_title)
         timing_header.addSpacing(12)
         timing_header.addWidget(self.timing_status)
         timing_header.addStretch()
@@ -1556,11 +1594,12 @@ class MainWindow(QMainWindow):
         action(project_menu, "Open Project Folder", self.open_project_folder)
 
         timeline_menu = bar.addMenu("Timeline")
-        action(timeline_menu, "Open Selected Timeline", self.open_selected_timeline)
-        action(timeline_menu, "Duplicate Timeline", self.duplicate_selected_timeline)
-        action(timeline_menu, "Delete Timeline…", self.delete_selected_timeline)
+        action(timeline_menu, "Open Selected Plate Set", self.open_selected_timeline)
+        action(timeline_menu, "Rename Plate Set…", self.rename_media_item)
+        action(timeline_menu, "Duplicate Plate Set", self.duplicate_selected_timeline)
+        action(timeline_menu, "Delete Plate Set…", self.delete_selected_timeline)
         timeline_menu.addSeparator()
-        action(timeline_menu, "Add to Render Queue", self.add_current_to_queue)
+        action(timeline_menu, "Add Plate Set to Render Queue", self.add_current_to_queue)
 
         playback_menu = bar.addMenu("Playback")
         action(playback_menu, "Full Screen Preview    P", lambda: self._handle_preview_command("fullscreen"))
@@ -1596,6 +1635,72 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             f"{APP_NAME}  —  {self.project_store.settings.name}"
         )
+        self._update_plate_set_context()
+
+    def _last_timeline_setting_key(self) -> str:
+        project_id = hashlib.sha1(
+            str(self.project_store.path.resolve()).encode("utf-8")
+        ).hexdigest()
+        return f"projects/{project_id}/lastPlateSet"
+
+    def _remember_active_timeline(self) -> None:
+        if self._active_timeline_id:
+            self.settings.setValue(
+                self._last_timeline_setting_key(), self._active_timeline_id
+            )
+            self.settings.sync()
+
+    def _restore_active_timeline(self) -> None:
+        timelines = list(self.project_store.timelines)
+        if not timelines or self.process is not None:
+            self._update_plate_set_context()
+            return
+        remembered = str(self.settings.value(self._last_timeline_setting_key(), ""))
+        timeline = next((item for item in timelines if item.id == remembered), None)
+        if timeline is None:
+            timeline = timelines[0]
+        self.load_project_timeline(timeline.id)
+
+    def _active_timeline_record(self) -> TimelineRecord | None:
+        return next(
+            (
+                timeline
+                for timeline in self.project_store.timelines
+                if timeline.id == self._active_timeline_id
+            ),
+            None,
+        )
+
+    def _update_plate_set_context(self) -> None:
+        timeline = self._active_timeline_record()
+        if timeline is None:
+            active_label = "ACTIVE PLATE SET · NONE"
+            preview_label = f"{self.project_store.settings.name} / NO PLATE SET OPEN"
+            range_label = "TIMELINE RANGE · NO PLATE SET"
+        else:
+            folder = next(
+                (
+                    item.name
+                    for item in self.project_store.bins
+                    if item.id == timeline.bin_id
+                ),
+                "Master",
+            )
+            plate_count = len(timeline.source_paths)
+            active_label = f"ACTIVE PLATE SET · {timeline.name} · {plate_count} PLATES"
+            preview_label = (
+                f"{self.project_store.settings.name} / {folder} / {timeline.name}"
+            )
+            range_label = f"TIMELINE RANGE · {timeline.name}"
+        if hasattr(self, "active_plates_title"):
+            self.active_plates_title.setText(active_label)
+            self.active_plates_title.setToolTip(active_label)
+        if hasattr(self, "preview_context"):
+            self.preview_context.setText(preview_label)
+            self.preview_context.setToolTip(preview_label)
+        if hasattr(self, "timing_title"):
+            self.timing_title.setText(range_label)
+            self.timing_title.setToolTip(range_label)
 
     def _apply_project_defaults(self) -> None:
         snapshot = self.project_store.settings.settings_snapshot
@@ -1741,11 +1846,14 @@ class MainWindow(QMainWindow):
         except RenderQueueError:
             self.render_queue = RenderQueueStore(project_directory / "render-queue.recovered.json")
         self.settings.setValue("lastProject", str(store.path))
+        self.settings.sync()
         self.clear_sources()
         self._apply_project_defaults()
         self._update_project_header()
         self._refresh_media_tree()
         self._refresh_queue_table()
+        if self._auto_workflows_enabled:
+            self._restore_active_timeline()
 
     def open_project_folder(self) -> None:
         QProcess.startDetached("open" if sys.platform == "darwin" else "explorer", [str(self.project_store.path.parent)])
@@ -1804,6 +1912,7 @@ class MainWindow(QMainWindow):
                     item.setExpanded(True)
                     break
                 iterator += 1
+        self._update_plate_set_context()
 
     def _append_timeline_tree_item(
         self, parent: QTreeWidgetItem, timeline: TimelineRecord
@@ -1811,7 +1920,18 @@ class MainWindow(QMainWindow):
         numbers = [plate_number(path) for path in timeline.source_paths]
         plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
         cache = timeline.playback_cache_status.value.upper()
-        item = QTreeWidgetItem([f"{timeline.name}   ·   {plate_label}   ·   {cache}"])
+        active = timeline.id == self._active_timeline_id
+        marker = "● " if active else ""
+        details = f"{plate_label} · {len(timeline.source_paths)} PLATES · {cache}"
+        if active:
+            details = f"{details} · ACTIVE"
+        item = QTreeWidgetItem([f"{marker}{timeline.name}\n{details}"])
+        item.setSizeHint(0, QSize(0, 40))
+        item.setToolTip(0, f"{timeline.name} · {details}")
+        if active:
+            active_font = item.font(0)
+            active_font.setBold(True)
+            item.setFont(0, active_font)
         item.setData(0, Qt.ItemDataRole.UserRole, "timeline")
         item.setData(0, Qt.ItemDataRole.UserRole + 1, timeline.id)
         parent.addChild(item)
@@ -1836,13 +1956,14 @@ class MainWindow(QMainWindow):
         kind, _item_id = self._selected_media_item()
         menu = QMenu(self)
         menu.addAction("New Folder…", self.create_media_bin)
-        if kind in {"bin", "timeline"}:
-            menu.addAction("Rename…", self.rename_media_item)
+        if kind == "bin":
+            menu.addAction("Rename Folder…", self.rename_media_item)
         if kind == "timeline":
-            menu.addAction("Open Timeline", self.open_selected_timeline)
-            menu.addAction("Duplicate Timeline", self.duplicate_selected_timeline)
+            menu.addAction("Open Plate Set", self.open_selected_timeline)
+            menu.addAction("Rename Plate Set…", self.rename_media_item)
+            menu.addAction("Duplicate Plate Set", self.duplicate_selected_timeline)
             menu.addSeparator()
-            menu.addAction("Delete Timeline…", self.delete_selected_timeline)
+            menu.addAction("Delete Plate Set…", self.delete_selected_timeline)
         menu.exec(self.media_tree.viewport().mapToGlobal(position))
 
     def rename_media_item(self) -> None:
@@ -1859,7 +1980,9 @@ class MainWindow(QMainWindow):
             ),
             "",
         )
-        name, accepted = QInputDialog.getText(self, "Rename", "Name", text=current)
+        title = "Rename Plate Set" if kind == "timeline" else "Rename Folder"
+        label = "Plate Set name" if kind == "timeline" else "Folder name"
+        name, accepted = QInputDialog.getText(self, title, label, text=current)
         if not accepted or not name.strip():
             return
         try:
@@ -1897,6 +2020,7 @@ class MainWindow(QMainWindow):
         try:
             self.project_store.add_timeline(duplicate)
             self._active_timeline_id = duplicate.id
+            self._remember_active_timeline()
             self._refresh_media_tree()
         except ProjectError as error:
             self._error("Duplicate Timeline", str(error))
@@ -1905,10 +2029,19 @@ class MainWindow(QMainWindow):
         kind, item_id = self._selected_media_item()
         if kind != "timeline" or not item_id:
             return
+        timeline = next(
+            (item for item in self.project_store.timelines if item.id == item_id),
+            None,
+        )
+        if timeline is None:
+            return
         if self._show_message(
             QMessageBox.Icon.Question,
-            "Delete Timeline",
-            "Remove this timeline from the project? Source media will not be deleted.",
+            "Delete Plate Set",
+            (
+                f'Delete Plate Set “{timeline.name}”? '
+                f"Its {len(timeline.source_paths)} source media files will remain on disk."
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -1916,14 +2049,13 @@ class MainWindow(QMainWindow):
         self.project_store.remove_timeline(item_id)
         if self._active_timeline_id == item_id:
             self._active_timeline_id = None
+            self.settings.remove(self._last_timeline_setting_key())
             self.clear_sources()
         self._refresh_media_tree()
 
-    def _ensure_project_timeline(self, sources: list[str]) -> None:
-        if self._loading_timeline:
-            return
+    def _timeline_for_sources(self, sources: list[str]) -> TimelineRecord | None:
         normalized = tuple(str(Path(path)) for path in sources)
-        existing = next(
+        return next(
             (
                 item
                 for item in self.project_store.timelines
@@ -1931,21 +2063,33 @@ class MainWindow(QMainWindow):
             ),
             None,
         )
+
+    def _unique_plate_set_name(self, requested: str, sources: list[str]) -> str:
+        base = requested.strip() or self._timeline_name(sources)
+        project_names = {item.name for item in self.project_store.timelines}
+        name = base
+        suffix = 2
+        while name in project_names:
+            name = f"{base} · {suffix}"
+            suffix += 1
+        return name
+
+    def _ensure_project_timeline(
+        self, sources: list[str], *, plate_set_name: str | None = None
+    ) -> None:
+        if self._loading_timeline:
+            return
+        existing = self._timeline_for_sources(sources)
         if existing is not None:
             self._active_timeline_id = existing.id
             self._active_bin_id = existing.bin_id
+            self._remember_active_timeline()
             self._refresh_media_tree()
             return
         bin_id = self._active_bin_id
         if bin_id is None and self.project_store.bins:
             bin_id = self.project_store.list_bins()[0].id
-        name = self._timeline_name(sources)
-        project_names = {item.name for item in self.project_store.timelines}
-        base = name
-        suffix = 2
-        while name in project_names:
-            name = f"{base} · {suffix}"
-            suffix += 1
+        name = self._unique_plate_set_name(plate_set_name or "", sources)
         try:
             timeline = TimelineRecord.create(
                 name=name,
@@ -1958,6 +2102,7 @@ class MainWindow(QMainWindow):
             self.project_store.add_timeline(timeline)
             self._active_timeline_id = timeline.id
             self._active_bin_id = timeline.bin_id
+            self._remember_active_timeline()
             self._refresh_media_tree()
         except ProjectError as error:
             self._append_log(f"PROJECT TIMELINE: {error}")
@@ -2014,6 +2159,7 @@ class MainWindow(QMainWindow):
             self._set_video_sources([str(path) for path in timeline.source_paths])
             self._active_timeline_id = timeline.id
             self._active_bin_id = timeline.bin_id
+            self._remember_active_timeline()
             if timeline.tc_alignment_snapshot is not None:
                 alignment_path = directory / "timecode-alignment.json"
                 alignment_path.write_text(
@@ -2103,7 +2249,9 @@ class MainWindow(QMainWindow):
         self.profile_label.setText(f"Drive {count}-Cam · {profile_kind}")
         self.setWindowTitle(f"{APP_NAME}  —  {count}-Camera 180°")
 
-    def _set_video_sources(self, files: list[str]) -> None:
+    def _set_video_sources(
+        self, files: list[str], *, plate_set_name: str | None = None
+    ) -> None:
         ordered, numbers = order_camera_plates(files)
         self._activate_camera_count(len(ordered))
         self._plate_numbers = numbers
@@ -2131,7 +2279,7 @@ class MainWindow(QMainWindow):
             else "natural filename order"
         )
         self._append_log(f"Imported {len(ordered)} plates · {order_note}")
-        self._ensure_project_timeline(ordered)
+        self._ensure_project_timeline(ordered, plate_set_name=plate_set_name)
 
     def _suggest_output_path(self, sources: list[str]) -> str:
         stem = re.sub(
@@ -2780,10 +2928,27 @@ class MainWindow(QMainWindow):
             self.settings.setValue("lastConfig", str(destination))
             self._append_log(f"Saved rig profile: {destination}")
 
+    def _request_plate_set_name(self, sources: list[str]) -> str | None:
+        existing = self._timeline_for_sources(sources)
+        if existing is not None:
+            return existing.name
+        default_name = self._unique_plate_set_name("", sources)
+        numbers = [plate_number(path) for path in sources]
+        plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
+        name, accepted = QInputDialog.getText(
+            self,
+            "New Plate Set",
+            f"Plate Set name · {plate_label} · {len(sources)} camera plates",
+            text=default_name,
+        )
+        if not accepted:
+            return None
+        return name.strip() or default_name
+
     def choose_videos(self) -> None:
         if self._import_dialog is None:
             dialog = QFileDialog(self)
-            dialog.setWindowTitle("Select P06-P08 or P01-P05 camera plates")
+            dialog.setWindowTitle("New Plate Set · Select 3 or 5 Camera Plates")
             dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setNameFilter(VIDEO_FILTER)
@@ -2804,10 +2969,14 @@ class MainWindow(QMainWindow):
         if files:
             self.settings.setValue("lastImportDir", str(Path(files[0]).parent))
             try:
-                self._set_video_sources(files)
+                ordered, _numbers = order_camera_plates(files)
+                plate_set_name = self._request_plate_set_name(ordered)
+                if plate_set_name is None:
+                    return
+                self._set_video_sources(ordered, plate_set_name=plate_set_name)
                 self._analyze_imported_sources()
             except Exception as error:
-                self._error("Import plates", str(error))
+                self._error("New Plate Set", str(error))
 
     def clear_sources(self) -> None:
         self.source_table.set_paths([""] * self.source_table.camera_count())
@@ -4398,10 +4567,15 @@ class MainWindow(QMainWindow):
             self.load_config(Path(configs[0]))
         if videos:
             try:
-                self._set_video_sources(videos)
+                ordered, _numbers = order_camera_plates(videos)
+                plate_set_name = self._request_plate_set_name(ordered)
+                if plate_set_name is None:
+                    event.ignore()
+                    return
+                self._set_video_sources(ordered, plate_set_name=plate_set_name)
                 self._analyze_imported_sources()
             except Exception as error:
-                self._error("Drop videos", str(error))
+                self._error("New Plate Set", str(error))
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:

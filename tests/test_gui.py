@@ -10,7 +10,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel, QToolBar
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QToolBar,
+)
 
 from vpstitch.config import load_config
 from vpstitch.gui import (
@@ -306,6 +313,45 @@ def test_imported_plate_set_becomes_timeline_in_unified_media_pool(
     app.processEvents()
 
 
+def test_named_plate_set_groups_all_cameras_and_updates_workspace_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Production" / "project.json"
+    store = ProjectStore.create(project_path, name="Production")
+    store.add_bin(Bin.create("Bridge"))
+    window = MainWindow(project_path)
+    clips = [tmp_path / f"hero_P{number:02d}.mov" for number in (5, 2, 4, 1, 3)]
+    for clip in clips:
+        clip.touch()
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *_args, **_kwargs: ("Bridge Hero", True),
+    )
+
+    ordered, _numbers = order_camera_plates([str(clip) for clip in clips])
+    plate_set_name = window._request_plate_set_name(ordered)
+    window._set_video_sources(ordered, plate_set_name=plate_set_name)
+
+    assert plate_set_name == "Bridge Hero"
+    assert len(window.project_store.timelines) == 1
+    timeline = window.project_store.timelines[0]
+    assert timeline.name == "Bridge Hero"
+    assert len(timeline.source_paths) == 5
+    assert window._active_timeline_id == timeline.id
+    assert window.active_plates_title.text() == "ACTIVE PLATE SET · Bridge Hero · 5 PLATES"
+    assert window.preview_context.text() == "Production / Bridge / Bridge Hero"
+    assert window.timing_title.text() == "TIMELINE RANGE · Bridge Hero"
+    root = window.media_tree.topLevelItem(0)
+    plate_set_item = root.child(0).child(0)
+    assert plate_set_item.text(0).startswith("● Bridge Hero\n")
+    assert "P01–P05 · 5 PLATES" in plate_set_item.text(0)
+    assert "ACTIVE" in plate_set_item.text(0)
+    window.close()
+    app.processEvents()
+
+
 def test_project_canvas_and_ocio_defaults_are_applied_to_new_workspace(
     tmp_path: Path,
 ) -> None:
@@ -386,6 +432,7 @@ def test_gui_reuses_import_dialog_to_avoid_macos_native_teardown(monkeypatch) ->
     first_dialog = window._import_dialog
     window.choose_videos()
     assert first_dialog is not None
+    assert first_dialog.windowTitle() == "New Plate Set · Select 3 or 5 Camera Plates"
     assert window._import_dialog is first_dialog
     window.close()
     app.processEvents()
@@ -445,6 +492,9 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     for path in three:
         path.touch()
     window._set_video_sources([str(path) for path in three])
+    three_plate_set = window._active_timeline_record()
+    assert three_plate_set is not None
+    assert len(three_plate_set.source_paths) == 3
     assert window.source_table.camera_count() == 3
     assert window.source_table.rowCount() == 5
     assert all(window.source_table.isRowHidden(row) for row in (3, 4))
@@ -471,6 +521,10 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     for path in five:
         path.touch()
     window._set_video_sources([str(path) for path in five])
+    five_plate_set = window._active_timeline_record()
+    assert five_plate_set is not None
+    assert five_plate_set.id != three_plate_set.id
+    assert len(five_plate_set.source_paths) == 5
     assert window.source_table.camera_count() == 5
     assert window.source_table.rowCount() == 5
     assert all(not window.source_table.isRowHidden(row) for row in range(5))
