@@ -20,9 +20,9 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 
 권장 작업 순서:
 
-1. `IMPORT PLATES`에서 `P01–P03` 또는 `P01–P05` 원본을 한 번에 선택합니다. 선택
-   순서와 관계없이 파일명이나 상위 폴더명의 `P01`, `CAM01`, `01` 표기를 인식해
-   1번부터 자동 배치합니다.
+1. `IMPORT PLATES`에서 전방 3카메라 `P06–P08` 또는 후방 5카메라 `P01–P05`
+   원본을 한 번에 선택합니다. 선택 순서와 관계없이 파일명이나 상위 폴더명의
+   `P06`, `CAM06`, `06` 같은 표기를 인식해 물리 카메라 번호 순으로 자동 배치합니다.
 2. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
    공통 구간으로 자동 트림합니다.
 3. 하나의 `SHARED TIMELINE`에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
@@ -43,7 +43,7 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 `Drive 5-Cam` 프로필이 자동으로 로드되므로 같은 리그로 촬영한 P01–P05 플레이트는
 별도 JSON 선택 없이 바로 불러와 작업할 수 있습니다.
 
-P01–P03 세 개만 임포트하면 현재 5카메라 프로필의 좌·중앙·우 카메라를 사용한
+P06–P08 세 개만 임포트하면 현재 5카메라 프로필의 좌·중앙·우 카메라를 사용한
 3카메라 작업 레이아웃으로 자동 전환합니다. 전방 3카메라 리그의 실제 렌즈나 물리
 각도가 후방 5카메라 리그와 다르면 전용 3카메라 `Rig Profile`을 열거나 `RIG ALIGN`으로
 보정해야 합니다.
@@ -89,7 +89,7 @@ DaVinci Resolve처럼 입력 색공간(자동/Rec.709/Rec.2020/Rec.601)과 Video
 - 메모리를 제한하는 타일 기반 cylindrical projection
 - 고정 리그 투영 맵의 디스크 캐시(프레임마다 삼각함수 재계산 방지)
 - embedded SMPTE TC 기반 3개/5개 플레이트 정렬과 공통 구간 자동 트림
-- P01–P03/P01–P05 네이밍 자동 인식 및 1번부터 카메라 순서 배치
+- 전방 P06–P08/후방 P01–P05 네이밍 자동 인식 및 물리 카메라 번호 순서 배치
 - drop-frame/non-drop-frame 및 24시간 자정 rollover 처리
 - pinhole 및 equidistant fisheye 렌즈 모델
 - float32 feather blending

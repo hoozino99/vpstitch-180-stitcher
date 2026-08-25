@@ -26,20 +26,35 @@ from vpstitch.renderqueue import RenderJob, RenderQueueStore, RenderStatus
 def test_plate_number_recognizes_one_based_clip_and_folder_names(tmp_path: Path) -> None:
     assert plate_number(tmp_path / "drive_P01_take.mov") == 1
     assert plate_number(tmp_path / "camera-5.mov") == 5
-    assert plate_number(tmp_path / "rear_03.mov") == 3
-    assert plate_number(tmp_path / "P04" / "A001.mov") == 4
+    assert plate_number(tmp_path / "front_08.mov") == 8
+    assert plate_number(tmp_path / "P06" / "A001.mov") == 6
 
 
-def test_camera_plates_are_auto_ordered_from_p01() -> None:
-    paths = ["shot_P03.mov", "shot_P01.mov", "shot_P02.mov"]
+def test_three_camera_plates_are_auto_ordered_from_p06() -> None:
+    paths = ["shot_P08.mov", "shot_P06.mov", "shot_P07.mov"]
     ordered, numbers = order_camera_plates(paths)
-    assert ordered == ["shot_P01.mov", "shot_P02.mov", "shot_P03.mov"]
-    assert numbers == [1, 2, 3]
+    assert ordered == ["shot_P06.mov", "shot_P07.mov", "shot_P08.mov"]
+    assert numbers == [6, 7, 8]
+
+
+def test_five_camera_plates_are_auto_ordered_from_p01() -> None:
+    paths = [
+        "shot_P05.mov",
+        "shot_P02.mov",
+        "shot_P04.mov",
+        "shot_P01.mov",
+        "shot_P03.mov",
+    ]
+    ordered, numbers = order_camera_plates(paths)
+    assert ordered == [f"shot_P{number:02d}.mov" for number in range(1, 6)]
+    assert numbers == [1, 2, 3, 4, 5]
 
 
 def test_camera_plate_import_rejects_incomplete_numbering() -> None:
-    with pytest.raises(ValueError, match="P01, P02, P03"):
-        order_camera_plates(["shot_P01.mov", "shot_P03.mov", "shot_P05.mov"])
+    with pytest.raises(ValueError, match="P06, P07, P08"):
+        order_camera_plates(["shot_P05.mov", "shot_P06.mov", "shot_P08.mov"])
+    with pytest.raises(ValueError, match="P06, P07, P08"):
+        order_camera_plates(["shot_P01.mov", "shot_P02.mov", "shot_P03.mov"])
 
 
 def test_preview_dimensions_preserve_canvas_aspect() -> None:
@@ -313,7 +328,7 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     first_camera_item = window.source_table.item(0, 0)
     fifth_camera_item = window.source_table.item(4, 0)
 
-    three = [tmp_path / f"front_P{number:02d}.mov" for number in (3, 1, 2)]
+    three = [tmp_path / f"front_P{number:02d}.mov" for number in (8, 6, 7)]
     for path in three:
         path.touch()
     window._set_video_sources([str(path) for path in three])
@@ -322,14 +337,14 @@ def test_gui_imports_three_or_five_numbered_plates_in_camera_order(tmp_path: Pat
     assert all(window.source_table.isRowHidden(row) for row in (3, 4))
     assert window.source_table.item(0, 0) is first_camera_item
     assert [Path(path).name for path in window.source_table.paths()] == [
-        "front_P01.mov",
-        "front_P02.mov",
-        "front_P03.mov",
+        "front_P06.mov",
+        "front_P07.mov",
+        "front_P08.mov",
     ]
     assert [window.source_table.item(row, 0).text() for row in range(3)] == [
-        "CAM 1",
-        "CAM 2",
-        "CAM 3",
+        "CAM 6",
+        "CAM 7",
+        "CAM 8",
     ]
     assert len(window.config_data["cameras"]) == 3
     assert "3-CAMERA" in window.app_subtitle.text()

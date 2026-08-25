@@ -84,6 +84,10 @@ APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
+PLATE_NUMBERS_BY_COUNT = {
+    3: (6, 7, 8),
+    5: (1, 2, 3, 4, 5),
+}
 _MACOS_AX_SHIM: ctypes.CDLL | None = None
 GUI_MASTER_BIT_DEPTHS = {
     "prores-hq": 10,
@@ -104,14 +108,14 @@ INPUT_VIDEO_RANGES = (
     ("Full", "pc"),
 )
 _EXPLICIT_PLATE_NUMBER = re.compile(
-    r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-5])(?=$|[^0-9])",
+    r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-8])(?=$|[^0-9])",
     re.IGNORECASE,
 )
-_BARE_PLATE_NUMBER = re.compile(r"(?:^|[^0-9])0([1-5])(?=$|[^0-9])")
+_BARE_PLATE_NUMBER = re.compile(r"(?:^|[^0-9])0([1-8])(?=$|[^0-9])")
 
 
 def plate_number(path: str | Path) -> int | None:
-    """Read a one-based P01-P05 camera number from a clip or parent folder name."""
+    """Read a P01-P08 camera number from a clip or parent folder name."""
     source = Path(path)
     components = [source.stem, *(parent.name for parent in source.parents[:3])]
     for pattern in (_EXPLICIT_PLATE_NUMBER, _BARE_PLATE_NUMBER):
@@ -123,9 +127,9 @@ def plate_number(path: str | Path) -> int | None:
 
 
 def order_camera_plates(paths: list[str]) -> tuple[list[str], list[int] | None]:
-    """Validate 3/5-plate imports and order recognized P01-P05 names."""
+    """Validate P06-P08 or P01-P05 sets and return them in camera order."""
     if len(paths) not in SUPPORTED_CAMERA_COUNTS:
-        raise ValueError("Select either 3 plates (P01-P03) or 5 plates (P01-P05)")
+        raise ValueError("Select either 3 plates (P06-P08) or 5 plates (P01-P05)")
 
     detected = [plate_number(path) for path in paths]
     if all(number is None for number in detected):
@@ -135,10 +139,10 @@ def order_camera_plates(paths: list[str]) -> tuple[list[str], list[int] | None]:
         ]
         return sorted(paths, key=natural), None
     if any(number is None for number in detected):
-        raise ValueError("Some plate numbers are missing. Name every clip P01-P03 or P01-P05")
+        raise ValueError("Some plate numbers are missing. Name every clip P06-P08 or P01-P05")
 
     numbers = [int(number) for number in detected if number is not None]
-    expected = list(range(1, len(paths) + 1))
+    expected = list(PLATE_NUMBERS_BY_COUNT[len(paths)])
     if sorted(numbers) != expected:
         expected_text = ", ".join(f"P{number:02d}" for number in expected)
         raise ValueError(f"Plate names must contain each of {expected_text} exactly once")
@@ -250,7 +254,7 @@ class PreviewView(QGraphicsView):
         self.setBackgroundBrush(QColor("#090c11"))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty = QLabel("P01–P03 또는 P01–P05를 넣고  PREVIEW  를 누르세요")
+        self._empty = QLabel("P06–P08 또는 P01–P05를 넣고  PREVIEW  를 누르세요")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setStyleSheet("color:#7e8793; font-size:13px; letter-spacing:.5px;")
         self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -650,6 +654,19 @@ class SourceTable(QTableWidget):
             item.setToolTip(path)
             item.setData(Qt.ItemDataRole.UserRole, path)
 
+    def set_camera_numbers(self, numbers: list[int] | None) -> None:
+        """Show physical plate numbers while preserving sequential rig slots."""
+        if numbers is not None and len(numbers) != self.camera_count():
+            raise ValueError("camera number count does not match the active rig")
+        for row in range(self.camera_count()):
+            number = numbers[row] if numbers is not None else row + 1
+            item = self.item(row, 0)
+            if item is None:
+                item = QTableWidgetItem()
+                self.setItem(row, 0, item)
+            item.setText(f"CAM {number}")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
     def clear_timing(self) -> None:
         for row in range(self.camera_count()):
             for column in (2, 3, 4):
@@ -851,7 +868,7 @@ class MainWindow(QMainWindow):
         media_title = QLabel("MEDIA POOL")
         media_title.setProperty("sectionTitle", True)
         source_layout.addWidget(media_title)
-        self.media_hint = QLabel("Import P01–P03 or P01–P05 · auto ordered")
+        self.media_hint = QLabel("Import P06–P08 or P01–P05 · auto ordered")
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
         source_layout.addWidget(self.media_hint)
@@ -867,7 +884,7 @@ class MainWindow(QMainWindow):
         source_buttons.addWidget(self.clear_button)
         source_layout.addLayout(source_buttons)
         source_layout.addStretch()
-        self.source_status = QLabel("Drop P01–P03 or P01–P05 clips here")
+        self.source_status = QLabel("Drop P06–P08 or P01–P05 clips here")
         self.source_status.setObjectName("sourceStatus")
         self.source_status.setWordWrap(True)
         source_layout.addWidget(self.source_status)
@@ -1176,6 +1193,7 @@ class MainWindow(QMainWindow):
         self.config_data["cameras"] = json.loads(json.dumps(cameras))
         self.source_table.blockSignals(True)
         self.source_table.set_rig(self.config_data["cameras"])
+        self.source_table.set_camera_numbers(list(PLATE_NUMBERS_BY_COUNT[count]))
         self.source_table.blockSignals(False)
         self.app_subtitle.setText(f"{count}-CAMERA 180° PANORAMA")
         profile_kind = "Auto Profile" if self.config_path and self.config_path.parent == self.project_root / "configs" else "Custom Profile"
@@ -1196,6 +1214,9 @@ class MainWindow(QMainWindow):
             for path, camera in zip(ordered, cameras, strict=True)
         }
         self.source_table.set_paths(ordered)
+        self.source_table.set_camera_numbers(
+            numbers or list(PLATE_NUMBERS_BY_COUNT[len(ordered)])
+        )
         current_output = self.output_path.text().strip()
         if not current_output or current_output == self._last_auto_output:
             self._last_auto_output = self._suggest_output_path(ordered)
@@ -1210,7 +1231,7 @@ class MainWindow(QMainWindow):
 
     def _suggest_output_path(self, sources: list[str]) -> str:
         stem = re.sub(
-            r"(?i)^P0?[1-5][._ -]*",
+            r"(?i)^P0?[1-8][._ -]*",
             "",
             Path(sources[0]).stem,
         ).strip(" ._-")
@@ -1260,7 +1281,7 @@ class MainWindow(QMainWindow):
         elif loaded:
             self.source_status.setText(f"●  {loaded} of {expected} plates loaded")
         else:
-            self.source_status.setText("Drop P01–P03 or P01–P05 clips here")
+            self.source_status.setText("Drop P06–P08 or P01–P05 clips here")
 
     def _stitch_settings(self) -> QWidget:
         panel = QWidget()
@@ -1648,6 +1669,9 @@ class MainWindow(QMainWindow):
         self._tc_alignment_path = None
         self.source_table.blockSignals(True)
         self.source_table.set_rig(cameras)
+        self.source_table.set_camera_numbers(
+            list(PLATE_NUMBERS_BY_COUNT[len(cameras)])
+        )
         self.source_table.blockSignals(False)
         output = raw.setdefault("output", {})
         self._loading_config = True
@@ -1849,7 +1873,7 @@ class MainWindow(QMainWindow):
     def choose_videos(self) -> None:
         if self._import_dialog is None:
             dialog = QFileDialog(self)
-            dialog.setWindowTitle("Select P01-P03 or P01-P05 camera plates")
+            dialog.setWindowTitle("Select P06-P08 or P01-P05 camera plates")
             dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setNameFilter(VIDEO_FILTER)
@@ -1877,6 +1901,9 @@ class MainWindow(QMainWindow):
 
     def clear_sources(self) -> None:
         self.source_table.set_paths([""] * self.source_table.camera_count())
+        self.source_table.set_camera_numbers(
+            list(PLATE_NUMBERS_BY_COUNT[self.source_table.camera_count()])
+        )
         self._plate_numbers = None
         self._source_probes = None
         self._source_overrides = {}
@@ -2778,7 +2805,7 @@ class MainWindow(QMainWindow):
     def _timeline_name(self, sources: list[str]) -> str:
         parent = Path(sources[0]).parent.name.strip()
         stem = re.sub(
-            r"(?i)^P0?1[._ -]*",
+            r"(?i)^P0?(?:1|6)[._ -]*",
             "",
             Path(sources[0]).stem,
         ).strip(" ._-")
