@@ -43,7 +43,11 @@ def test_round_trip_preserves_project_snapshots_statuses_and_cross_platform_path
     store = ProjectStore.create(
         project_path,
         name="서울 촬영",
-        settings_snapshot={"canvas": [8192, 2252], "ocio": Path("config/studio.ocio")},
+        settings_snapshot={
+            "canvas": [8192, 2252],
+            "ocio": Path("config/studio.ocio"),
+            "portable_relative": PureWindowsPath(r"config\studio.ocio"),
+        },
     )
     shoot = store.add_bin(Bin.create("Location A", bin_id="bin-a"))
     original = TimelineRecord.create(
@@ -63,6 +67,7 @@ def test_round_trip_preserves_project_snapshots_statuses_and_cross_platform_path
 
     assert loaded.settings.name == "서울 촬영"
     assert loaded.settings.settings_snapshot["ocio"] == "config/studio.ocio"
+    assert loaded.settings.settings_snapshot["portable_relative"] == "config/studio.ocio"
     assert loaded.list_bins() == (shoot,)
     assert loaded.list_timelines(shoot.id) == (original,)
     assert loaded.timelines[0].source_paths == tuple(plate_paths((6, 7, 8), windows=True))

@@ -19,6 +19,12 @@ class RenderQueueError(ValueError):
     """Raised when a render queue or job contains invalid data."""
 
 
+def _path_to_json(value: PurePath) -> str:
+    if not value.is_absolute() and not value.drive:
+        return PurePosixPath(*value.parts).as_posix()
+    return str(value)
+
+
 class RenderStatus(str, Enum):
     QUEUED = "queued"
     RENDERING = "rendering"
@@ -31,7 +37,7 @@ def _json_value(value: Any, *, field: str) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, PurePath):
-        return str(value)
+        return _path_to_json(value)
     if isinstance(value, Enum):
         return _json_value(value.value, field=field)
     if isinstance(value, Mapping):
@@ -175,7 +181,7 @@ class RenderJob:
         return {
             "id": self.id,
             "name": self.name,
-            "source_paths": [str(path) for path in self.source_paths],
+            "source_paths": [_path_to_json(path) for path in self.source_paths],
             "config_snapshot": _json_value(
                 self.config_snapshot, field="config_snapshot"
             ),
@@ -183,11 +189,13 @@ class RenderJob:
                 self.tc_alignment_snapshot, field="tc_alignment_snapshot"
             ),
             "tc_alignment_path": (
-                None if self.tc_alignment_path is None else str(self.tc_alignment_path)
+                None
+                if self.tc_alignment_path is None
+                else _path_to_json(self.tc_alignment_path)
             ),
             "in_frame": self.in_frame,
             "out_frame": self.out_frame,
-            "output_path": str(self.output_path),
+            "output_path": _path_to_json(self.output_path),
             "status": self.status.value,
             "error": self.error,
         }

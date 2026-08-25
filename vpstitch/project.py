@@ -18,6 +18,12 @@ _PLATE_NUMBER = re.compile(r"(?:^|[^A-Z0-9])P(0[1-8])(?=[^0-9]|$)", re.IGNORECAS
 _T = TypeVar("_T")
 
 
+def _path_to_json(value: PurePath) -> str:
+    if not value.is_absolute() and not value.drive:
+        return PurePosixPath(*value.parts).as_posix()
+    return str(value)
+
+
 class ProjectError(ValueError):
     """Raised when project data is invalid or cannot be persisted."""
 
@@ -63,7 +69,7 @@ def _json_value(value: Any, *, field: str) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, PurePath):
-        return str(value)
+        return _path_to_json(value)
     if isinstance(value, Enum):
         return _json_value(value.value, field=field)
     if isinstance(value, Mapping):
@@ -292,14 +298,18 @@ class TimelineRecord:
             "id": self.id,
             "name": self.name,
             "bin_id": self.bin_id,
-            "source_paths": [str(path) for path in self.source_paths],
+            "source_paths": [_path_to_json(path) for path in self.source_paths],
             "config_snapshot": _json_value(self.config_snapshot, field="config_snapshot"),
             "tc_alignment_snapshot": _json_value(
                 self.tc_alignment_snapshot, field="tc_alignment_snapshot"
             ),
             "in_frame": self.in_frame,
             "out_frame": self.out_frame,
-            "playback_cache_path": None if self.playback_cache_path is None else str(self.playback_cache_path),
+            "playback_cache_path": (
+                None
+                if self.playback_cache_path is None
+                else _path_to_json(self.playback_cache_path)
+            ),
             "playback_cache_status": self.playback_cache_status.value,
             "stitch_status": self.stitch_status.value,
             "order": self.order,

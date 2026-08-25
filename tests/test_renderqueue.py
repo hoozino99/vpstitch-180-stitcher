@@ -20,6 +20,7 @@ def make_job(name: str, *, status: RenderStatus = RenderStatus.QUEUED) -> Render
         config_snapshot={
             "output": {"width": 20_000, "height": 5_504},
             "ocio": {"config": Path("color") / "studio.ocio"},
+            "portable_relative": PureWindowsPath(r"color\studio.ocio"),
         },
         tc_alignment_snapshot={"fps": 24.0, "common_frames": 240},
         tc_alignment_path=Path("alignments") / f"{name}.json",
@@ -46,6 +47,7 @@ def test_job_round_trip_keeps_snapshots_ranges_and_paths(tmp_path: Path) -> None
     assert job.tc_alignment_snapshot == {"fps": 24.0, "common_frames": 240}
     assert job.tc_alignment_path == Path("alignments") / "야간 테이크 01.json"
     assert job.config_snapshot["ocio"]["config"] == "color/studio.ocio"
+    assert job.config_snapshot["portable_relative"] == "color/studio.ocio"
     assert json.loads(queue_path.read_text(encoding="utf-8"))["version"] == 1
 
 
