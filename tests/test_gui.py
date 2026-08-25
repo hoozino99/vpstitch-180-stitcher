@@ -8,6 +8,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel, QToolBar
 
 from vpstitch.config import load_config
@@ -21,6 +23,7 @@ from vpstitch.gui import (
     preview_dimensions,
 )
 from vpstitch.renderqueue import RenderJob, RenderQueueStore, RenderStatus
+from vpstitch.project import Bin, ProjectStore
 
 
 def test_plate_number_recognizes_one_based_clip_and_folder_names(tmp_path: Path) -> None:
@@ -237,12 +240,102 @@ def test_gui_uses_compact_resolve_style_workspace() -> None:
     window = MainWindow()
     window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
     assert window.findChild(QToolBar) is None
-    assert window.log_box.isHidden()
     assert not window.inspector_panel.isHidden()
+    assert window.right_tabs.currentIndex() == 0
+    assert window.right_tabs.tabText(1) == "RENDER QUEUE"
+    assert window.right_tabs.tabText(2) == "TASK LOG"
+    assert window.media_tree.topLevelItemCount() == 1
     assert window.source_table.isColumnHidden(3)
     assert all(window.source_table.isColumnHidden(column) for column in (5, 6, 7, 8))
     assert "Auto Profile" in window.profile_label.text()
     assert window.rig_align_button.isEnabled() is False
+    window.close()
+    app.processEvents()
+
+
+def test_imported_plate_set_becomes_timeline_in_unified_media_pool(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Production" / "project.json"
+    store = ProjectStore.create(project_path, name="Production")
+    store.add_bin(Bin.create("Location A"))
+    window = MainWindow(project_path)
+    clips = [tmp_path / f"take_07_P{number:02d}.mov" for number in (8, 6, 7)]
+    for clip in clips:
+        clip.touch()
+
+    window._set_video_sources([str(clip) for clip in clips])
+
+    assert len(window.project_store.timelines) == 1
+    timeline = window.project_store.timelines[0]
+    assert [Path(path).name for path in timeline.source_paths] == [
+        "take_07_P06.mov",
+        "take_07_P07.mov",
+        "take_07_P08.mov",
+    ]
+    assert window._active_timeline_id == timeline.id
+    root = window.media_tree.topLevelItem(0)
+    labels = [root.child(index).text(0) for index in range(root.childCount())]
+    assert any("P06–P08" in label for label in labels) or any(
+        "P06–P08" in root.child(index).child(0).text(0)
+        for index in range(root.childCount())
+        if root.child(index).childCount()
+    )
+    window.close()
+    app.processEvents()
+
+
+def test_project_canvas_and_ocio_defaults_are_applied_to_new_workspace(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "ACES Project" / "project.json"
+    ProjectStore.create(
+        project_path,
+        name="ACES Project",
+        settings_snapshot={
+            "output": {"width": 18_000, "height": 5_000},
+            "color": {
+                "mode": "ocio",
+                "ocio_config": "ocio://show-config",
+                "working_space": "ACEScg",
+                "output_space": "ACES 1.0 SDR-video",
+            },
+        },
+    )
+
+    window = MainWindow(project_path)
+
+    assert window.canvas_width.value() == 18_000
+    assert window.canvas_height.value() == 5_000
+    assert window.color_mode.currentData() == "ocio"
+    assert window.ocio_config.text() == "ocio://show-config"
+    assert window.working_space.text() == "ACEScg"
+    assert window.output_space.text() == "ACES 1.0 SDR-video"
+    window.close()
+    app.processEvents()
+
+
+def test_preview_transport_shortcuts_route_from_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    commands: list[str] = []
+    monkeypatch.setattr(window, "toggle_preview_fullscreen", lambda: commands.append("P"))
+    monkeypatch.setattr(window, "toggle_playback", lambda: commands.append("SPACE"))
+    monkeypatch.setattr(window, "play_reverse", lambda: commands.append("J"))
+    monkeypatch.setattr(window, "stop_playback", lambda: commands.append("K"))
+    monkeypatch.setattr(window, "step_playback", lambda value: commands.append(str(value)))
+
+    window.preview.setFocus()
+    for key in (Qt.Key.Key_P, Qt.Key.Key_Space, Qt.Key.Key_J, Qt.Key.Key_K, Qt.Key.Key_Left, Qt.Key.Key_Right):
+        QTest.keyClick(window.preview.viewport(), key)
+
+    assert commands == ["P", "SPACE", "J", "K", "-1", "1"]
     window.close()
     app.processEvents()
 
@@ -383,7 +476,8 @@ def test_gui_inspector_and_jobs_drawers_toggle() -> None:
     window.inspector_toggle.click()
     assert not window.inspector_panel.isHidden()
     window.jobs_toggle.click()
-    assert window.log_box.isVisible()
+    assert window.inspector_panel.isVisible()
+    assert window.right_tabs.currentIndex() == 1
     assert window.jobs_toggle.text() == "HIDE JOBS"
     window.jobs_toggle.click()
     assert window.log_box.isHidden()

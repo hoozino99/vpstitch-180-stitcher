@@ -12,6 +12,7 @@ __pycache__/
 *.tmp.tif
 output/
 .vpstitch-cache/
+.vpstitch-ui/
 *.mov
 *.mkv
 *.mp4

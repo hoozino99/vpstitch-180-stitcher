@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QCloseEvent,
     QFont,
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -69,6 +71,9 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -77,6 +82,14 @@ from .imageio import read_image
 
 from .canvas import recommend_full_plate_canvas
 from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH, load_config as parse_config
+from .project import (
+    Bin,
+    PlaybackCacheStatus,
+    ProjectError,
+    ProjectStore,
+    StitchStatus,
+    TimelineRecord,
+)
 from .renderqueue import RenderJob, RenderQueueError, RenderQueueStore, RenderStatus
 
 
@@ -244,7 +257,42 @@ def _display_image(array: np.ndarray) -> QImage:
     return QImage(rgb8.data, width, height, rgb8.strides[0], QImage.Format.Format_RGB888).copy()
 
 
+_PREVIEW_KEY_COMMANDS = {
+    Qt.Key.Key_P: "fullscreen",
+    Qt.Key.Key_Space: "play-pause",
+    Qt.Key.Key_J: "reverse",
+    Qt.Key.Key_K: "stop",
+    Qt.Key.Key_L: "forward",
+    Qt.Key.Key_Left: "step-back",
+    Qt.Key.Key_Right: "step-forward",
+}
+
+
+class PlaybackVideoWidget(QVideoWidget):
+    commandRequested = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.setFocus()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.setFullScreen(False)
+            return
+        command = _PREVIEW_KEY_COMMANDS.get(event.key())
+        if command:
+            self.commandRequested.emit(command)
+            return
+        super().keyPressEvent(event)
+
+
 class PreviewView(QGraphicsView):
+    commandRequested = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setScene(QGraphicsScene(self))
@@ -254,11 +302,23 @@ class PreviewView(QGraphicsView):
         self.setBackgroundBrush(QColor("#090c11"))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._empty = QLabel("P06–P08 또는 P01–P05를 넣고  PREVIEW  를 누르세요")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setStyleSheet("color:#7e8793; font-size:13px; letter-spacing:.5px;")
         self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._empty.setParent(self.viewport())
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.setFocus()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        command = _PREVIEW_KEY_COMMANDS.get(event.key())
+        if command:
+            self.commandRequested.emit(command)
+            return
+        super().keyPressEvent(event)
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
@@ -749,8 +809,202 @@ class SourceTable(QTableWidget):
                 raise ValueError(f"Camera {row + 1} orientation/offset is invalid") from error
 
 
+class ProjectManagerDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("VP Stitch · Project Manager")
+        self.setMinimumSize(760, 500)
+        self.setStyleSheet(
+            """
+            QDialog, QWidget { background:#0d1014; color:#e6e9ee; font-family:'-apple-system','SF Pro Text','Malgun Gothic','Segoe UI'; font-size:11px; }
+            QLabel { background:transparent; }
+            QTreeWidget { background:#15191e; border:1px solid #2a3038; border-radius:4px; }
+            QTreeWidget::item { min-height:28px; padding:3px 6px; }
+            QTreeWidget::item:selected { background:#343147; color:#ffffff; }
+            QHeaderView::section { background:#15191e; color:#858d98; border:0; border-bottom:1px solid #2c323a; padding:6px; font-size:9px; font-weight:700; }
+            QLineEdit, QSpinBox { background:#101419; border:1px solid #343b44; border-radius:3px; padding:5px 7px; }
+            QPushButton { background:#20252c; color:#d1d6dd; border:1px solid #373e48; border-radius:3px; padding:6px 10px; font-weight:650; }
+            QPushButton:hover { background:#292f37; border-color:#666f7d; color:#ffffff; }
+            QPushButton#primaryButton { background:#5f5b83; color:#ffffff; border-color:#777199; }
+            """
+        )
+        self.project_path: Path | None = None
+        self.settings = QSettings("VP-LAB", APP_NAME)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(12)
+        title = QLabel("VP STITCH PROJECTS")
+        title.setProperty("sectionTitle", True)
+        layout.addWidget(title)
+        note = QLabel(
+            "Choose a project first. Media bins, Plate Set timelines, proxies and render queue stay inside it."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+        self.projects = QTreeWidget()
+        self.projects.setHeaderLabels(["PROJECT", "LOCATION"])
+        self.projects.setRootIsDecorated(False)
+        self.projects.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.projects.itemDoubleClicked.connect(lambda _item, _column: self.open_selected())
+        self.projects.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.projects.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.projects, 1)
+        actions = QHBoxLayout()
+        new_button = QPushButton("NEW PROJECT")
+        new_button.setObjectName("primaryButton")
+        new_button.clicked.connect(self.create_project)
+        open_button = QPushButton("OPEN…")
+        open_button.setObjectName("secondaryButton")
+        open_button.clicked.connect(self.open_existing)
+        selected_button = QPushButton("OPEN SELECTED")
+        selected_button.setObjectName("primaryButton")
+        selected_button.clicked.connect(self.open_selected)
+        actions.addWidget(new_button)
+        actions.addWidget(open_button)
+        actions.addStretch()
+        actions.addWidget(selected_button)
+        layout.addLayout(actions)
+        self._load_recents()
+
+    def _recent_paths(self) -> list[str]:
+        value = self.settings.value("recentProjects", [])
+        if isinstance(value, str):
+            return [value] if value else []
+        return [str(path) for path in value]
+
+    def _load_recents(self) -> None:
+        paths = self._recent_paths()
+        last = str(self.settings.value("lastProject", ""))
+        if last and last not in paths:
+            paths.insert(0, last)
+        for value in paths:
+            path = Path(value)
+            if not path.is_file():
+                continue
+            try:
+                name = ProjectStore.load(path, autosave=False).settings.name
+            except ProjectError:
+                continue
+            item = QTreeWidgetItem([name, str(path.parent)])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+            self.projects.addTopLevelItem(item)
+        if self.projects.topLevelItemCount():
+            self.projects.setCurrentItem(self.projects.topLevelItem(0))
+
+    def _remember(self, path: Path) -> None:
+        values = [str(path), *[item for item in self._recent_paths() if item != str(path)]]
+        self.settings.setValue("lastProject", str(path))
+        self.settings.setValue("recentProjects", values[:12])
+
+    def create_project(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("New VP Stitch Project")
+        dialog.setMinimumWidth(520)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        name = QLineEdit("Untitled Project")
+        location = QLineEdit(
+            str(Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentLocation)) / "VP Stitch Projects")
+        )
+        browse = QPushButton("…")
+        browse.setObjectName("iconButton")
+        location_row = QWidget()
+        location_layout = QHBoxLayout(location_row)
+        location_layout.setContentsMargins(0, 0, 0, 0)
+        location_layout.addWidget(location)
+        location_layout.addWidget(browse)
+        browse.clicked.connect(
+            lambda: location.setText(
+                QFileDialog.getExistingDirectory(dialog, "Project location", location.text())
+                or location.text()
+            )
+        )
+        width = QSpinBox()
+        width.setRange(640, MAX_CANVAS_WIDTH)
+        width.setValue(20_000)
+        height = QSpinBox()
+        height.setRange(320, MAX_CANVAS_HEIGHT)
+        height.setValue(5_504)
+        ocio = QLineEdit("")
+        ocio.setPlaceholderText("Optional OCIO config · can be changed later")
+        form.addRow("Project name", name)
+        form.addRow("Location", location_row)
+        form.addRow("Default canvas width", width)
+        form.addRow("Default canvas height", height)
+        form.addRow("Default OCIO", ocio)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setText("CREATE")
+            save_button.setObjectName("primaryButton")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        project_name = name.text().strip()
+        if not project_name:
+            return
+        path = Path(location.text()).expanduser() / project_name / "project.json"
+        try:
+            ocio_value = ocio.text().strip()
+            store = ProjectStore.create(
+                path,
+                name=project_name,
+                settings_snapshot={
+                    "output": {"width": width.value(), "height": height.value()},
+                    "color": {
+                        "mode": "ocio" if ocio_value else "passthrough",
+                        **({"ocio_config": ocio_value} if ocio_value else {}),
+                    },
+                },
+            )
+            store.add_bin(Bin.create("Master"))
+        except ProjectError as error:
+            QMessageBox.critical(self, "New Project", str(error))
+            return
+        self.project_path = path
+        self._remember(path)
+        self.accept()
+
+    def open_existing(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open VP Stitch Project",
+            str(Path.home()),
+            "VP Stitch project (project.json *.vpstitch);;JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            ProjectStore.load(path, autosave=False)
+        except ProjectError as error:
+            QMessageBox.critical(self, "Open Project", str(error))
+            return
+        self.project_path = Path(path)
+        self._remember(self.project_path)
+        self.accept()
+
+    def open_selected(self) -> None:
+        item = self.projects.currentItem()
+        if item is None:
+            self.open_existing()
+            return
+        path = Path(str(item.data(0, Qt.ItemDataRole.UserRole)))
+        if not path.is_file():
+            return
+        self.project_path = path
+        self._remember(path)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, project_path: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME}  —  5-Camera 180°")
         self.resize(1600, 960)
@@ -802,14 +1056,31 @@ class MainWindow(QMainWindow):
         self._queue_running = False
         self._queue_current_id: str | None = None
         self._queue_load_error: str | None = None
+        self._active_timeline_id: str | None = None
+        self._active_bin_id: str | None = None
+        self._loading_timeline = False
+        self._auto_cache_requested = False
+        self._auto_cache_in_progress = False
+        self._auto_workflows_enabled = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        self._fullscreen_preview: QDialog | None = None
+        self._reverse_timer = QTimer(self)
+        self._reverse_timer.setInterval(42)
+        self._reverse_timer.timeout.connect(lambda: self.step_playback(-1))
+        self.project_store = self._open_project_store(project_path)
+        project_directory = self.project_store.path.parent
+        self._working_dir = project_directory / "work"
+        self._cache_dir = project_directory / "cache"
+        self._output_root = project_directory / "renders"
+        for directory in (self._working_dir, self._cache_dir, self._output_root):
+            directory.mkdir(parents=True, exist_ok=True)
         try:
             self.render_queue = RenderQueueStore.load(
-                self.user_data_root / "render-queue.json"
+                project_directory / "render-queue.json"
             )
         except RenderQueueError as error:
             self._queue_load_error = str(error)
             self.render_queue = RenderQueueStore(
-                self.user_data_root / "render-queue.recovered.json"
+                project_directory / "render-queue.recovered.json"
             )
         self._build_ui()
         self._apply_style()
@@ -820,7 +1091,29 @@ class MainWindow(QMainWindow):
             initial = self.project_root / "configs" / "five_cam_180.sample.json"
         if initial.is_file():
             self.load_config(initial)
+        self._apply_project_defaults()
+        self._refresh_media_tree()
+        self._update_project_header()
         self.statusBar().showMessage("Ready · preview fits within 4K; final render stays full resolution")
+
+    def _open_project_store(self, project_path: Path | None) -> ProjectStore:
+        testing = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        path = project_path or self.user_data_root / "projects" / "Default Project" / "project.json"
+        if path.is_file():
+            try:
+                return ProjectStore.load(path, autosave=not testing)
+            except ProjectError as error:
+                self._queue_load_error = f"Project recovery: {error}"
+        name = path.parent.name if path.name == "project.json" else path.stem
+        store = ProjectStore.create(
+            path,
+            name=name or "Untitled Project",
+            settings_snapshot={},
+            autosave=not testing,
+        )
+        if not store.bins:
+            store.add_bin(Bin.create("Master"))
+        return store
 
     def _build_ui(self) -> None:
         top_bar = QFrame()
@@ -836,6 +1129,11 @@ class MainWindow(QMainWindow):
         self.app_subtitle.setObjectName("appSubtitle")
         top_layout.addWidget(self.app_subtitle)
         top_layout.addStretch()
+        self.project_title = QLabel(self.project_store.settings.name)
+        self.project_title.setObjectName("projectTitle")
+        self.project_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_layout.addWidget(self.project_title)
+        top_layout.addSpacing(12)
         self.profile_label = QLabel("Rig Profile · Loading…")
         self.profile_label.setObjectName("profileLabel")
         self.profile_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -860,18 +1158,42 @@ class MainWindow(QMainWindow):
         self.source_table.inputSettingsRequested.connect(self._open_input_settings)
         source_group = QFrame()
         source_group.setObjectName("mediaPanel")
-        source_group.setMinimumWidth(250)
-        source_group.setMaximumWidth(330)
+        source_group.setMinimumWidth(300)
+        source_group.setMaximumWidth(390)
         source_layout = QVBoxLayout(source_group)
         source_layout.setContentsMargins(12, 10, 12, 10)
         source_layout.setSpacing(7)
+        media_header = QHBoxLayout()
         media_title = QLabel("MEDIA POOL")
         media_title.setProperty("sectionTitle", True)
-        source_layout.addWidget(media_title)
-        self.media_hint = QLabel("Import P06–P08 or P01–P05 · auto ordered")
+        media_header.addWidget(media_title)
+        media_header.addStretch()
+        self.new_bin_button = QPushButton("+")
+        self.new_bin_button.setObjectName("iconButton")
+        self.new_bin_button.setFixedSize(26, 24)
+        self.new_bin_button.setToolTip("New folder")
+        self.new_bin_button.clicked.connect(self.create_media_bin)
+        media_header.addWidget(self.new_bin_button)
+        source_layout.addLayout(media_header)
+        self.media_hint = QLabel("Plate Set = Timeline · double-click to open")
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
         source_layout.addWidget(self.media_hint)
+
+        self.media_tree = QTreeWidget()
+        self.media_tree.setObjectName("mediaTree")
+        self.media_tree.setHeaderHidden(True)
+        self.media_tree.setIndentation(16)
+        self.media_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.media_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.media_tree.customContextMenuRequested.connect(self._media_tree_menu)
+        self.media_tree.itemDoubleClicked.connect(self._media_item_activated)
+        self.media_tree.setMinimumHeight(180)
+        source_layout.addWidget(self.media_tree, 1)
+
+        active_plates_title = QLabel("ACTIVE PLATE SET")
+        active_plates_title.setProperty("inspectorTitle", True)
+        source_layout.addWidget(active_plates_title)
         source_layout.addWidget(self.source_table)
         source_buttons = QHBoxLayout()
         self.import_button = QPushButton("IMPORT PLATES")
@@ -881,16 +1203,23 @@ class MainWindow(QMainWindow):
         self.clear_button.setObjectName("secondaryButton")
         self.clear_button.clicked.connect(self.clear_sources)
         source_buttons.addWidget(self.import_button, 1)
-        source_buttons.addWidget(self.clear_button)
+        self.new_timeline_button = QPushButton("NEW FOLDER")
+        self.new_timeline_button.setObjectName("secondaryButton")
+        self.new_timeline_button.setToolTip(
+            "Plate Sets become timelines automatically; folders organize both"
+        )
+        self.new_timeline_button.clicked.connect(self.create_media_bin)
+        source_buttons.addWidget(self.new_timeline_button)
         source_layout.addLayout(source_buttons)
-        source_layout.addStretch()
         self.source_status = QLabel("Drop P06–P08 or P01–P05 clips here")
         self.source_status.setObjectName("sourceStatus")
         self.source_status.setWordWrap(True)
         source_layout.addWidget(self.source_status)
 
         self.preview = PreviewView()
-        self.video_preview = QVideoWidget()
+        self.preview.commandRequested.connect(self._handle_preview_command)
+        self.video_preview = PlaybackVideoWidget()
+        self.video_preview.commandRequested.connect(self._handle_preview_command)
         self.video_preview.setStyleSheet("background:#05070a;")
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.preview)
@@ -933,17 +1262,27 @@ class MainWindow(QMainWindow):
         self.settings_tabs.addTab(self._color_settings(), "COLOR")
         self.settings_tabs.addTab(self._output_settings(), "DELIVER")
         settings_scroll.setWidget(self.settings_tabs)
+
+        inspector_page = QWidget()
+        inspector_page_layout = QVBoxLayout(inspector_page)
+        inspector_page_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_page_layout.setSpacing(6)
+        inspector_title = QLabel("TIMELINE VALUES / STITCH CONTROLS")
+        inspector_title.setProperty("sectionTitle", True)
+        inspector_page_layout.addWidget(inspector_title)
+        inspector_page_layout.addWidget(settings_scroll, 1)
+
         self.inspector_panel = QFrame()
         self.inspector_panel.setObjectName("inspectorPanel")
         self.inspector_panel.setMinimumWidth(310)
-        self.inspector_panel.setMaximumWidth(350)
+        self.inspector_panel.setMaximumWidth(390)
         inspector_layout = QVBoxLayout(self.inspector_panel)
-        inspector_layout.setContentsMargins(10, 9, 10, 9)
-        inspector_layout.setSpacing(6)
-        inspector_title = QLabel("PROJECT DEFAULTS / TIMELINE OVERRIDE")
-        inspector_title.setProperty("sectionTitle", True)
-        inspector_layout.addWidget(inspector_title)
-        inspector_layout.addWidget(settings_scroll, 1)
+        inspector_layout.setContentsMargins(8, 7, 8, 7)
+        inspector_layout.setSpacing(0)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setObjectName("rightTabs")
+        self.right_tabs.addTab(inspector_page, "INSPECTOR")
+        inspector_layout.addWidget(self.right_tabs, 1)
 
         upper = QSplitter(Qt.Orientation.Horizontal)
         upper.setObjectName("workspaceSplitter")
@@ -952,7 +1291,7 @@ class MainWindow(QMainWindow):
         upper.addWidget(source_group)
         upper.addWidget(preview_box)
         upper.addWidget(self.inspector_panel)
-        upper.setSizes([280, 960, 310])
+        upper.setSizes([340, 900, 340])
 
         timing_panel = QFrame()
         timing_panel.setObjectName("timingPanel")
@@ -1018,6 +1357,28 @@ class MainWindow(QMainWindow):
         self.playback_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.playback_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self.playback_shortcut.activated.connect(self.toggle_playback)
+        self.preview_shortcuts: list[QShortcut] = []
+        for key, command in (
+            ("P", "fullscreen"),
+            ("J", "reverse"),
+            ("K", "stop"),
+            ("L", "forward"),
+            (Qt.Key.Key_Left, "step-back"),
+            (Qt.Key.Key_Right, "step-forward"),
+        ):
+            shortcut = QShortcut(QKeySequence(key), preview_box)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(
+                lambda selected=command: self._handle_preview_command(selected)
+            )
+            self.preview_shortcuts.append(shortcut)
+        shortcut_hint = QLabel(
+            "P FULL SCREEN  ·  SPACE PLAY/PAUSE  ·  J REVERSE  ·  K STOP  ·  "
+            "L FORWARD  ·  ←/→ FRAME"
+        )
+        shortcut_hint.setProperty("muted", True)
+        shortcut_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        timing_layout.addWidget(shortcut_hint)
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
@@ -1057,17 +1418,12 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(5000)
         self.log.setMinimumHeight(130)
         self.log.setFont(QFont("Cascadia Mono", 9))
-        self.log_box = QFrame()
-        self.log_box.setObjectName("logPanel")
-        log_layout = QVBoxLayout(self.log_box)
-        log_layout.setContentsMargins(14, 10, 14, 10)
-        log_title = QLabel("TIMELINES / RENDER QUEUE")
-        log_title.setProperty("sectionTitle", True)
-        log_layout.addWidget(log_title)
-        self.jobs_tabs = QTabWidget()
         queue_page = QWidget()
         queue_layout = QVBoxLayout(queue_page)
-        queue_layout.setContentsMargins(0, 2, 0, 0)
+        queue_layout.setContentsMargins(0, 4, 0, 0)
+        queue_title = QLabel("TIMELINE RENDER QUEUE")
+        queue_title.setProperty("sectionTitle", True)
+        queue_layout.addWidget(queue_title)
         self.queue_table = QTableWidget(0, 5)
         self.queue_table.setHorizontalHeaderLabels(
             ["TIMELINE", "RANGE", "CANVAS", "OUTPUT", "STATUS"]
@@ -1115,12 +1471,15 @@ class MainWindow(QMainWindow):
         queue_layout.addLayout(queue_actions)
         log_page = QWidget()
         task_log_layout = QVBoxLayout(log_page)
-        task_log_layout.setContentsMargins(0, 2, 0, 0)
+        task_log_layout.setContentsMargins(0, 4, 0, 0)
+        task_log_title = QLabel("TASK LOG")
+        task_log_title.setProperty("sectionTitle", True)
+        task_log_layout.addWidget(task_log_title)
         task_log_layout.addWidget(self.log)
-        self.jobs_tabs.addTab(queue_page, "RENDER QUEUE")
-        self.jobs_tabs.addTab(log_page, "TASK LOG")
-        log_layout.addWidget(self.jobs_tabs)
-        self.log_box.setVisible(False)
+        self.right_tabs.addTab(queue_page, "RENDER QUEUE")
+        self.right_tabs.addTab(log_page, "TASK LOG")
+        self.jobs_tabs = self.right_tabs
+        self.log_box = self.inspector_panel
 
         workspace = QWidget()
         workspace_layout = QVBoxLayout(workspace)
@@ -1136,8 +1495,8 @@ class MainWindow(QMainWindow):
         central_layout.setSpacing(0)
         central_layout.addWidget(top_bar)
         central_layout.addWidget(workspace, 1)
-        central_layout.addWidget(self.log_box)
         self.setCentralWidget(central)
+        self._build_menus()
 
         status = QStatusBar()
         self.task_label = QLabel("IDLE")
@@ -1152,12 +1511,531 @@ class MainWindow(QMainWindow):
         if self._queue_load_error:
             self._append_log(f"RENDER QUEUE RECOVERY: {self._queue_load_error}")
 
+    def _build_menus(self) -> None:
+        bar = self.menuBar()
+        bar.setNativeMenuBar(sys.platform == "darwin")
+
+        def action(menu, text: str, callback: Callable[[], None]) -> QAction:
+            item = QAction(text, self)
+            item.triggered.connect(callback)
+            menu.addAction(item)
+            return item
+
+        file_menu = bar.addMenu("File")
+        action(file_menu, "New Project…", self.new_project)
+        action(file_menu, "Open Project…", self.open_project)
+        file_menu.addSeparator()
+        action(file_menu, "Import Plates…", self.choose_videos)
+        file_menu.addSeparator()
+        action(file_menu, "Quit", self.close)
+
+        edit_menu = bar.addMenu("Edit")
+        action(edit_menu, "New Folder…", self.create_media_bin)
+        action(edit_menu, "Rename Selected…", self.rename_media_item)
+
+        project_menu = bar.addMenu("Project")
+        action(project_menu, "Project Settings…", self.edit_project_settings)
+        action(project_menu, "Open Project Folder", self.open_project_folder)
+
+        timeline_menu = bar.addMenu("Timeline")
+        action(timeline_menu, "Open Selected Timeline", self.open_selected_timeline)
+        action(timeline_menu, "Duplicate Timeline", self.duplicate_selected_timeline)
+        action(timeline_menu, "Delete Timeline…", self.delete_selected_timeline)
+        timeline_menu.addSeparator()
+        action(timeline_menu, "Add to Render Queue", self.add_current_to_queue)
+
+        playback_menu = bar.addMenu("Playback")
+        action(playback_menu, "Full Screen Preview    P", lambda: self._handle_preview_command("fullscreen"))
+        action(playback_menu, "Play / Pause    Space", self.toggle_playback)
+        action(playback_menu, "Reverse    J", lambda: self._handle_preview_command("reverse"))
+        action(playback_menu, "Stop    K", lambda: self._handle_preview_command("stop"))
+        action(playback_menu, "Forward    L", lambda: self._handle_preview_command("forward"))
+        action(playback_menu, "Previous Frame    ←", lambda: self.step_playback(-1))
+        action(playback_menu, "Next Frame    →", lambda: self.step_playback(1))
+
+        tools_menu = bar.addMenu("Tools")
+        action(tools_menu, "TC Align", self.align_timecode)
+        action(tools_menu, "Build Preview", self.create_preview)
+        action(tools_menu, "Rig Align", self.auto_align)
+
+        window_menu = bar.addMenu("Window")
+        action(window_menu, "Inspector", lambda: self._show_right_tab(0))
+        action(window_menu, "Render Queue", lambda: self._show_right_tab(1))
+        action(window_menu, "Task Log", lambda: self._show_right_tab(2))
+
+        help_menu = bar.addMenu("Help")
+        action(help_menu, "Keyboard Shortcuts", self.show_shortcuts)
+
+    def _show_right_tab(self, index: int) -> None:
+        self.inspector_panel.show()
+        self.right_tabs.setCurrentIndex(index)
+        self.inspector_toggle.setChecked(index == 0)
+        self.jobs_toggle.setChecked(index == 1)
+
+    def _update_project_header(self) -> None:
+        if hasattr(self, "project_title"):
+            self.project_title.setText(self.project_store.settings.name)
+        self.setWindowTitle(
+            f"{APP_NAME}  —  {self.project_store.settings.name}"
+        )
+
+    def _apply_project_defaults(self) -> None:
+        snapshot = self.project_store.settings.settings_snapshot
+        output = snapshot.get("output") if isinstance(snapshot, dict) else None
+        if isinstance(output, dict):
+            if hasattr(self, "canvas_width") and output.get("width") is not None:
+                self.canvas_width.setValue(int(output["width"]))
+            if hasattr(self, "canvas_height") and output.get("height") is not None:
+                self.canvas_height.setValue(int(output["height"]))
+        color = snapshot.get("color") if isinstance(snapshot, dict) else None
+        if isinstance(color, dict) and hasattr(self, "color_mode"):
+            index = self.color_mode.findData(color.get("mode"))
+            if index >= 0:
+                self.color_mode.setCurrentIndex(index)
+            if color.get("ocio_config"):
+                self.ocio_config.setText(str(color["ocio_config"]))
+            if color.get("working_space"):
+                self.working_space.setText(str(color["working_space"]))
+            if color.get("output_space"):
+                self.output_space.setText(str(color["output_space"]))
+        cameras = snapshot.get("cameras") if isinstance(snapshot, dict) else None
+        if isinstance(cameras, list) and cameras and isinstance(cameras[0], dict):
+            if cameras[0].get("colorspace"):
+                self.input_space.setText(str(cameras[0]["colorspace"]))
+
+    def edit_project_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Project Settings")
+        dialog.setMinimumWidth(460)
+        layout = QVBoxLayout(dialog)
+        title = QLabel("PROJECT DEFAULTS")
+        title.setProperty("sectionTitle", True)
+        layout.addWidget(title)
+        form = QFormLayout()
+        name = QLineEdit(self.project_store.settings.name)
+        width = QSpinBox()
+        width.setRange(640, MAX_CANVAS_WIDTH)
+        width.setValue(self.canvas_width.value())
+        height = QSpinBox()
+        height.setRange(320, MAX_CANVAS_HEIGHT)
+        height.setValue(self.canvas_height.value())
+        color_mode = QComboBox()
+        color_mode.addItem("Passthrough", "passthrough")
+        color_mode.addItem("OCIO", "ocio")
+        current_mode = color_mode.findData(self.color_mode.currentData())
+        color_mode.setCurrentIndex(max(0, current_mode))
+        ocio = QLineEdit(self.ocio_config.text())
+        form.addRow("Project name", name)
+        form.addRow("Default canvas width", width)
+        form.addRow("Default canvas height", height)
+        form.addRow("Color pipeline", color_mode)
+        form.addRow("Default OCIO", ocio)
+        layout.addLayout(form)
+        note = QLabel(
+            "New Plate Set timelines inherit these values. Existing timeline overrides stay unchanged."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.canvas_width.setValue(width.value())
+        self.canvas_height.setValue(height.value())
+        mode_index = self.color_mode.findData(color_mode.currentData())
+        if mode_index >= 0:
+            self.color_mode.setCurrentIndex(mode_index)
+        self.ocio_config.setText(ocio.text().strip())
+        try:
+            defaults = self._collect_config()
+            self.project_store.update_settings(
+                name=name.text().strip(), settings_snapshot=defaults
+            )
+        except Exception as error:
+            self._error("Project Settings", str(error))
+            return
+        self._update_project_header()
+        self._refresh_media_tree()
+
+    def new_project(self) -> None:
+        parent = QFileDialog.getExistingDirectory(
+            self, "Choose project parent folder", str(self.user_data_root / "projects")
+        )
+        if not parent:
+            return
+        name, accepted = QInputDialog.getText(self, "New Project", "Project name")
+        if not accepted or not name.strip():
+            return
+        path = Path(parent) / name.strip() / "project.json"
+        if path.exists():
+            self._error("New Project", f"Project already exists: {path}")
+            return
+        try:
+            defaults = self._collect_config()
+            store = ProjectStore.create(
+                path, name=name.strip(), settings_snapshot=defaults
+            )
+            store.add_bin(Bin.create("Master"))
+            self._switch_project(store)
+        except Exception as error:
+            self._error("New Project", str(error))
+
+    def open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open VP Stitch Project",
+            str(self.user_data_root / "projects"),
+            "VP Stitch project (project.json *.vpstitch);;JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            self._switch_project(ProjectStore.load(path))
+        except ProjectError as error:
+            self._error("Open Project", str(error))
+
+    def _switch_project(self, store: ProjectStore) -> None:
+        self._save_active_timeline()
+        self.project_store = store
+        self._active_timeline_id = None
+        self._active_bin_id = None
+        project_directory = store.path.parent
+        self._working_dir = project_directory / "work"
+        self._cache_dir = project_directory / "cache"
+        self._output_root = project_directory / "renders"
+        for directory in (self._working_dir, self._cache_dir, self._output_root):
+            directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self.render_queue = RenderQueueStore.load(project_directory / "render-queue.json")
+        except RenderQueueError:
+            self.render_queue = RenderQueueStore(project_directory / "render-queue.recovered.json")
+        self.settings.setValue("lastProject", str(store.path))
+        self.clear_sources()
+        self._apply_project_defaults()
+        self._update_project_header()
+        self._refresh_media_tree()
+        self._refresh_queue_table()
+
+    def open_project_folder(self) -> None:
+        QProcess.startDetached("open" if sys.platform == "darwin" else "explorer", [str(self.project_store.path.parent)])
+
+    def _selected_media_item(self) -> tuple[str | None, str | None]:
+        item = self.media_tree.currentItem()
+        if item is None:
+            return None, None
+        return item.data(0, Qt.ItemDataRole.UserRole), item.data(0, Qt.ItemDataRole.UserRole + 1)
+
+    def create_media_bin(self) -> None:
+        kind, selected_id = self._selected_media_item()
+        parent_id = selected_id if kind == "bin" else self._active_bin_id
+        name, accepted = QInputDialog.getText(self, "New Folder", "Folder name")
+        if not accepted or not name.strip():
+            return
+        try:
+            created = self.project_store.add_bin(
+                Bin.create(name.strip(), parent_id=parent_id)
+            )
+            self._active_bin_id = created.id
+            self._refresh_media_tree()
+        except ProjectError as error:
+            self._error("New Folder", str(error))
+
+    def _refresh_media_tree(self) -> None:
+        if not hasattr(self, "media_tree"):
+            return
+        selected_id = self._active_timeline_id or self._active_bin_id
+        self.media_tree.clear()
+        root = QTreeWidgetItem([self.project_store.settings.name])
+        root.setData(0, Qt.ItemDataRole.UserRole, "project")
+        self.media_tree.addTopLevelItem(root)
+
+        def add_bin(parent_item: QTreeWidgetItem, parent_id: str | None) -> None:
+            for folder in self.project_store.list_bins(parent_id):
+                folder_item = QTreeWidgetItem([folder.name])
+                folder_item.setData(0, Qt.ItemDataRole.UserRole, "bin")
+                folder_item.setData(0, Qt.ItemDataRole.UserRole + 1, folder.id)
+                parent_item.addChild(folder_item)
+                for timeline in self.project_store.list_timelines(folder.id):
+                    self._append_timeline_tree_item(folder_item, timeline)
+                add_bin(folder_item, folder.id)
+
+        for timeline in self.project_store.list_timelines(None):
+            self._append_timeline_tree_item(root, timeline)
+        add_bin(root, None)
+        root.setExpanded(True)
+        self.media_tree.expandToDepth(1)
+        if selected_id:
+            iterator = QTreeWidgetItemIterator(self.media_tree)
+            while iterator.value() is not None:
+                item = iterator.value()
+                if item.data(0, Qt.ItemDataRole.UserRole + 1) == selected_id:
+                    self.media_tree.setCurrentItem(item)
+                    item.setExpanded(True)
+                    break
+                iterator += 1
+
+    def _append_timeline_tree_item(
+        self, parent: QTreeWidgetItem, timeline: TimelineRecord
+    ) -> None:
+        numbers = [plate_number(path) for path in timeline.source_paths]
+        plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
+        cache = timeline.playback_cache_status.value.upper()
+        item = QTreeWidgetItem([f"{timeline.name}   ·   {plate_label}   ·   {cache}"])
+        item.setData(0, Qt.ItemDataRole.UserRole, "timeline")
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, timeline.id)
+        parent.addChild(item)
+        for source in timeline.source_paths:
+            child = QTreeWidgetItem([Path(str(source)).name])
+            child.setData(0, Qt.ItemDataRole.UserRole, "plate")
+            child.setData(0, Qt.ItemDataRole.UserRole + 1, timeline.id)
+            item.addChild(child)
+
+    def _media_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
+        kind = item.data(0, Qt.ItemDataRole.UserRole)
+        item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if kind == "timeline" and item_id:
+            self.load_project_timeline(str(item_id))
+        elif kind == "bin" and item_id:
+            self._active_bin_id = str(item_id)
+
+    def _media_tree_menu(self, position) -> None:  # type: ignore[no-untyped-def]
+        item = self.media_tree.itemAt(position)
+        if item is not None:
+            self.media_tree.setCurrentItem(item)
+        kind, _item_id = self._selected_media_item()
+        menu = QMenu(self)
+        menu.addAction("New Folder…", self.create_media_bin)
+        if kind in {"bin", "timeline"}:
+            menu.addAction("Rename…", self.rename_media_item)
+        if kind == "timeline":
+            menu.addAction("Open Timeline", self.open_selected_timeline)
+            menu.addAction("Duplicate Timeline", self.duplicate_selected_timeline)
+            menu.addSeparator()
+            menu.addAction("Delete Timeline…", self.delete_selected_timeline)
+        menu.exec(self.media_tree.viewport().mapToGlobal(position))
+
+    def rename_media_item(self) -> None:
+        kind, item_id = self._selected_media_item()
+        if kind not in {"bin", "timeline"} or not item_id:
+            return
+        current = next(
+            (
+                item.name
+                for item in (
+                    self.project_store.bins if kind == "bin" else self.project_store.timelines
+                )
+                if item.id == item_id
+            ),
+            "",
+        )
+        name, accepted = QInputDialog.getText(self, "Rename", "Name", text=current)
+        if not accepted or not name.strip():
+            return
+        try:
+            if kind == "bin":
+                self.project_store.update_bin(item_id, name=name.strip())
+            else:
+                self.project_store.update_timeline(item_id, name=name.strip())
+            self._refresh_media_tree()
+        except ProjectError as error:
+            self._error("Rename", str(error))
+
+    def open_selected_timeline(self) -> None:
+        kind, item_id = self._selected_media_item()
+        if kind == "timeline" and item_id:
+            self.load_project_timeline(item_id)
+
+    def duplicate_selected_timeline(self) -> None:
+        kind, item_id = self._selected_media_item()
+        if kind != "timeline" or not item_id:
+            return
+        source = next(item for item in self.project_store.timelines if item.id == item_id)
+        duplicate = TimelineRecord.create(
+            name=f"{source.name} Copy",
+            source_paths=source.source_paths,
+            config_snapshot=source.config_snapshot,
+            bin_id=source.bin_id,
+            tc_alignment_snapshot=source.tc_alignment_snapshot,
+            in_frame=source.in_frame,
+            out_frame=source.out_frame,
+            playback_cache_path=source.playback_cache_path,
+            playback_cache_status=source.playback_cache_status,
+            stitch_status=source.stitch_status,
+            order=source.order + 1,
+        )
+        try:
+            self.project_store.add_timeline(duplicate)
+            self._active_timeline_id = duplicate.id
+            self._refresh_media_tree()
+        except ProjectError as error:
+            self._error("Duplicate Timeline", str(error))
+
+    def delete_selected_timeline(self) -> None:
+        kind, item_id = self._selected_media_item()
+        if kind != "timeline" or not item_id:
+            return
+        if self._show_message(
+            QMessageBox.Icon.Question,
+            "Delete Timeline",
+            "Remove this timeline from the project? Source media will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.project_store.remove_timeline(item_id)
+        if self._active_timeline_id == item_id:
+            self._active_timeline_id = None
+            self.clear_sources()
+        self._refresh_media_tree()
+
+    def _ensure_project_timeline(self, sources: list[str]) -> None:
+        if self._loading_timeline:
+            return
+        normalized = tuple(str(Path(path)) for path in sources)
+        existing = next(
+            (
+                item
+                for item in self.project_store.timelines
+                if tuple(str(path) for path in item.source_paths) == normalized
+            ),
+            None,
+        )
+        if existing is not None:
+            self._active_timeline_id = existing.id
+            self._active_bin_id = existing.bin_id
+            self._refresh_media_tree()
+            return
+        bin_id = self._active_bin_id
+        if bin_id is None and self.project_store.bins:
+            bin_id = self.project_store.list_bins()[0].id
+        name = self._timeline_name(sources)
+        project_names = {item.name for item in self.project_store.timelines}
+        base = name
+        suffix = 2
+        while name in project_names:
+            name = f"{base} · {suffix}"
+            suffix += 1
+        try:
+            timeline = TimelineRecord.create(
+                name=name,
+                source_paths=sources,
+                config_snapshot=self._collect_config(),
+                bin_id=bin_id,
+                playback_cache_status=PlaybackCacheStatus.PENDING,
+                stitch_status=StitchStatus.UNSTITCHED,
+            )
+            self.project_store.add_timeline(timeline)
+            self._active_timeline_id = timeline.id
+            self._active_bin_id = timeline.bin_id
+            self._refresh_media_tree()
+        except ProjectError as error:
+            self._append_log(f"PROJECT TIMELINE: {error}")
+
+    def _save_active_timeline(self) -> None:
+        if not self._active_timeline_id or self._loading_timeline:
+            return
+        if not any(item.id == self._active_timeline_id for item in self.project_store.timelines):
+            return
+        try:
+            sources = self._validate_sources()
+            lower = self.timeline_in.value() if self._tc_alignment else 0
+            upper = self.timeline_out.value() if self._tc_alignment else None
+            cache_ready = self._playback_path is not None and self._playback_path.is_file()
+            self.project_store.update_timeline(
+                self._active_timeline_id,
+                source_paths=tuple(sources),
+                config_snapshot=self._collect_config(),
+                tc_alignment_snapshot=self._tc_alignment,
+                in_frame=lower,
+                out_frame=upper,
+                playback_cache_path=self._playback_path,
+                playback_cache_status=(
+                    PlaybackCacheStatus.READY
+                    if cache_ready
+                    else PlaybackCacheStatus.PENDING
+                ),
+                stitch_status=(
+                    StitchStatus.READY if self._preview_ready else StitchStatus.UNSTITCHED
+                ),
+            )
+            self._refresh_media_tree()
+        except (ProjectError, ValueError, OSError):
+            pass
+
+    def load_project_timeline(self, timeline_id: str) -> None:
+        timeline = next(
+            (item for item in self.project_store.timelines if item.id == timeline_id),
+            None,
+        )
+        if timeline is None:
+            return
+        if self.process is not None:
+            self.statusBar().showMessage("Finish the current task before changing timeline", 8000)
+            return
+        self._save_active_timeline()
+        self._loading_timeline = True
+        try:
+            directory = self._working_dir / "timelines" / timeline.id
+            directory.mkdir(parents=True, exist_ok=True)
+            config_path = directory / "config.json"
+            config_path.write_text(json.dumps(timeline.config_snapshot, indent=2), encoding="utf-8")
+            self.load_config(config_path)
+            self._set_video_sources([str(path) for path in timeline.source_paths])
+            self._active_timeline_id = timeline.id
+            self._active_bin_id = timeline.bin_id
+            if timeline.tc_alignment_snapshot is not None:
+                alignment_path = directory / "timecode-alignment.json"
+                alignment_path.write_text(
+                    json.dumps(timeline.tc_alignment_snapshot, indent=2), encoding="utf-8"
+                )
+                self._tc_alignment_path = alignment_path
+                self._apply_alignment_payload(
+                    timeline.tc_alignment_snapshot,
+                    timeline.in_frame,
+                    timeline.out_frame,
+                )
+            if timeline.playback_cache_path is not None:
+                cache_path = Path(str(timeline.playback_cache_path))
+                if cache_path.is_file() and cache_path.stat().st_size > 0:
+                    key, _ = self._playback_signature()
+                    self._load_playback(cache_path, key, autoplay=False)
+            self.statusBar().showMessage(f"Opened timeline: {timeline.name}", 8000)
+        except Exception as error:
+            self._error("Open Timeline", str(error))
+        finally:
+            self._loading_timeline = False
+            self._refresh_media_tree()
+
+    def show_shortcuts(self) -> None:
+        self._show_message(
+            QMessageBox.Icon.Information,
+            "Playback Shortcuts",
+            "Click the preview, then use:\n\nP  Full screen\nSpace  Play / Pause\n"
+            "J  Reverse\nK  Stop\nL  Forward\n← / →  Step one frame",
+        )
+
     def _toggle_inspector(self, checked: bool) -> None:
         self.inspector_panel.setVisible(checked)
+        if checked:
+            self.right_tabs.setCurrentIndex(0)
+            self.jobs_toggle.blockSignals(True)
+            self.jobs_toggle.setChecked(False)
+            self.jobs_toggle.blockSignals(False)
         self.inspector_toggle.setText("INSPECTOR" if checked else "SHOW INSPECTOR")
 
     def _toggle_log(self, checked: bool) -> None:
-        self.log_box.setVisible(checked)
+        self.inspector_panel.setVisible(checked)
+        if checked:
+            self.right_tabs.setCurrentIndex(1)
+            self.inspector_toggle.blockSignals(True)
+            self.inspector_toggle.setChecked(False)
+            self.inspector_toggle.blockSignals(False)
         count = len(self.render_queue.jobs)
         suffix = f" {count}" if count else ""
         self.jobs_toggle.setText(
@@ -1228,6 +2106,7 @@ class MainWindow(QMainWindow):
             else "natural filename order"
         )
         self._append_log(f"Imported {len(ordered)} plates · {order_note}")
+        self._ensure_project_timeline(ordered)
 
     def _suggest_output_path(self, sources: list[str]) -> str:
         stem = re.sub(
@@ -1524,6 +2403,7 @@ class MainWindow(QMainWindow):
             QFrame#topBar { background:#15191e; border-bottom:1px solid #2a3038; }
             QLabel#appTitle { color:#f3f4f6; font-size:15px; font-weight:750; }
             QLabel#appSubtitle { color:#747c86; font-size:9px; letter-spacing:.8px; }
+            QLabel#projectTitle { color:#eef0f3; font-size:11px; font-weight:700; }
             QLabel#profileLabel { color:#aeb5be; font-size:10px; }
             QLabel#statusPill {
                 color:#74d89a;
@@ -1553,7 +2433,7 @@ class MainWindow(QMainWindow):
                 font-weight:650;
             }
             QGroupBox::title { subcontrol-origin:margin; left:2px; padding:0 4px; color:#aeb5bf; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {
                 background:#101318;
                 border:1px solid #303740;
                 border-radius:3px;
@@ -1603,6 +2483,10 @@ class MainWindow(QMainWindow):
             QTableWidget { border:0; background:#15191e; }
             QTableWidget::item { border-bottom:1px solid #252b32; padding:3px; }
             QTableWidget::item:selected { background:#292833; color:#ffffff; }
+            QTreeWidget#mediaTree { border:0; background:#15191e; padding:2px 0; }
+            QTreeWidget#mediaTree::item { min-height:24px; padding:2px 4px; border:0; }
+            QTreeWidget#mediaTree::item:selected { background:#343147; color:#ffffff; }
+            QTreeWidget#mediaTree::branch { background:#15191e; }
             QTabWidget::pane { border:0; }
             QTabBar::tab {
                 background:#15191e;
@@ -1738,6 +2622,7 @@ class MainWindow(QMainWindow):
         self.preview_note.setText(
             "Canvas changed · create Preview to refresh the complete fitted canvas"
         )
+        self._save_active_timeline()
 
     def fit_full_plates(self) -> None:
         try:
@@ -1982,11 +2867,17 @@ class MainWindow(QMainWindow):
         if not self._timeline_updating:
             self._stop_playback(clear=True)
             self._set_timeline_range(lower, upper)
+            self._save_active_timeline()
+            if self._auto_workflows_enabled:
+                QTimer.singleShot(350, self._warm_playback_cache)
 
     def _timeline_spin_changed(self) -> None:
         if not self._timeline_updating:
             self._stop_playback(clear=True)
             self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
+            self._save_active_timeline()
+            if self._auto_workflows_enabled:
+                QTimer.singleShot(350, self._warm_playback_cache)
 
     def _update_playhead_time(self, frame: int) -> None:
         fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
@@ -2020,6 +2911,90 @@ class MainWindow(QMainWindow):
         if self._seek_loaded_playback(frame):
             return
         self._scrub_preview()
+
+    def _handle_preview_command(self, command: str) -> None:
+        if command == "fullscreen":
+            self.toggle_preview_fullscreen()
+        elif command == "play-pause":
+            self.toggle_playback()
+        elif command == "reverse":
+            self.play_reverse()
+        elif command == "stop":
+            self.stop_playback()
+        elif command == "forward":
+            self._reverse_timer.stop()
+            if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                self.toggle_playback()
+        elif command == "step-back":
+            self.step_playback(-1)
+        elif command == "step-forward":
+            self.step_playback(1)
+
+    def toggle_preview_fullscreen(self) -> None:
+        if self.preview_stack.currentWidget() is self.video_preview:
+            self.video_preview.setFullScreen(not self.video_preview.isFullScreen())
+            return
+        if self._fullscreen_preview is not None:
+            self._fullscreen_preview.close()
+            self._fullscreen_preview = None
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("VP Stitch Preview")
+        dialog.setStyleSheet("background:#05070a;")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        image = QLabel()
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = self.preview.viewport().grab()
+        image.setPixmap(pixmap)
+        image.setScaledContents(False)
+        layout.addWidget(image)
+        for key in ("P", "Escape"):
+            shortcut = QShortcut(QKeySequence(key), dialog)
+            shortcut.activated.connect(dialog.close)
+        dialog.finished.connect(lambda _result: setattr(self, "_fullscreen_preview", None))
+        self._fullscreen_preview = dialog
+        dialog.showFullScreen()
+        image.setPixmap(
+            pixmap.scaled(
+                dialog.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def play_reverse(self) -> None:
+        if self._playback_path is None or not self._playback_path.is_file():
+            self.statusBar().showMessage("Playback proxy is not ready yet", 5000)
+            return
+        self.media_player.pause()
+        fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
+        self._reverse_timer.setInterval(max(10, int(round(1000 / max(1.0, fps)))))
+        self._reverse_timer.start()
+        self.preview_stack.setCurrentWidget(self.video_preview)
+        self.playback_button.setText("◀  REVERSE")
+
+    def stop_playback(self) -> None:
+        self._reverse_timer.stop()
+        self.media_player.pause()
+        self.playback_button.setText("▶  PLAY")
+
+    def step_playback(self, direction: int) -> None:
+        self._reverse_timer.stop()
+        self.media_player.pause()
+        fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
+        frame_ms = max(1, int(round(1000 / max(1.0, fps))))
+        if self._playback_path is not None and self._playback_path.is_file():
+            self.media_player.setPosition(
+                max(0, min(self.media_player.duration(), self.media_player.position() + direction * frame_ms))
+            )
+            self.preview_stack.setCurrentWidget(self.video_preview)
+            return
+        if self._tc_alignment:
+            lower, upper = self.timeline_bar.values()
+            frame = max(lower, min(upper - 1, self.timeline_playhead.value() + direction))
+            self._set_playhead(frame)
+            self._scrub_preview()
 
     def _playback_focus_uses_space(self) -> bool:
         focus = QApplication.focusWidget()
@@ -2098,6 +3073,7 @@ class MainWindow(QMainWindow):
     def _stop_playback(self, *, clear: bool = False) -> None:
         if not hasattr(self, "media_player"):
             return
+        self._reverse_timer.stop()
         self.media_player.stop()
         self.preview_stack.setCurrentWidget(self.preview)
         if clear:
@@ -2108,6 +3084,7 @@ class MainWindow(QMainWindow):
     def toggle_playback(self) -> None:
         if self._playback_focus_uses_space():
             return
+        self._reverse_timer.stop()
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
             return
@@ -2117,7 +3094,12 @@ class MainWindow(QMainWindow):
         ):
             self.media_player.setPosition(0)
         if self.process is not None:
-            self.statusBar().showMessage("Finish the current task before playback", 6000)
+            message = (
+                "Playback cache is already warming in the background"
+                if self._auto_cache_in_progress
+                else "Finish the current task before playback"
+            )
+            self.statusBar().showMessage(message, 6000)
             return
         if not self._tc_alignment:
             self._error("Playback", "Run TC ALIGN before building synchronized playback")
@@ -2222,6 +3204,7 @@ class MainWindow(QMainWindow):
         )
         timeline_tc = str(payload["timeline_timecode"])
         self.timing_status.setText(f"START {timeline_tc}  ·  SHORTEST PLATE LOCK")
+        self._save_active_timeline()
 
     def align_timecode(self) -> None:
         try:
@@ -2247,6 +3230,9 @@ class MainWindow(QMainWindow):
                     f"TC aligned at {timeline_tc} · {common_frames:,} common frames",
                     15000,
                 )
+                self._save_active_timeline()
+                if self._auto_workflows_enabled:
+                    QTimer.singleShot(0, self._warm_playback_cache)
             except Exception as error:
                 self._error("TC align", str(error))
 
@@ -2352,6 +3338,15 @@ class MainWindow(QMainWindow):
             self.preview_note.setText(
                 f"SOURCE {minimum}-bit detected · 10/12-bit master pipeline ready"
             )
+        self._save_active_timeline()
+        if (
+            self._auto_workflows_enabled
+            and self._active_timeline_id
+            and self._tc_alignment is None
+            and self.process is None
+        ):
+            self.preview_note.setText("Source analyzed · automatic TC align starting…")
+            QTimer.singleShot(0, self.align_timecode)
 
     def _open_input_settings(self, rows: list[int]) -> None:
         valid_rows = sorted(
@@ -2450,6 +3445,8 @@ class MainWindow(QMainWindow):
         playback_path: Path,
         playback_key: str,
         sources: list[str],
+        *,
+        autoplay: bool = True,
     ) -> None:
         try:
             full_config = self._write_working_config()
@@ -2497,27 +3494,74 @@ class MainWindow(QMainWindow):
             arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
         arguments.extend(sources)
         self.preview_note.setText(
-            f"Building {width}×{height} playback proxy once · Space will play when ready"
+            f"Background cache {width}×{height} · playback will be instant when ready"
         )
-        self._playback_autostart = True
+        self._playback_autostart = autoplay
+        self._auto_cache_in_progress = not autoplay
 
         def playback_failed() -> None:
             self._playback_autostart = False
+            self._auto_cache_in_progress = False
             try:
                 playback_path.unlink(missing_ok=True)
             except OSError:
                 pass
             self.preview_note.setText("Playback proxy failed · open Jobs for details")
+            if self._active_timeline_id:
+                try:
+                    self.project_store.update_timeline(
+                        self._active_timeline_id,
+                        playback_cache_status=PlaybackCacheStatus.FAILED,
+                    )
+                except ProjectError:
+                    pass
+
+        def playback_ready() -> None:
+            self._auto_cache_in_progress = False
+            self._load_playback(
+                playback_path,
+                playback_key,
+                autoplay=self._playback_autostart,
+            )
+            self._save_active_timeline()
 
         self._run_cli(
             "BUILD PLAYBACK PROXY",
             arguments,
-            lambda: self._load_playback(
-                playback_path,
-                playback_key,
-                autoplay=self._playback_autostart,
-            ),
+            playback_ready,
             playback_failed,
+        )
+
+    def _warm_playback_cache(self) -> None:
+        if not self._tc_alignment or self._loading_timeline:
+            return
+        if self.process is not None:
+            self._auto_cache_requested = True
+            return
+        try:
+            playback_key, sources = self._playback_signature()
+        except Exception as error:
+            self._append_log(f"AUTO CACHE: {error}")
+            return
+        playback_dir = self._cache_dir / "playback"
+        playback_dir.mkdir(parents=True, exist_ok=True)
+        playback_path = playback_dir / f"{playback_key}.mp4"
+        if playback_path.is_file() and playback_path.stat().st_size > 0:
+            self._load_playback(playback_path, playback_key, autoplay=False)
+            self._save_active_timeline()
+            return
+        self._auto_cache_requested = False
+        if self._active_timeline_id:
+            try:
+                self.project_store.update_timeline(
+                    self._active_timeline_id,
+                    playback_cache_status=PlaybackCacheStatus.BUILDING,
+                )
+            except ProjectError:
+                pass
+        self._refresh_media_tree()
+        self._build_playback(
+            playback_path, playback_key, sources, autoplay=False
         )
 
     def _load_playback(
@@ -2534,6 +3578,7 @@ class MainWindow(QMainWindow):
         self._seek_loaded_playback(self.timeline_playhead.value())
         self.preview_stack.setCurrentWidget(self.video_preview)
         self.preview_note.setText("Playback proxy ready · Space to play / pause")
+        self._save_active_timeline()
         if autoplay:
             self.media_player.play()
 
@@ -2613,6 +3658,9 @@ class MainWindow(QMainWindow):
                         10000,
                     )
                     self._finish_preview_frame(timeline_start)
+                    self._save_active_timeline()
+                    if self._auto_workflows_enabled:
+                        QTimer.singleShot(0, self._warm_playback_cache)
                 except Exception as error:
                     preview_failed()
                     self._error("Preview load", str(error))
@@ -2798,8 +3846,11 @@ class MainWindow(QMainWindow):
         if selected_row >= 0:
             self.queue_table.selectRow(selected_row)
         suffix = f" {len(jobs)}" if jobs else ""
+        queue_visible = (
+            self.inspector_panel.isVisible() and self.right_tabs.currentIndex() == 1
+        )
         self.jobs_toggle.setText(
-            f"JOBS{suffix}" if self.log_box.isHidden() else f"HIDE JOBS{suffix}"
+            f"HIDE JOBS{suffix}" if queue_visible else f"JOBS{suffix}"
         )
 
     def _timeline_name(self, sources: list[str]) -> str:
@@ -2862,7 +3913,7 @@ class MainWindow(QMainWindow):
         self._refresh_queue_table()
         self.jobs_toggle.setChecked(True)
         self._toggle_log(True)
-        self.jobs_tabs.setCurrentIndex(0)
+        self.right_tabs.setCurrentIndex(1)
         self.queue_table.selectRow(len(self.render_queue.jobs) - 1)
         self.statusBar().showMessage(
             f"Added timeline to render queue: {job.name}", 8000
@@ -3231,6 +4282,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Task failed — see Task Log", 10000)
             if failure:
                 failure()
+        if self._auto_cache_requested and self.process is None:
+            QTimer.singleShot(0, self._warm_playback_cache)
 
     def cancel_task(self) -> None:
         if self.process is not None:
@@ -3351,6 +4404,7 @@ class MainWindow(QMainWindow):
                     pass
                 self._queue_current_id = None
             self.media_player.stop()
+            self._reverse_timer.stop()
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
             process = self.process
@@ -3369,8 +4423,10 @@ class MainWindow(QMainWindow):
             self._closing = True
             self._queue_running = False
             self.media_player.stop()
+            self._reverse_timer.stop()
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
+        self._save_active_timeline()
         event.accept()
 
 
@@ -3389,7 +4445,10 @@ def main() -> int:
         _stabilize_macos_accessibility_bridge()
         app.setApplicationName(APP_NAME)
         app.setOrganizationName("VP-LAB")
-        window = MainWindow()
+        launcher = ProjectManagerDialog()
+        if launcher.exec() != QDialog.DialogCode.Accepted or launcher.project_path is None:
+            return 0
+        window = MainWindow(launcher.project_path)
         window.show()
         return app.exec()
     except Exception:

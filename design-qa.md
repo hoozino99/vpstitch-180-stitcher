@@ -87,3 +87,26 @@ final result: passed
 The viewer remains dominant at the minimum practical viewport. The new timeline has a clear selected range, distinct trim caps, a visible playhead, and consolidated controls without text clipping. No new P0–P2 visual issue was found in the same-viewport comparison.
 
 follow-up result: passed with accessibility verification noted above
+
+## Project / Timeline Workspace Follow-up
+
+- Date: 2026-08-25
+- Source visual truth: `/Users/hyunho/.codex/generated_images/01a0326f-e41b-7341-8eb5-68306a459fca/exec-62644d61-70da-4253-a161-d0c3eb534e8a.png`
+- Implementation screenshot: `/tmp/vpstitch-design-qa-current.png`
+- Same-viewport comparison: `/tmp/vpstitch-design-qa-comparison.png`
+- Viewport: 1487 × 1058 px for both sides
+- State: loaded five-camera Plate Set, aligned timecode, real stitched panorama preview, default Rig Inspector.
+
+### Findings
+
+- Left hierarchy: the unified Media Pool now owns project folders, Plate Set timelines, and their source clips. A Plate Set is persisted as a timeline and opens on double-click.
+- Center workspace: the viewer remains dominant, displays the entire 20000×5504 canvas without cropping, and keeps one shared trim/playhead bar below it.
+- Right workflow: `INSPECTOR`, `RENDER QUEUE`, and `TASK LOG` are peer tabs. The Inspector is intentionally denser than the visual target because the user requested the current app's editable stitch values to remain available.
+- Global navigation: project, timeline, playback, tools, window, and help commands are exposed through the native application menu instead of duplicate toolbar buttons.
+- Visual tokens: graphite surfaces, thin dividers, compact system typography, and restrained blue-violet selection/action states remain aligned with the selected target.
+- Interaction: no visible clipped button labels or overlapping controls at 1487×1058. The same layout also retains the existing 1180×720 minimum-size regression coverage.
+- Playback verification: a fresh P06–P08 3-camera test take completed input probing, embedded-TC alignment, representative-frame stitching, 960×360 H.264 proxy warming, playback, reverse/stop/forward controls, and frame stepping. The resulting project timeline persisted both stitch and cache status as `ready`.
+
+No actionable P0, P1, or P2 difference remains. The larger vertical letterbox in the implementation is required by the real 20000×5504 source canvas; filling the viewer like the 2:1 concept image would crop the plates and violate the no-crop requirement.
+
+final result: passed

@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path, PureWindowsPath
+
+import pytest
+
+from vpstitch.project import (
+    Bin,
+    PlaybackCacheStatus,
+    ProjectError,
+    ProjectStore,
+    StitchStatus,
+    TimelineRecord,
+)
+
+
+def plate_paths(numbers: tuple[int, ...], *, windows: bool = False):
+    if windows:
+        return [PureWindowsPath(fr"D:\Shoot\Take_01_P{number:02d}.mov") for number in numbers]
+    return [Path("plates") / f"Take_01_P{number:02d}.mov" for number in numbers]
+
+
+def timeline(name: str, bin_id: str | None, numbers=(1, 2, 3, 4, 5), order=0):
+    return TimelineRecord.create(
+        name=name,
+        timeline_id=f"timeline-{name}",
+        bin_id=bin_id,
+        source_paths=plate_paths(numbers),
+        config_snapshot={"output": {"width": 8192}, "ocio": Path("color/studio.ocio")},
+        tc_alignment_snapshot={"common_frames": 240},
+        in_frame=12,
+        out_frame=120,
+        playback_cache_path=Path("cache") / f"{name}.mp4",
+        playback_cache_status=PlaybackCacheStatus.READY,
+        stitch_status=StitchStatus.READY,
+        order=order,
+    )
+
+
+def test_round_trip_preserves_project_snapshots_statuses_and_cross_platform_paths(tmp_path: Path):
+    project_path = tmp_path / "project" / "project.json"
+    store = ProjectStore.create(
+        project_path,
+        name="서울 촬영",
+        settings_snapshot={"canvas": [8192, 2252], "ocio": Path("config/studio.ocio")},
+    )
+    shoot = store.add_bin(Bin.create("Location A", bin_id="bin-a"))
+    original = TimelineRecord.create(
+        name="Front 3 Cam",
+        timeline_id="front-01",
+        bin_id=shoot.id,
+        source_paths=plate_paths((6, 7, 8), windows=True),
+        config_snapshot={"rig": "front_3cam"},
+        tc_alignment_snapshot=None,
+        playback_cache_path=PureWindowsPath(r"E:\Cache\front.mp4"),
+        playback_cache_status="ready",
+        stitch_status="ready",
+    )
+    store.add_timeline(original)
+
+    loaded = ProjectStore.load(project_path)
+
+    assert loaded.settings.name == "서울 촬영"
+    assert loaded.settings.settings_snapshot["ocio"] == "config/studio.ocio"
+    assert loaded.list_bins() == (shoot,)
+    assert loaded.list_timelines(shoot.id) == (original,)
+    assert loaded.timelines[0].source_paths == tuple(plate_paths((6, 7, 8), windows=True))
+    assert loaded.timelines[0].playback_cache_path == PureWindowsPath(r"E:\Cache\front.mp4")
+    raw = json.loads(project_path.read_text(encoding="utf-8"))
+    assert raw["version"] == 1
+    assert "root" not in raw["settings"]
+
+
+def test_bin_hierarchy_move_reorder_and_recursive_remove(tmp_path: Path):
+    store = ProjectStore.create(tmp_path / "project.json", name="Hierarchy")
+    a = store.add_bin(Bin.create("A", bin_id="a"))
+    b = store.add_bin(Bin.create("B", bin_id="b", order=1))
+    child = store.add_bin(Bin.create("Child", parent_id=a.id, bin_id="child"))
+    store.add_timeline(timeline("nested", child.id))
+
+    store.reorder_bin(b.id, 0)
+    assert [item.id for item in store.list_bins()] == ["b", "a"]
+    with pytest.raises(ProjectError, match="descendant"):
+        store.move_bin(a.id, child.id)
+    store.move_bin(child.id, b.id)
+    assert store.list_bins(b.id)[0].id == child.id
+    with pytest.raises(ProjectError, match="not empty"):
+        store.remove_bin(b.id)
+    store.remove_bin(b.id, recursive=True)
+    assert [item.id for item in store.list_bins()] == ["a"]
+    assert store.timelines == ()
+
+
+def test_timeline_move_reorder_update_and_remove(tmp_path: Path):
+    store = ProjectStore.create(tmp_path / "project.json", name="Timelines")
+    first_bin = store.add_bin(Bin.create("First", bin_id="first"))
+    second_bin = store.add_bin(Bin.create("Second", bin_id="second", order=1))
+    one = store.add_timeline(timeline("one", first_bin.id))
+    two = store.add_timeline(timeline("two", first_bin.id, numbers=(6, 7, 8), order=1))
+    three = store.add_timeline(timeline("three", first_bin.id, order=2))
+
+    store.reorder_timeline(three.id, 0)
+    assert [item.id for item in store.list_timelines(first_bin.id)] == [three.id, one.id, two.id]
+    moved = store.move_timeline(one.id, second_bin.id)
+    assert moved.bin_id == second_bin.id
+    updated = store.update_timeline(one.id, name="one renamed", in_frame=20, out_frame=80)
+    assert updated.name == "one renamed"
+    assert updated.updated_at >= updated.created_at
+    assert store.remove_timeline(two.id).id == two.id
+    assert [item.order for item in store.list_timelines(first_bin.id)] == [0]
+    assert ProjectStore.load(store.path).list_timelines(second_bin.id)[0].name == "one renamed"
+
+
+def test_atomic_write_failure_preserves_disk_and_rolls_back_memory(tmp_path: Path, monkeypatch):
+    project_path = tmp_path / "project.json"
+    store = ProjectStore.create(project_path, name="Safe")
+    previous = project_path.read_bytes()
+
+    def fail_replace(source, destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("vpstitch.project.os.replace", fail_replace)
+    with pytest.raises(ProjectError, match="simulated replace failure"):
+        store.add_bin(Bin.create("Must rollback", bin_id="rollback"))
+
+    assert project_path.read_bytes() == previous
+    assert store.bins == ()
+    assert list(tmp_path.glob(".project.json.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"version": 99, "settings": {}, "bins": [], "timelines": []}, "unsupported"),
+        ({"version": 1, "settings": {"name": "x", "settings_snapshot": {}}, "bins": [], "timelines": [], "future": True}, "unknown"),
+        ({"version": 1, "settings": {"name": "x", "settings_snapshot": {}}, "bins": "bad", "timelines": []}, "must be lists"),
+    ],
+)
+def test_invalid_or_unknown_payload_is_rejected(tmp_path: Path, payload, message):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProjectError, match=message):
+        ProjectStore.load(path)
+
+
+def test_rejects_corrupt_json_unknown_relations_and_wrong_plate_sets(tmp_path: Path):
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ProjectError, match="cannot load"):
+        ProjectStore.load(corrupt)
+
+    store = ProjectStore.create(tmp_path / "valid.json", name="Validation")
+    with pytest.raises(ProjectError, match="unknown timeline bin"):
+        store.add_timeline(timeline("orphan", "missing"))
+    with pytest.raises(ProjectError, match="P01-P05 or P06-P08"):
+        TimelineRecord.create(
+            name="wrong",
+            source_paths=plate_paths((1, 2, 3)),
+            config_snapshot={},
+        )
+    with pytest.raises(ProjectError, match="P01-P05 or P06-P08"):
+        TimelineRecord.create(
+            name="wrong order",
+            source_paths=plate_paths((8, 7, 6)),
+            config_snapshot={},
+        )
