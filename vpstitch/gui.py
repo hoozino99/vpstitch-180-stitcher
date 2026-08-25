@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -19,9 +20,21 @@ from PySide6.QtCore import (
     QStandardPaths,
     Qt,
     QTimer,
+    QUrl,
     Signal,
 )
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QImage, QPainter, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
+from PySide6.QtMultimedia import QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -51,6 +64,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -63,6 +77,7 @@ from .imageio import read_image
 
 from .canvas import recommend_full_plate_canvas
 from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH, load_config as parse_config
+from .renderqueue import RenderJob, RenderQueueError, RenderQueueStore, RenderStatus
 
 
 APP_NAME = "VP Stitch"
@@ -752,6 +767,10 @@ class MainWindow(QMainWindow):
         self._preview_ready = False
         self._preview_in_progress = False
         self._pending_scrub_frame: int | None = None
+        self._playback_path: Path | None = None
+        self._playback_key: str | None = None
+        self._playback_autostart = False
+        self._last_auto_output: str | None = None
         self._tc_alignment: dict[str, object] | None = None
         self._tc_alignment_path: Path | None = None
         self._timeline_maximum = 1
@@ -763,6 +782,18 @@ class MainWindow(QMainWindow):
         self._working_dir.mkdir(parents=True, exist_ok=True)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._output_root.mkdir(parents=True, exist_ok=True)
+        self._queue_running = False
+        self._queue_current_id: str | None = None
+        self._queue_load_error: str | None = None
+        try:
+            self.render_queue = RenderQueueStore.load(
+                self.user_data_root / "render-queue.json"
+            )
+        except RenderQueueError as error:
+            self._queue_load_error = str(error)
+            self.render_queue = RenderQueueStore(
+                self.user_data_root / "render-queue.recovered.json"
+            )
         self._build_ui()
         self._apply_style()
         initial = Path(str(self.settings.value("lastConfig", "")))
@@ -842,6 +873,16 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(self.source_status)
 
         self.preview = PreviewView()
+        self.video_preview = QVideoWidget()
+        self.video_preview.setStyleSheet("background:#05070a;")
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.addWidget(self.preview)
+        self.preview_stack.addWidget(self.video_preview)
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setVideoOutput(self.video_preview)
+        self.media_player.positionChanged.connect(self._playback_position_changed)
+        self.media_player.playbackStateChanged.connect(self._playback_state_changed)
+        self.media_player.errorOccurred.connect(self._playback_error)
         preview_box = QFrame()
         preview_box.setObjectName("previewPanel")
         preview_layout = QVBoxLayout(preview_box)
@@ -856,7 +897,7 @@ class MainWindow(QMainWindow):
         preview_header.addStretch()
         preview_header.addWidget(preview_limit)
         preview_layout.addLayout(preview_header)
-        preview_layout.addWidget(self.preview, 1)
+        preview_layout.addWidget(self.preview_stack, 1)
         self.preview_note = QLabel("Fitted preview · UHD 4K max · master render stays full resolution")
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_note.setProperty("muted", True)
@@ -882,7 +923,7 @@ class MainWindow(QMainWindow):
         inspector_layout = QVBoxLayout(self.inspector_panel)
         inspector_layout.setContentsMargins(10, 9, 10, 9)
         inspector_layout.setSpacing(6)
-        inspector_title = QLabel("INSPECTOR")
+        inspector_title = QLabel("PROJECT DEFAULTS / TIMELINE OVERRIDE")
         inspector_title.setProperty("sectionTitle", True)
         inspector_layout.addWidget(inspector_title)
         inspector_layout.addWidget(settings_scroll, 1)
@@ -947,8 +988,19 @@ class MainWindow(QMainWindow):
         timing_values.addWidget(self.timeline_playhead)
         timing_values.addWidget(self.playhead_time)
         timing_values.addStretch()
+        self.playback_button = QPushButton("▶  PLAY")
+        self.playback_button.setObjectName("quietButton")
+        self.playback_button.setToolTip(
+            "Space toggles a cached 1280px stitched playback proxy"
+        )
+        self.playback_button.clicked.connect(self.toggle_playback)
+        timing_values.addWidget(self.playback_button)
         timing_values.addWidget(self.reset_timeline_button)
         timing_layout.addLayout(timing_values)
+
+        self.playback_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self.playback_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.playback_shortcut.activated.connect(self.toggle_playback)
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
@@ -970,8 +1022,11 @@ class MainWindow(QMainWindow):
         self.rig_align_button = workflow_button("RIG ALIGN", self.auto_align, "3")
         self.rig_align_button.setEnabled(False)
         self.rig_align_button.setToolTip("Create a preview first. Rig Align then adjusts camera geometry and refreshes it.")
+        self.add_queue_button = workflow_button(
+            "ADD TO QUEUE", self.add_current_to_queue, "4"
+        )
         action_layout.addStretch()
-        self.render_button = workflow_button("RENDER", self.render, "4")
+        self.render_button = workflow_button("RENDER NOW", self.render, "5")
         self.render_button.setObjectName("renderButton")
         self.render_button.setMinimumWidth(156)
         self.cancel_button = QPushButton("CANCEL")
@@ -989,10 +1044,65 @@ class MainWindow(QMainWindow):
         self.log_box.setObjectName("logPanel")
         log_layout = QVBoxLayout(self.log_box)
         log_layout.setContentsMargins(14, 10, 14, 10)
-        log_title = QLabel("JOBS / TASK LOG")
+        log_title = QLabel("TIMELINES / RENDER QUEUE")
         log_title.setProperty("sectionTitle", True)
         log_layout.addWidget(log_title)
-        log_layout.addWidget(self.log)
+        self.jobs_tabs = QTabWidget()
+        queue_page = QWidget()
+        queue_layout = QVBoxLayout(queue_page)
+        queue_layout.setContentsMargins(0, 2, 0, 0)
+        self.queue_table = QTableWidget(0, 5)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["TIMELINE", "RANGE", "CANVAS", "OUTPUT", "STATUS"]
+        )
+        self.queue_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.queue_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.queue_table.doubleClicked.connect(self.load_selected_queue_job)
+        queue_layout.addWidget(self.queue_table)
+        queue_actions = QHBoxLayout()
+        for text_value, callback in (
+            ("ADD CURRENT", self.add_current_to_queue),
+            ("LOAD", self.load_selected_queue_job),
+            ("REMOVE", self.remove_selected_queue_job),
+            ("RENDER SELECTED", self.render_selected_queue_job),
+            ("RENDER ALL", self.render_all_queue_jobs),
+        ):
+            button = QPushButton(text_value)
+            button.setObjectName(
+                "primaryButton" if text_value == "RENDER ALL" else "secondaryButton"
+            )
+            button.clicked.connect(callback)
+            queue_actions.addWidget(button)
+        queue_actions.addStretch()
+        queue_layout.addLayout(queue_actions)
+        log_page = QWidget()
+        task_log_layout = QVBoxLayout(log_page)
+        task_log_layout.setContentsMargins(0, 2, 0, 0)
+        task_log_layout.addWidget(self.log)
+        self.jobs_tabs.addTab(queue_page, "RENDER QUEUE")
+        self.jobs_tabs.addTab(log_page, "TASK LOG")
+        log_layout.addWidget(self.jobs_tabs)
         self.log_box.setVisible(False)
 
         workspace = QWidget()
@@ -1021,6 +1131,9 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.task_label)
         status.addPermanentWidget(self.progress)
         self.setStatusBar(status)
+        self._refresh_queue_table()
+        if self._queue_load_error:
+            self._append_log(f"RENDER QUEUE RECOVERY: {self._queue_load_error}")
 
     def _toggle_inspector(self, checked: bool) -> None:
         self.inspector_panel.setVisible(checked)
@@ -1028,7 +1141,11 @@ class MainWindow(QMainWindow):
 
     def _toggle_log(self, checked: bool) -> None:
         self.log_box.setVisible(checked)
-        self.jobs_toggle.setText("HIDE JOBS" if checked else "JOBS")
+        count = len(self.render_queue.jobs)
+        suffix = f" {count}" if count else ""
+        self.jobs_toggle.setText(
+            f"HIDE JOBS{suffix}" if checked else f"JOBS{suffix}"
+        )
 
     def _profile_for_count(self, count: int) -> dict[str, object]:
         if count in self._rig_profiles:
@@ -1079,6 +1196,10 @@ class MainWindow(QMainWindow):
             for path, camera in zip(ordered, cameras, strict=True)
         }
         self.source_table.set_paths(ordered)
+        current_output = self.output_path.text().strip()
+        if not current_output or current_output == self._last_auto_output:
+            self._last_auto_output = self._suggest_output_path(ordered)
+            self.output_path.setText(self._last_auto_output)
         self._reset_timing()
         order_note = (
             f"P{numbers[0]:02d} → P{numbers[-1]:02d}"
@@ -1086,6 +1207,27 @@ class MainWindow(QMainWindow):
             else "natural filename order"
         )
         self._append_log(f"Imported {len(ordered)} plates · {order_note}")
+
+    def _suggest_output_path(self, sources: list[str]) -> str:
+        stem = re.sub(
+            r"(?i)^P0?[1-5][._ -]*",
+            "",
+            Path(sources[0]).stem,
+        ).strip(" ._-")
+        if not stem:
+            stem = Path(sources[0]).parent.name or "timeline"
+        safe = re.sub(r"[^A-Za-z0-9가-힣._-]+", "_", stem).strip("._-")
+        codec = str(self.output_codec.currentData())
+        if codec.endswith("sequence"):
+            return str(self._output_root / f"{safe}_stitched")
+        suffix = (
+            ".mov"
+            if codec.startswith("prores")
+            else ".mp4"
+            if codec == "h264-mp4-10"
+            else ".mkv"
+        )
+        return str(self._output_root / f"{safe}_stitched{suffix}")
 
     def _update_source_status(self) -> None:
         loaded = sum(bool(path) for path in self.source_table.paths())
@@ -1563,6 +1705,7 @@ class MainWindow(QMainWindow):
         self._update_canvas_ratio()
         if self._loading_config or not self.config_data:
             return
+        self._stop_playback(clear=True)
         self._cleanup_reference_dir(self._last_reference_dir)
         self._last_reference_dir = None
         self._last_reference_config_path = None
@@ -1753,6 +1896,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _reset_timing(self) -> None:
+        self._stop_playback(clear=True)
         self._cleanup_reference_dir(self._last_reference_dir)
         self._tc_alignment = None
         self._tc_alignment_path = None
@@ -1809,10 +1953,12 @@ class MainWindow(QMainWindow):
 
     def _timeline_bar_changed(self, lower: int, upper: int) -> None:
         if not self._timeline_updating:
+            self._stop_playback(clear=True)
             self._set_timeline_range(lower, upper)
 
     def _timeline_spin_changed(self) -> None:
         if not self._timeline_updating:
+            self._stop_playback(clear=True)
             self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
 
     def _update_playhead_time(self, frame: int) -> None:
@@ -1844,7 +1990,123 @@ class MainWindow(QMainWindow):
 
     def _timeline_playhead_released(self, frame: int) -> None:
         self._set_playhead(frame)
+        if self._seek_loaded_playback(frame):
+            return
         self._scrub_preview()
+
+    def _playback_focus_uses_space(self) -> bool:
+        focus = QApplication.focusWidget()
+        return isinstance(
+            focus,
+            (
+                QLineEdit,
+                QSpinBox,
+                QDoubleSpinBox,
+                QComboBox,
+                QPlainTextEdit,
+                QPushButton,
+                QCheckBox,
+                QTableWidget,
+            ),
+        )
+
+    def _playback_signature(self) -> tuple[str, list[str]]:
+        sources = self._validate_sources()
+        config = self._collect_config()
+        lower = self.timeline_in.value() if self._tc_alignment else 0
+        upper = (
+            self.timeline_out.value()
+            if self._tc_alignment
+            else int(config.get("video", {}).get("frames") or 0)
+        )
+        fingerprints = []
+        for source in sources:
+            stat = Path(source).stat()
+            fingerprints.append((source, stat.st_size, stat.st_mtime_ns))
+        payload = {
+            "config": config,
+            "sources": fingerprints,
+            "alignment": self._tc_alignment,
+            "range": [lower, upper],
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:20], sources
+
+    def _seek_loaded_playback(self, frame: int) -> bool:
+        if self._playback_path is None or not self._playback_path.is_file():
+            return False
+        try:
+            current_key, _ = self._playback_signature()
+        except (OSError, ValueError):
+            return False
+        if current_key != self._playback_key:
+            return False
+        lower = self.timeline_in.value() if self._tc_alignment else 0
+        fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
+        self.media_player.setPosition(max(0, int(round((frame - lower) * 1000 / fps))))
+        self.preview_stack.setCurrentWidget(self.video_preview)
+        return True
+
+    def _playback_position_changed(self, position_ms: int) -> None:
+        if self._playback_path is None or not self._tc_alignment:
+            return
+        lower, upper = self.timeline_bar.values()
+        frame = lower + int(round(position_ms * float(self._tc_alignment["fps"]) / 1000))
+        self._set_playhead(max(lower, min(frame, upper - 1)))
+
+    def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.playback_button.setText("Ⅱ  PAUSE" if playing else "▶  PLAY")
+        if playing:
+            self.preview_stack.setCurrentWidget(self.video_preview)
+            self.preview_note.setText("Playback proxy · Space to pause")
+
+    def _playback_error(self, _error, message: str) -> None:  # type: ignore[no-untyped-def]
+        if message:
+            self._append_log(f"PLAYBACK ERROR: {message}")
+            self.preview_note.setText("Playback failed · rebuild the proxy or open Jobs")
+
+    def _stop_playback(self, *, clear: bool = False) -> None:
+        if not hasattr(self, "media_player"):
+            return
+        self.media_player.stop()
+        self.preview_stack.setCurrentWidget(self.preview)
+        if clear:
+            self.media_player.setSource(QUrl())
+            self._playback_path = None
+            self._playback_key = None
+
+    def toggle_playback(self) -> None:
+        if self._playback_focus_uses_space():
+            return
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+            return
+        if (
+            self.media_player.duration() > 0
+            and self.media_player.position() >= self.media_player.duration() - 50
+        ):
+            self.media_player.setPosition(0)
+        if self.process is not None:
+            self.statusBar().showMessage("Finish the current task before playback", 6000)
+            return
+        if not self._tc_alignment:
+            self._error("Playback", "Run TC ALIGN before building synchronized playback")
+            return
+        try:
+            playback_key, sources = self._playback_signature()
+        except Exception as error:
+            self._error("Playback", str(error))
+            return
+        playback_dir = self._cache_dir / "playback"
+        playback_dir.mkdir(parents=True, exist_ok=True)
+        playback_path = playback_dir / f"{playback_key}.mp4"
+        if playback_path.is_file() and playback_path.stat().st_size > 0:
+            self._load_playback(playback_path, playback_key, autoplay=True)
+            return
+        self._build_playback(playback_path, playback_key, sources)
 
     def _scrub_preview(self) -> None:
         if not self._tc_alignment:
@@ -1890,6 +2152,7 @@ class MainWindow(QMainWindow):
         if item.column() != 8 or not self._tc_alignment or self._timeline_updating:
             return
         try:
+            self._stop_playback(clear=True)
             lower, upper = self.timeline_bar.values()
             self._timeline_maximum = self._effective_common_frames(self._tc_alignment)
             self._timeline_updating = True
@@ -1910,6 +2173,7 @@ class MainWindow(QMainWindow):
         lower: int = 0,
         upper: int | None = None,
     ) -> None:
+        self._stop_playback(clear=True)
         inputs = payload["inputs"]
         common_frames = int(payload["common_frames"])
         if not isinstance(inputs, list) or common_frames < 1:
@@ -1995,6 +2259,7 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self._output_root / f"stitched{suffix}"), "All files (*.*)")
         if path:
             self.output_path.setText(path)
+            self._last_auto_output = None
 
     def _validate_sources(self) -> list[str]:
         paths = self.source_table.paths()
@@ -2117,6 +2382,8 @@ class MainWindow(QMainWindow):
         destination: Path,
         width: int,
         height: int,
+        *,
+        scale_cameras: bool = True,
     ) -> float:
         raw = json.loads(source.read_text(encoding="utf-8"))
         output = raw["output"]
@@ -2134,23 +2401,117 @@ class MainWindow(QMainWindow):
         output["height"] = height
         output["tile_width"] = min(int(output.get("tile_width", 1024)), width)
         output["tile_height"] = min(int(output.get("tile_height", 512)), height)
-        for camera in raw["cameras"]:
-            camera["width"] = max(1, int(round(int(camera["width"]) * scale)))
-            camera["height"] = max(1, int(round(int(camera["height"]) * scale)))
-            lens = camera["lens"]
-            for key in ("fx", "fy", "cx", "cy"):
-                lens[key] = float(lens[key]) * scale
-            if lens.get("circle_radius") is not None:
-                lens["circle_radius"] = float(lens["circle_radius"]) * scale
-        flow = raw.get("flow")
-        if isinstance(flow, dict) and flow.get("max_displacement_px") is not None:
-            flow["max_displacement_px"] = max(
-                1.0, float(flow["max_displacement_px"]) * scale
-            )
+        if scale_cameras:
+            for camera in raw["cameras"]:
+                camera["width"] = max(1, int(round(int(camera["width"]) * scale)))
+                camera["height"] = max(1, int(round(int(camera["height"]) * scale)))
+                lens = camera["lens"]
+                for key in ("fx", "fy", "cx", "cy"):
+                    lens[key] = float(lens[key]) * scale
+                if lens.get("circle_radius") is not None:
+                    lens["circle_radius"] = float(lens["circle_radius"]) * scale
+            flow = raw.get("flow")
+            if isinstance(flow, dict) and flow.get("max_displacement_px") is not None:
+                flow["max_displacement_px"] = max(
+                    1.0, float(flow["max_displacement_px"]) * scale
+                )
         destination.write_text(json.dumps(raw, indent=2), encoding="utf-8")
         return scale
 
+    def _build_playback(
+        self,
+        playback_path: Path,
+        playback_key: str,
+        sources: list[str],
+    ) -> None:
+        try:
+            full_config = self._write_working_config()
+            config_dir = self._working_dir / "playback"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            playback_config = config_dir / f"{playback_key}.json"
+            width, height = preview_dimensions(
+                self.canvas_width.value(),
+                self.canvas_height.value(),
+                max_width=1280,
+                max_height=720,
+            )
+            decode_scale = self._write_preview_config(
+                full_config,
+                playback_config,
+                width,
+                height,
+                scale_cameras=False,
+            )
+            raw = json.loads(playback_config.read_text(encoding="utf-8"))
+            lower, upper = self.timeline_bar.values()
+            raw.setdefault("video", {})["frames"] = upper - lower
+            raw["video"]["output_codec"] = "h264-proxy"
+            raw.setdefault("flow", {})["enabled"] = False
+            playback_config.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        except Exception as error:
+            self._error("Playback setup", str(error))
+            return
+
+        arguments = [
+            "stitch-video",
+            "--allow-low-bit-depth",
+            "--config",
+            str(playback_config),
+            "--output",
+            str(playback_path),
+            "--map-cache",
+            str(self._cache_dir / "playback-maps"),
+            "--start-frame",
+            str(lower),
+            "--decode-scale",
+            f"{decode_scale:.9f}",
+        ]
+        if self._tc_alignment_path:
+            arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
+        arguments.extend(sources)
+        self.preview_note.setText(
+            f"Building {width}×{height} playback proxy once · Space will play when ready"
+        )
+        self._playback_autostart = True
+
+        def playback_failed() -> None:
+            self._playback_autostart = False
+            try:
+                playback_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.preview_note.setText("Playback proxy failed · open Jobs for details")
+
+        self._run_cli(
+            "BUILD PLAYBACK PROXY",
+            arguments,
+            lambda: self._load_playback(
+                playback_path,
+                playback_key,
+                autoplay=self._playback_autostart,
+            ),
+            playback_failed,
+        )
+
+    def _load_playback(
+        self,
+        path: Path,
+        playback_key: str,
+        *,
+        autoplay: bool,
+    ) -> None:
+        self._playback_autostart = False
+        self._playback_path = path
+        self._playback_key = playback_key
+        self.media_player.setSource(QUrl.fromLocalFile(str(path)))
+        self._seek_loaded_playback(self.timeline_playhead.value())
+        self.preview_stack.setCurrentWidget(self.video_preview)
+        self.preview_note.setText("Playback proxy ready · Space to play / pause")
+        if autoplay:
+            self.media_player.play()
+
     def create_preview(self) -> None:
+        self._stop_playback()
         try:
             config = self._write_working_config()
             sources = self._validate_sources()
@@ -2354,6 +2715,316 @@ class MainWindow(QMainWindow):
             return
         self._run_cli("ESTIMATE RESOURCES", ["estimate-resources", "--config", str(config)])
 
+    def _selected_queue_job(self) -> RenderJob | None:
+        row = self.queue_table.currentRow()
+        if row < 0:
+            return None
+        item = self.queue_table.item(row, 0)
+        if item is None:
+            return None
+        job_id = item.data(Qt.ItemDataRole.UserRole)
+        return next(
+            (job for job in self.render_queue.jobs if job.id == job_id),
+            None,
+        )
+
+    def _refresh_queue_table(self) -> None:
+        if not hasattr(self, "queue_table"):
+            return
+        selected = self._selected_queue_job()
+        selected_id = selected.id if selected else None
+        jobs = self.render_queue.jobs
+        self.queue_table.setRowCount(len(jobs))
+        selected_row = -1
+        for row, job in enumerate(jobs):
+            output = job.config_snapshot.get("output", {})
+            width = int(output.get("width", 0))
+            height = int(output.get("height", 0))
+            frame_range = (
+                f"{job.in_frame}–{job.out_frame}"
+                if job.out_frame is not None
+                else f"{job.in_frame}–END"
+            )
+            values = (
+                job.name,
+                frame_range,
+                f"{width}×{height}",
+                str(job.output_path),
+                job.status.value.upper(),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, job.id)
+                if column == 4:
+                    colors = {
+                        RenderStatus.QUEUED: "#c8c3df",
+                        RenderStatus.RENDERING: "#e5c878",
+                        RenderStatus.DONE: "#74d89a",
+                        RenderStatus.FAILED: "#e37d83",
+                    }
+                    item.setForeground(QColor(colors[job.status]))
+                    item.setToolTip(job.error or "")
+                self.queue_table.setItem(row, column, item)
+            if job.id == selected_id:
+                selected_row = row
+        if selected_row >= 0:
+            self.queue_table.selectRow(selected_row)
+        suffix = f" {len(jobs)}" if jobs else ""
+        self.jobs_toggle.setText(
+            f"JOBS{suffix}" if self.log_box.isHidden() else f"HIDE JOBS{suffix}"
+        )
+
+    def _timeline_name(self, sources: list[str]) -> str:
+        parent = Path(sources[0]).parent.name.strip()
+        stem = re.sub(
+            r"(?i)^P0?1[._ -]*",
+            "",
+            Path(sources[0]).stem,
+        ).strip(" ._-")
+        base = stem or parent or "Timeline"
+        existing = {job.name for job in self.render_queue.jobs}
+        if base not in existing:
+            return base
+        number = 2
+        while f"{base} · {number}" in existing:
+            number += 1
+        return f"{base} · {number}"
+
+    def add_current_to_queue(self) -> None:
+        try:
+            sources = self._validate_sources()
+            output = self.output_path.text().strip()
+            if not output:
+                raise ValueError("Choose a render destination before adding the timeline")
+            config = self._collect_config()
+            lower = self.timeline_in.value() if self._tc_alignment else 0
+            upper = (
+                self.timeline_out.value()
+                if self._tc_alignment
+                else (
+                    lower + self.frame_limit.value()
+                    if self.frame_limit.value()
+                    else None
+                )
+            )
+            if upper is not None:
+                config.setdefault("video", {})["frames"] = upper - lower
+            job = RenderJob.create(
+                name=self._timeline_name(sources),
+                source_paths=sources,
+                config_snapshot=config,
+                tc_alignment_snapshot=self._tc_alignment,
+                tc_alignment_path=self._tc_alignment_path,
+                in_frame=lower,
+                out_frame=upper,
+                output_path=output,
+            )
+            duplicates = [
+                queued
+                for queued in self.render_queue.jobs
+                if str(queued.output_path) == output
+                and queued.status is not RenderStatus.FAILED
+            ]
+            if duplicates:
+                raise ValueError("Another queued timeline already uses this output path")
+            self.render_queue.add(job)
+        except Exception as error:
+            self._error("Render queue", str(error))
+            return
+        self._refresh_queue_table()
+        self.jobs_toggle.setChecked(True)
+        self._toggle_log(True)
+        self.jobs_tabs.setCurrentIndex(0)
+        self.queue_table.selectRow(len(self.render_queue.jobs) - 1)
+        self.statusBar().showMessage(
+            f"Added timeline to render queue: {job.name}", 8000
+        )
+
+    def remove_selected_queue_job(self) -> None:
+        job = self._selected_queue_job()
+        if job is None:
+            self.statusBar().showMessage("Select a timeline in Render Queue", 5000)
+            return
+        if job.status is RenderStatus.RENDERING:
+            self._error("Render queue", "The active render cannot be removed")
+            return
+        self.render_queue.remove(job.id)
+        self._refresh_queue_table()
+
+    def load_selected_queue_job(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        job = self._selected_queue_job()
+        if job is None:
+            self.statusBar().showMessage("Select a timeline in Render Queue", 5000)
+            return
+        if self.process is not None:
+            self._error("Render queue", "Finish the current task before loading a timeline")
+            return
+        try:
+            job_dir = self._working_dir / "queue" / job.id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            config_path = job_dir / "config.json"
+            config_path.write_text(
+                json.dumps(job.config_snapshot, indent=2), encoding="utf-8"
+            )
+            self.load_config(config_path)
+            sources = [str(path) for path in job.source_paths]
+            self._set_video_sources(sources)
+            alignment = job.tc_alignment_snapshot
+            if alignment is not None:
+                alignment_path = job_dir / "timecode-alignment.json"
+                alignment_path.write_text(
+                    json.dumps(alignment, indent=2), encoding="utf-8"
+                )
+                self._tc_alignment_path = alignment_path
+                self._apply_alignment_payload(
+                    alignment,
+                    lower=job.in_frame,
+                    upper=job.out_frame,
+                )
+                probes = alignment.get("probes")
+                if isinstance(probes, list):
+                    self._apply_source_probe_payload(
+                        {"inputs": probes, "issues": []}
+                    )
+            self.output_path.setText(str(job.output_path))
+            self._last_auto_output = None
+        except Exception as error:
+            self._error("Load timeline", str(error))
+            return
+        self.statusBar().showMessage(f"Loaded timeline: {job.name}", 8000)
+
+    def _materialize_queue_job(
+        self, job: RenderJob
+    ) -> tuple[Path, Path | None, list[str]]:
+        job_dir = self._working_dir / "queue" / job.id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        config = json.loads(json.dumps(job.config_snapshot))
+        if job.out_frame is not None:
+            config.setdefault("video", {})["frames"] = job.out_frame - job.in_frame
+        config_path = job_dir / "config.json"
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        alignment_path = None
+        if job.tc_alignment_snapshot is not None:
+            alignment_path = job_dir / "timecode-alignment.json"
+            alignment_path.write_text(
+                json.dumps(job.tc_alignment_snapshot, indent=2), encoding="utf-8"
+            )
+        return config_path, alignment_path, [str(path) for path in job.source_paths]
+
+    def _start_queue_job(self, job: RenderJob) -> None:
+        try:
+            output = Path(job.output_path)
+            if output.exists():
+                if output.is_dir() and not any(output.iterdir()):
+                    pass
+                else:
+                    raise ValueError(f"Output already exists: {output}")
+            for source in job.source_paths:
+                if not Path(source).is_file():
+                    raise ValueError(f"Source is missing: {source}")
+            config_path, alignment_path, sources = self._materialize_queue_job(job)
+        except Exception as error:
+            self.render_queue.update(
+                job.id, status=RenderStatus.FAILED, error=str(error)
+            )
+            self._refresh_queue_table()
+            if self._queue_running:
+                QTimer.singleShot(0, self._run_next_queue_job)
+            return
+
+        self._queue_current_id = job.id
+        self.render_queue.update(
+            job.id, status=RenderStatus.RENDERING, error=None
+        )
+        self._refresh_queue_table()
+        arguments = [
+            "stitch-video",
+            "--allow-low-bit-depth",
+            "--config",
+            str(config_path),
+            "--output",
+            str(job.output_path),
+            "--map-cache",
+            str(self._cache_dir),
+            "--start-frame",
+            str(job.in_frame),
+        ]
+        if alignment_path is not None:
+            arguments.extend(["--alignment-plan", str(alignment_path)])
+        arguments.extend(sources)
+
+        def completed() -> None:
+            self.render_queue.update(
+                job.id, status=RenderStatus.DONE, error=None
+            )
+            self._queue_current_id = None
+            self._refresh_queue_table()
+            if self._queue_running:
+                QTimer.singleShot(0, self._run_next_queue_job)
+
+        def failed() -> None:
+            current = next(
+                (queued for queued in self.render_queue.jobs if queued.id == job.id),
+                None,
+            )
+            if (
+                current is not None
+                and current.status is RenderStatus.QUEUED
+                and current.error == "Cancelled by user"
+            ):
+                self._refresh_queue_table()
+                return
+            self.render_queue.update(
+                job.id,
+                status=RenderStatus.FAILED,
+                error="Render process failed; inspect Task Log",
+            )
+            self._queue_current_id = None
+            self._refresh_queue_table()
+            if self._queue_running:
+                QTimer.singleShot(0, self._run_next_queue_job)
+
+        self._run_cli(f"QUEUE · {job.name}", arguments, completed, failed)
+
+    def render_selected_queue_job(self) -> None:
+        if self.process is not None:
+            self._error("Render queue", "Another task is already running")
+            return
+        job = self._selected_queue_job()
+        if job is None:
+            self.statusBar().showMessage("Select a timeline in Render Queue", 5000)
+            return
+        self._queue_running = False
+        job = self.render_queue.update(
+            job.id, status=RenderStatus.QUEUED, error=None
+        )
+        self._start_queue_job(job)
+
+    def render_all_queue_jobs(self) -> None:
+        if self.process is not None:
+            self._error("Render queue", "Another task is already running")
+            return
+        for job in self.render_queue.jobs:
+            if job.status is RenderStatus.FAILED:
+                self.render_queue.update(
+                    job.id, status=RenderStatus.QUEUED, error=None
+                )
+        self._queue_running = True
+        self._run_next_queue_job()
+
+    def _run_next_queue_job(self) -> None:
+        if not self._queue_running or self.process is not None:
+            return
+        job = self.render_queue.next_queued()
+        if job is None:
+            self._queue_running = False
+            self._queue_current_id = None
+            self._refresh_queue_table()
+            self.statusBar().showMessage("Render queue complete", 15000)
+            return
+        self._start_queue_job(job)
+
     def render(self) -> None:
         try:
             config = self._write_working_config()
@@ -2465,6 +3136,8 @@ class MainWindow(QMainWindow):
         self.settings_tabs.setEnabled(not busy)
         self.tc_align_button.setEnabled(not busy)
         self.preview_button.setEnabled(not busy)
+        self.playback_button.setEnabled(not busy)
+        self.add_queue_button.setEnabled(not busy)
         self.render_button.setEnabled(not busy)
         self.rig_align_button.setEnabled(not busy and self._preview_ready)
         self.timeline_in.setEnabled(not busy and self._tc_alignment is not None)
@@ -2534,6 +3207,18 @@ class MainWindow(QMainWindow):
 
     def cancel_task(self) -> None:
         if self.process is not None:
+            if self._queue_current_id is not None:
+                self._queue_running = False
+                try:
+                    self.render_queue.update(
+                        self._queue_current_id,
+                        status=RenderStatus.QUEUED,
+                        error="Cancelled by user",
+                    )
+                except (KeyError, RenderQueueError):
+                    pass
+                self._queue_current_id = None
+                self._refresh_queue_table()
             self._append_log("Cancelling task …")
             self.status_pill.setText("CANCELLING")
             self.process.kill()
@@ -2627,6 +3312,18 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._closing = True
+            self._queue_running = False
+            if self._queue_current_id is not None:
+                try:
+                    self.render_queue.update(
+                        self._queue_current_id,
+                        status=RenderStatus.QUEUED,
+                        error="Application closed during render",
+                    )
+                except (KeyError, RenderQueueError):
+                    pass
+                self._queue_current_id = None
+            self.media_player.stop()
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
             process = self.process
@@ -2643,6 +3340,8 @@ class MainWindow(QMainWindow):
             process.deleteLater()
         else:
             self._closing = True
+            self._queue_running = False
+            self.media_player.stop()
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
         event.accept()

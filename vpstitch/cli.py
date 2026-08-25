@@ -203,6 +203,34 @@ def _stitch_video(args: argparse.Namespace) -> None:
                 f"requested {config.video.frames} frames, but only {available} aligned frames remain"
             )
 
+    decode_scale = float(args.decode_scale)
+    if not 0.0 < decode_scale <= 1.0:
+        raise ConfigError("--decode-scale must be greater than 0 and at most 1")
+    if decode_scale < 1.0:
+        scaled_cameras = []
+        for camera in config.cameras:
+            lens = camera.lens
+            scaled_cameras.append(
+                replace(
+                    camera,
+                    width=max(1, int(round(camera.width * decode_scale))),
+                    height=max(1, int(round(camera.height * decode_scale))),
+                    lens=replace(
+                        lens,
+                        fx=lens.fx * decode_scale,
+                        fy=lens.fy * decode_scale,
+                        cx=lens.cx * decode_scale,
+                        cy=lens.cy * decode_scale,
+                        circle_radius=(
+                            None
+                            if lens.circle_radius is None
+                            else lens.circle_radius * decode_scale
+                        ),
+                    ),
+                )
+            )
+        config = replace(config, cameras=tuple(scaled_cameras))
+
     cache = MapCache(config, args.map_cache).open(progress=_progress)
     stitcher = Stitcher(config, map_cache=cache)
     decoders = []
@@ -223,6 +251,9 @@ def _stitch_video(args: argparse.Namespace) -> None:
                 start_frame=decoder_start,
                 source_fps=probe.fps,
                 exact_frame_seek=True,
+                output_size=(camera.width, camera.height)
+                if decode_scale < 1.0
+                else None,
             )
         )
     if config.video.output_codec == "exr-half-sequence":
@@ -529,6 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-low-bit-depth",
         action="store_true",
         help="continue with 8-bit or other sub-10-bit inputs, with an explicit warning",
+    )
+    video.add_argument(
+        "--decode-scale",
+        type=float,
+        default=1.0,
+        help="downscale source decoding for playback proxies (0-1]",
     )
     video.add_argument("inputs", nargs="+")
     _add_canvas_arguments(video)

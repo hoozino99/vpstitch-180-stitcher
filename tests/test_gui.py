@@ -20,6 +20,7 @@ from vpstitch.gui import (
     plate_number,
     preview_dimensions,
 )
+from vpstitch.renderqueue import RenderJob, RenderQueueStore, RenderStatus
 
 
 def test_plate_number_recognizes_one_based_clip_and_folder_names(tmp_path: Path) -> None:
@@ -91,6 +92,92 @@ def test_gui_full_plate_fit_updates_manual_canvas_controls() -> None:
     assert window.canvas_height.value() <= 6_000
     assert "FULL PLATES" in window.canvas_ratio.text()
     assert window._preview_ready is False
+    window.close()
+    app.processEvents()
+
+
+def test_gui_builds_small_cached_playback_proxy_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_config(Path("configs/five_cam_180.sample.json"))
+    sources = []
+    for number in range(1, 6):
+        source = tmp_path / f"P{number:02d}.mov"
+        source.touch()
+        sources.append(str(source))
+    window.source_table.set_paths(sources)
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 48
+    window._timeline_updating = True
+    window.timeline_in.setRange(0, 47)
+    window.timeline_out.setRange(1, 48)
+    window.timeline_in.setValue(4)
+    window.timeline_out.setValue(28)
+    window._timeline_updating = False
+    window.timeline_bar.set_frame_range(48, 4, 28, 4)
+    captured: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        window,
+        "_run_cli",
+        lambda task, arguments, success=None, failure=None: captured.append(
+            (task, arguments)
+        ),
+    )
+
+    window._build_playback(tmp_path / "proxy.mp4", "proxy-key", sources)
+
+    assert captured[0][0] == "BUILD PLAYBACK PROXY"
+    config_path = Path(captured[0][1][captured[0][1].index("--config") + 1])
+    proxy_config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert proxy_config["output"]["width"] <= 1280
+    assert proxy_config["output"]["height"] <= 720
+    assert proxy_config["video"]["output_codec"] == "h264-proxy"
+    assert proxy_config["video"]["frames"] == 24
+    window.close()
+    app.processEvents()
+
+
+def test_gui_render_all_processes_timeline_snapshots_sequentially(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.render_queue = RenderQueueStore(tmp_path / "render-queue.json")
+    sources = []
+    for number in range(1, 6):
+        source = tmp_path / f"P{number:02d}.mov"
+        source.touch()
+        sources.append(source)
+    config = json.loads(Path("configs/five_cam_180.sample.json").read_text())
+    for number in range(2):
+        window.render_queue.add(
+            RenderJob.create(
+                name=f"Take {number + 1}",
+                source_paths=sources,
+                config_snapshot=config,
+                output_path=tmp_path / f"take-{number + 1}.mov",
+                in_frame=0,
+                out_frame=12,
+            )
+        )
+    started: list[str] = []
+
+    def run_cli(task, arguments, success=None, failure=None):
+        started.append(task)
+        if success:
+            success()
+
+    monkeypatch.setattr(window, "_run_cli", run_cli)
+    window._refresh_queue_table()
+    window.render_all_queue_jobs()
+    for _ in range(4):
+        app.processEvents()
+
+    assert started == ["QUEUE · Take 1", "QUEUE · Take 2"]
+    assert all(job.status is RenderStatus.DONE for job in window.render_queue.jobs)
+    assert window._queue_running is False
     window.close()
     app.processEvents()
 

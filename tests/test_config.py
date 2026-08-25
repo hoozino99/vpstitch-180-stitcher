@@ -32,7 +32,12 @@ def test_accepts_prores_h264_mp4_and_dpx_outputs(tmp_path: Path) -> None:
     source = json.loads(Path("configs/five_cam_180.sample.json").read_text(encoding="utf-8"))
     source["output"]["width"] = 1920
     source["output"]["height"] = 1080
-    for codec in ("prores-hq", "h264-mp4-10", "dpx12-sequence"):
+    for codec in (
+        "prores-hq",
+        "h264-mp4-10",
+        "h264-proxy",
+        "dpx12-sequence",
+    ):
         source["video"]["output_codec"] = codec
         path = tmp_path / f"{codec}.json"
         path.write_text(json.dumps(source), encoding="utf-8")

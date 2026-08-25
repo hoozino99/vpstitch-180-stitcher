@@ -190,10 +190,83 @@ def _tag_value(tags: object, key: str) -> str | None:
     return None
 
 
-def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProbe:
+def _positive_float(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) and result > 0.0 else None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _stream_duration_seconds(
+    video: dict[str, object],
+) -> tuple[float | None, bool]:
+    duration = _positive_float(video.get("duration"))
+    timestamp_count = _positive_int(video.get("duration_ts"))
+    time_base = _fraction_rate(video.get("time_base"))
+    timestamp_duration = (
+        timestamp_count * time_base
+        if timestamp_count is not None and time_base is not None
+        else None
+    )
+    if duration is not None and timestamp_duration is not None:
+        if abs(duration - timestamp_duration) > max(1e-6, duration * 1e-6):
+            return None, True
+    return duration or timestamp_duration, False
+
+
+def _validated_metadata_frame_count(
+    video: dict[str, object], format_data: dict[str, object], fps: float
+) -> int | None:
+    """Return a frame count only when container metadata is CFR-consistent."""
+    if not np.isfinite(fps) or fps <= 0.0:
+        return None
+
+    average_rate = _fraction_rate(video.get("avg_frame_rate"))
+    nominal_rate = _fraction_rate(video.get("r_frame_rate"))
+    if average_rate is not None and nominal_rate is not None:
+        rate_tolerance = max(0.001, fps * 1e-4)
+        if abs(average_rate - nominal_rate) > rate_tolerance:
+            return None
+
+    duration, ambiguous_duration = _stream_duration_seconds(video)
+    if ambiguous_duration:
+        return None
+    if duration is None:
+        duration = _positive_float(format_data.get("duration"))
+    if duration is None:
+        return None
+
+    expected = duration * fps
+    rounded = int(round(expected))
+    if rounded < 1:
+        return None
+
+    declared = _positive_int(video.get("nb_frames"))
+    if declared is not None:
+        # One frame allows common container end-timestamp rounding while still
+        # rejecting stale or stream-mismatched frame-count metadata.
+        return declared if abs(declared - expected) <= 1.0 + 1e-6 else None
+
+    # A duration-only count is safe only when it lands very close to a whole
+    # frame. Otherwise the source may be VFR or the container duration rounded.
+    return rounded if abs(rounded - expected) <= 0.05 else None
+
+
+def _enhance_probe_with_ffprobe(
+    path: str | Path, base: VideoProbe
+) -> tuple[VideoProbe, int | None]:
     executable = ffprobe_executable()
     if not executable:
-        return base
+        return base, None
     try:
         process = subprocess.run(
             [
@@ -213,16 +286,16 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
             check=False,
         )
     except OSError:
-        return base
+        return base, None
     if process.returncode:
-        return base
+        return base, None
     try:
         payload = json.loads(process.stdout.decode("utf-8", errors="replace"))
         streams = payload.get("streams", [])
         video = next(stream for stream in streams if stream.get("codec_type") == "video")
         format_data = payload.get("format", {})
     except (json.JSONDecodeError, StopIteration, TypeError, AttributeError):
-        return base
+        return base, None
 
     fps = (
         _fraction_rate(video.get("avg_frame_rate"))
@@ -238,13 +311,10 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
         if duration_seconds >= 0.0:
             break
         duration_seconds = None
-    frame_count = None
-    try:
-        frame_count = int(video.get("nb_frames"))
-    except (TypeError, ValueError):
-        pass
+    frame_count = _positive_int(video.get("nb_frames"))
     if not frame_count and duration_seconds is not None:
         frame_count = max(1, int(round(duration_seconds * fps)))
+    validated_frame_count = _validated_metadata_frame_count(video, format_data, fps)
 
     timecode = _tag_value(video.get("tags"), "timecode")
     if not timecode:
@@ -268,18 +338,21 @@ def _enhance_probe_with_ffprobe(path: str | Path, base: VideoProbe) -> VideoProb
         if candidate_rate > 0:
             bit_rate = candidate_rate
             break
-    return replace(
-        base,
-        codec=str(video.get("codec_name") or base.codec),
-        pixel_format=pixel_format,
-        width=int(video.get("width") or base.width),
-        height=int(video.get("height") or base.height),
-        fps=fps,
-        bit_depth=pixel_format_bit_depth(pixel_format),
-        duration_seconds=duration_seconds,
-        frame_count=frame_count,
-        timecode=timecode or base.timecode,
-        bit_rate=bit_rate,
+    return (
+        replace(
+            base,
+            codec=str(video.get("codec_name") or base.codec),
+            pixel_format=pixel_format,
+            width=int(video.get("width") or base.width),
+            height=int(video.get("height") or base.height),
+            fps=fps,
+            bit_depth=pixel_format_bit_depth(pixel_format),
+            duration_seconds=duration_seconds,
+            frame_count=frame_count,
+            timecode=timecode or base.timecode,
+            bit_rate=bit_rate,
+        ),
+        validated_frame_count,
     )
 
 
@@ -323,8 +396,10 @@ def probe_video(path: str | Path, *, count_frames: bool = False) -> VideoProbe:
         check=False,
     )
     base = parse_probe_output(path, process.stderr.decode("utf-8", errors="replace"))
-    result = _enhance_probe_with_ffprobe(path, base)
-    if count_frames:
+    result, metadata_frame_count = _enhance_probe_with_ffprobe(path, base)
+    if count_frames and metadata_frame_count is not None:
+        result = replace(result, frame_count=metadata_frame_count)
+    elif count_frames:
         result = replace(result, frame_count=_count_video_frames(path))
     return result
 
@@ -568,6 +643,23 @@ class VideoEncoder:
                     "14",
                     "-pix_fmt",
                     "yuv420p10le",
+                    "-movflags",
+                    "+faststart",
+                ]
+            )
+        elif video.output_codec == "h264-proxy":
+            command.extend(
+                [
+                    "-vf",
+                    _filter_chain(video),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "22",
+                    "-pix_fmt",
+                    "yuv420p",
                     "-movflags",
                     "+faststart",
                 ]

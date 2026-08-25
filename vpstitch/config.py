@@ -19,6 +19,7 @@ OUTPUT_CODECS = {
     "prores-4444",
     "prores-hq",
     "h264-mp4-10",
+    "h264-proxy",
     "hevc-444-10",
 }
 
