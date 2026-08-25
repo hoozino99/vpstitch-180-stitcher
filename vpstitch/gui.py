@@ -81,6 +81,7 @@ from PySide6.QtWidgets import (
 from .imageio import read_image
 
 from .canvas import recommend_full_plate_canvas
+from .color import BUNDLED_ACES_STUDIO_ID
 from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH, load_config as parse_config
 from .project import (
     Bin,
@@ -94,7 +95,7 @@ from .renderqueue import RenderJob, RenderQueueError, RenderQueueStore, RenderSt
 
 
 APP_NAME = "VP Stitch"
-BUILTIN_ACES_STUDIO = "ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5"
+BUILTIN_ACES_STUDIO = BUNDLED_ACES_STUDIO_ID
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
 PLATE_NUMBERS_BY_COUNT = {
@@ -926,8 +927,8 @@ class ProjectManagerDialog(QDialog):
         height = QSpinBox()
         height.setRange(320, MAX_CANVAS_HEIGHT)
         height.setValue(5_504)
-        ocio = QLineEdit("")
-        ocio.setPlaceholderText("Optional OCIO config · can be changed later")
+        ocio = QLineEdit(BUNDLED_ACES_STUDIO_ID)
+        ocio.setPlaceholderText("Bundled ACES Studio config · can be changed later")
         form.addRow("Project name", name)
         form.addRow("Location", location_row)
         form.addRow("Default canvas width", width)
@@ -960,7 +961,15 @@ class ProjectManagerDialog(QDialog):
                     "output": {"width": width.value(), "height": height.value()},
                     "color": {
                         "mode": "ocio" if ocio_value else "passthrough",
-                        **({"ocio_config": ocio_value} if ocio_value else {}),
+                        **(
+                            {
+                                "ocio_config": ocio_value,
+                                "working_space": "ACEScg",
+                                "output_space": "Gamma 2.4 Encoded Rec.709",
+                            }
+                            if ocio_value
+                            else {}
+                        ),
                     },
                 },
             )
@@ -1091,6 +1100,8 @@ class MainWindow(QMainWindow):
             initial = self.project_root / "configs" / "five_cam_180.sample.json"
         if initial.is_file():
             self.load_config(initial)
+        if not self.ocio_config.text().strip():
+            self.ocio_config.setText(BUNDLED_ACES_STUDIO_ID)
         self._apply_project_defaults()
         self._refresh_media_tree()
         self._update_project_header()
@@ -1598,6 +1609,13 @@ class MainWindow(QMainWindow):
                 self.working_space.setText(str(color["working_space"]))
             if color.get("output_space"):
                 self.output_space.setText(str(color["output_space"]))
+            if color.get("mode") == "ocio":
+                if not self.input_space.text().strip():
+                    self.input_space.setText("Camera Rec.709")
+                if not self.working_space.text().strip():
+                    self.working_space.setText("ACEScg")
+                if not self.output_space.text().strip():
+                    self.output_space.setText("Gamma 2.4 Encoded Rec.709")
         cameras = snapshot.get("cameras") if isinstance(snapshot, dict) else None
         if isinstance(cameras, list) and cameras and isinstance(cameras[0], dict):
             if cameras[0].get("colorspace"):
@@ -2316,7 +2334,7 @@ class MainWindow(QMainWindow):
         ocio_button.setFixedWidth(34)
         ocio_button.clicked.connect(self.choose_ocio)
         ocio_layout.addWidget(ocio_button)
-        aces_button = QPushButton("USE BUILT-IN ACES 2.0 / REC.709")
+        aces_button = QPushButton("USE BUNDLED ACES 2.0 / REC.709")
         aces_button.setObjectName("secondaryButton")
         aces_button.clicked.connect(self.apply_aces_preset)
         self.input_space = QLineEdit()
@@ -3261,7 +3279,7 @@ class MainWindow(QMainWindow):
         self.working_space.setText("ACEScg")
         self.output_space.setText("Gamma 2.4 Encoded Rec.709")
         self._update_color_controls()
-        self._append_log("Applied built-in ACES 2.0 Studio preset: Camera Rec.709 → ACEScg → Gamma 2.4 Rec.709")
+        self._append_log("Applied bundled ACES 2.0 Studio preset: Camera Rec.709 → ACEScg → Gamma 2.4 Rec.709")
 
     def choose_output(self) -> None:
         codec = str(self.output_codec.currentData())

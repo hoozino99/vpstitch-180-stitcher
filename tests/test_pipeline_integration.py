@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import PyOpenColorIO as ocio
 
-from vpstitch.color import ColorPipeline
+from vpstitch.color import (
+    BUNDLED_ACES_STUDIO_ID,
+    ColorPipeline,
+    bundled_aces_studio_path,
+)
 from vpstitch.config import Camera, Color, Lens, Output, RigConfig
 from vpstitch.geometry import camera_to_world
 from vpstitch.pipeline import Stitcher
@@ -138,11 +143,16 @@ def test_float_destination_does_not_clip_extended_range() -> None:
     assert float(destination.max()) > 1.0
 
 
-def test_builtin_aces_studio_config_uri() -> None:
+def test_bundled_aces_studio_config_uri() -> None:
+    config_path = bundled_aces_studio_path()
+    assert config_path.is_file()
+    assert hashlib.sha256(config_path.read_bytes()).hexdigest() == (
+        "eda5b0008a43b72b98ad540e32eb0eb83b340dde54e35bddba64ccbafac1029a"
+    )
     pipeline = ColorPipeline(
         Color(
             mode="ocio",
-            ocio_config="ocio://studio-config-v4.0.0_aces-v2.0_ocio-v2.5",
+            ocio_config=BUNDLED_ACES_STUDIO_ID,
             working_space="ACEScg",
             output_space="Gamma 2.4 Encoded Rec.709",
         ),

@@ -1,13 +1,41 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 
 from .config import Color
 
 
+BUNDLED_ACES_STUDIO_ID = "vpstitch://aces-studio-v4.0.0"
+BUNDLED_ACES_STUDIO_FILENAME = (
+    "studio-config-v4.0.0_aces-v2.0_ocio-v2.5.ocio"
+)
+
+
+def bundled_aces_studio_path() -> Path:
+    root = (
+        Path(str(getattr(sys, "_MEIPASS")))
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+        else Path(__file__).resolve().parents[1]
+    )
+    return root / "configs" / "ocio" / BUNDLED_ACES_STUDIO_FILENAME
+
+
+def resolve_ocio_identifier(identifier: str) -> str:
+    if identifier == BUNDLED_ACES_STUDIO_ID:
+        path = bundled_aces_studio_path()
+        if not path.is_file():
+            raise FileNotFoundError(f"bundled ACES Studio config is missing: {path}")
+        return str(path)
+    return identifier
+
+
 def load_ocio_config(identifier: str):
     import PyOpenColorIO as ocio
 
+    identifier = resolve_ocio_identifier(identifier)
     if identifier.startswith("ocio://"):
         return ocio.Config.CreateFromBuiltinConfig(identifier.removeprefix("ocio://"))
     return ocio.Config.CreateFromFile(identifier)

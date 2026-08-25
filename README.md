@@ -372,9 +372,9 @@ OCIO 출력이 ACEScg 같은 scene-linear 공간이라면 `exr-half-sequence`를
   ],
   "color": {
     "mode": "ocio",
-    "ocio_config": "C:/color/aces_1.3/config.ocio",
+    "ocio_config": "vpstitch://aces-studio-v4.0.0",
     "working_space": "ACEScg",
-    "output_space": "ARRI LogC4",
+    "output_space": "Gamma 2.4 Encoded Rec.709",
     "integer_dither": true
   }
 }
@@ -385,10 +385,14 @@ RAW로 디베이어된 경우 해당 linear colorspace를 입력으로 지정하
 
 config에 들어 있는 정확한 색공간 이름은 다음 명령으로 확인할 수 있습니다.
 
-GUI의 `USE BUILT-IN ACES 2.0 / REC.709` 버튼은 설치된 OpenColorIO의 Studio Config를
-사용하여 `Camera Rec.709 → ACEScg → Gamma 2.4 Encoded Rec.709` 작업 설정을 채웁니다.
-외부 `.ocio` 파일 없이 사용할 수 있으며, 프로젝트의 실제 입력 인코딩과 납품 색공간에
-맞게 이름을 변경할 수 있습니다.
+앱에는 Academy Software Foundation이 배포한 공식
+`OpenColorIO-Config-ACES v4.0.0 / ACES 2.0 / OCIO 2.5` Studio Config가 포함됩니다.
+새 프로젝트는 `vpstitch://aces-studio-v4.0.0`을 기본값으로 사용하고, 앱은 이를
+macOS/Windows 패키지 내부의 실제 `.ocio` 파일로 해석합니다. 따라서 인터넷 연결이나
+별도 OCIO 다운로드가 필요 없고 프로젝트를 다른 OS로 옮겨도 앱 설치 경로가 저장되지
+않습니다. `USE BUNDLED ACES 2.0 / REC.709` 버튼은
+`Camera Rec.709 → ACEScg → Gamma 2.4 Encoded Rec.709` 작업 설정을 채웁니다.
+프로젝트의 실제 입력 인코딩과 납품 색공간에 맞게 이름을 변경할 수 있습니다.
 
 ```powershell
 .\.venv\Scripts\vpstitch.exe list-ocio-spaces `

@@ -490,7 +490,7 @@ def test_gui_applies_builtin_aces_preset() -> None:
     window = MainWindow()
     window.apply_aces_preset()
     assert window.color_mode.currentData() == "ocio"
-    assert window.ocio_config.text().startswith("ocio://studio-config-")
+    assert window.ocio_config.text() == "vpstitch://aces-studio-v4.0.0"
     assert window.input_space.text() == "Camera Rec.709"
     assert window.working_space.text() == "ACEScg"
     window.close()
