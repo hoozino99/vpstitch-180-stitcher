@@ -17,6 +17,7 @@ from vpstitch.gui import (
     GUI_MASTER_BIT_DEPTHS,
     InputSettingsDialog,
     MainWindow,
+    ProjectManagerDialog,
     TrimRangeBar,
     order_camera_plates,
     plate_number,
@@ -64,6 +65,25 @@ def test_preview_dimensions_preserve_canvas_aspect() -> None:
     assert preview_dimensions(15360, 3968) == (3840, 992)
     assert preview_dimensions(20000, 6000) == (3840, 1152)
     assert preview_dimensions(20000, 32) == (3840, 6)
+
+
+def test_project_manager_new_project_button_opens_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    manager = ProjectManagerDialog()
+    opened: list[str] = []
+
+    def reject_new_project(dialog: QDialog) -> QDialog.DialogCode:
+        opened.append(dialog.windowTitle())
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", reject_new_project)
+    manager.new_project_button.click()
+
+    assert opened == ["New VP Stitch Project"]
+    manager.close()
+    app.processEvents()
 
 
 def test_timeline_track_is_vertically_centered() -> None:

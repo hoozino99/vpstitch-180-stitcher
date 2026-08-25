@@ -39,6 +39,7 @@ COMMON_ARGS="\
   --paths "$ROOT_DIR" \
   --windowed \
   --name "VP Stitch" \
+  --icon "assets/VP-Stitch.icns" \
   --add-binary "$AX_SHIM:." \
   --add-data "configs:configs" \
   packaging/gui_entry.py

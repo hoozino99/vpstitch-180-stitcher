@@ -5,4 +5,7 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.ocio binary
+*.icns binary
+*.ico binary
+*.png binary
 *.ocio binary

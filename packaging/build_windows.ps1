@@ -74,6 +74,7 @@ $CommonArgs = @(
 $GuiArgs = $CommonArgs + @(
     "--windowed"
     "--name", "VP Stitch"
+    "--icon", "assets\VP-Stitch.ico"
     "--add-data", "configs;configs"
     "packaging/gui_entry.py"
 )

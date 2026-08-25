@@ -852,16 +852,16 @@ class ProjectManagerDialog(QDialog):
         self.projects.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.projects, 1)
         actions = QHBoxLayout()
-        new_button = QPushButton("NEW PROJECT")
-        new_button.setObjectName("primaryButton")
-        new_button.clicked.connect(self.create_project)
+        self.new_project_button = QPushButton("NEW PROJECT")
+        self.new_project_button.setObjectName("primaryButton")
+        self.new_project_button.clicked.connect(self.create_project)
         open_button = QPushButton("OPEN…")
         open_button.setObjectName("secondaryButton")
         open_button.clicked.connect(self.open_existing)
         selected_button = QPushButton("OPEN SELECTED")
         selected_button.setObjectName("primaryButton")
         selected_button.clicked.connect(self.open_selected)
-        actions.addWidget(new_button)
+        actions.addWidget(self.new_project_button)
         actions.addWidget(open_button)
         actions.addStretch()
         actions.addWidget(selected_button)
@@ -906,7 +906,14 @@ class ProjectManagerDialog(QDialog):
         form = QFormLayout()
         name = QLineEdit("Untitled Project")
         location = QLineEdit(
-            str(Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentLocation)) / "VP Stitch Projects")
+            str(
+                Path(
+                    QStandardPaths.writableLocation(
+                        QStandardPaths.StandardLocation.DocumentsLocation
+                    )
+                )
+                / "VP Stitch Projects"
+            )
         )
         browse = QPushButton("…")
         browse.setObjectName("iconButton")
