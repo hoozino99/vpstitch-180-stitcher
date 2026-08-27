@@ -21,23 +21,72 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 권장 작업 순서:
 
 1. 시작 화면에서 프로젝트를 만들거나 기존 `project.json`을 엽니다. 프로젝트의 기본
-   캔버스와 OCIO는 네이티브 메뉴의 `Project > Project Settings…`에서 바꿀 수 있습니다.
+   캔버스와 OCIO Config, Input/Working/Output transform은 네이티브 메뉴의
+   `Project > Project Settings…`에서 바꿀 수 있습니다.
 2. 왼쪽 `MEDIA POOL`에서 폴더를 만들고 전방 3카메라 `P06–P08` 또는 후방 5카메라
-   `P01–P05` 원본을 한 번에 임포트합니다. 한 번 임포트한 `Plate Set`은 곧 하나의
-   타임라인이며, 더블클릭해 다시 엽니다. 선택 순서와 관계없이 물리 카메라 번호 순으로
-   자동 배치합니다.
-3. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
+   `P01–P05` 원본을 임포트합니다. 클립은 카메라 번호 순으로 정리되며, 임포트만으로
+   타임라인이 자동 생성되지는 않습니다.
+3. `NEW TIMELINE`에서 이름과 `3 CAM · FRONT · P06–P08` 또는
+   `5 CAM · REAR · P01–P05` 레이아웃을 고릅니다. Media Pool에서 완성된 세트를
+   먼저 선택했다면 생성과 동시에 플레이트를 넣을 수 있습니다. 그렇지 않으면 생성 후
+   클립을 선택하고 우클릭해 활성 타임라인에 추가합니다. 왼쪽 `PLATE SETS`에는 개별
+   클립 없이 타임라인만 표시되며, 더블클릭해 작업 타임라인을 전환합니다.
+4. Media Pool 클립/폴더나 Plate Sets 타임라인을 선택한 뒤 `Backspace` 또는
+   `Delete`를 누르면 프로젝트에서 제거됩니다. 우클릭 메뉴에서도 같은 동작을 할 수
+   있으며 확인창을 거치고 원본 영상 파일은 디스크에서 삭제하지 않습니다.
+   `MEDIA POOL`, `PLATE SETS`, `ACTIVE TIMELINE`은 각각 테두리로 구분되며 섹션 사이
+   핸들을 위아래로 드래그해 높이를 조절할 수 있습니다. 왼쪽 패널과 프리뷰 사이 핸들도
+   좌우로 드래그할 수 있고, 마지막 패널 배치는 앱을 다시 열어도 복원됩니다.
+5. 각 타임라인은 기본적으로 프로젝트 해상도와 OCIO 설정을 따르지만
+   `Timeline > Timeline Settings…`에서 상속을 끄고 별도로 덮어쓸 수 있습니다.
+   OCIO config를 읽으면 Input / Working / Delivery 항목이 해당 config의 전체 컬러스페이스
+   목록으로 채워집니다. 드롭다운에서 고르거나 이름 일부를 입력해 필터링할 수 있습니다.
+6. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
    공통 구간으로 자동 트림합니다.
-4. 하나의 타임라인 바에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
-5. 고정 피사체가 잘 보이는 시각을 플레이헤드로 선택하고 `PREVIEW`를 누릅니다.
-   첫 프리뷰 이후에는 플레이헤드를 끌어 놓을 때 해당 프레임을 다시 스티칭해 확인합니다.
-6. 공간적인 리그 각도 보정이 필요하면 `RIG ALIGN`을 실행합니다. 보정이 끝나면
-   결과 프리뷰가 자동으로 다시 생성됩니다.
-7. TC 정렬이나 스티칭 프리뷰가 끝나면 1280px H.264 프록시를 백그라운드에서 미리
-   생성합니다. 준비된 뒤에는 `Space` 재생/일시정지, `J/K/L` 역재생·정지·정방향,
-   `←/→` 한 프레임 이동, `P` 전체화면을 사용할 수 있습니다.
-8. 현재 타임라인만 바로 출력하려면 `RENDER NOW`, 여러 테이크를 모아 순차 출력하려면
-   `ADD TO QUEUE`를 누릅니다. Jobs의 `RENDER ALL`은 대기 중인 타임라인을 순서대로 렌더합니다.
+7. 하나의 타임라인 바에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
+8. 고정 피사체가 잘 보이는 시각을 플레이헤드로 선택하고 `QUICK PREVIEW`를 누릅니다.
+   현재 저장된 카메라 값으로 플레이헤드의 한 프레임만 최대 2K로 스티칭합니다. 첫 프리뷰
+   이후에는 플레이헤드를 끌어 놓을 때 해당 대표 프레임만 다시 확인합니다.
+9. 왼쪽 `ACTIVE TIMELINE`에서 플레이트 하나를 선택하면 Inspector가 `PLATE` 탭으로
+   전환됩니다. 해당 플레이트의 Position X/Y, Rotation, Scale, 좌·우·상·하 Crop,
+   Lens Warp 1–4, 좌·우 Feather를 타임라인별로 미세조정하면 메모리 상주형 1280px
+   인터랙티브 프리뷰에 자동 반영됩니다. 숫자 필드를 위아래로 드래그해 값을 스크럽할 수 있고 `Shift`를 누른
+   채 드래그하면 10배 정밀하게 조정됩니다. 재생 프록시에서 특정 프레임을 고른 뒤 값을
+   바꾸면 현재 프레임을 그대로 얼려 표시하고, 임포트 때 백그라운드로 만든 960×540 이하
+   소스 프록시에서 해당 TC 프레임 묶음을 읽습니다. 이후 Transform/Crop/Warp 변경은 수정한 카메라 레이어만
+   약 40ms 단위로 다시 투영하며 다른 카메라 레이어와 소스 디코드는 재사용합니다. Feather는
+   재투영 없이 블렌드만 갱신합니다. 플레이헤드를 0으로 되돌리거나 매번 CLI를 실행하지
+   않습니다. `REFRESH FRAME`은 자동 갱신 실패 시 현재 프레임을 수동 재시도합니다.
+10. 카메라 사이에 마젠타/시안 화이트 포인트 차이가 보이면 오른쪽 `COLOR > CAMERA MATCH`에서
+    기준 카메라를 고르고 `MATCH`를 누릅니다. Quick Preview의 대표 프레임 한 장과 카메라
+    중첩부만 분석해 노출을 유지하는 RGB 보정값을 저장하며, 프레임마다 다시 분석하지 않습니다.
+    `Strength`로 강도를 낮출 수 있고 `RESET`은 모든 카메라를 1.0 gain으로 되돌립니다.
+11. 공간적인 리그 각도 보정이 필요하면 `AUTO STITCH`를 실행합니다. Quick Preview의
+    대표 프레임에서 yaw/pitch/roll을 한 번 계산해 타임라인 전체에 고정 적용하고, 결과
+    프리뷰를 자동으로 다시 생성합니다.
+12. 미디어를 임포트하면 카메라별 960×540 이하 H.264 소스 프록시를 독립 백그라운드
+   작업으로 선제 생성합니다. `TC ALIGN` 뒤에는 이 프록시를 지속 디코딩하며 모든 카메라가
+   준비된 완전한 프레임 묶음만 표시합니다. 준비된 뒤에는 첫
+   `Play` 또는 `Space`부터 바로 재생되며, `Space` 재생/일시정지, `J/K/L` 연속 역재생·정지·정방향,
+   `←/→` 한 프레임 이동, `P` 전체화면을 사용할 수 있습니다. Space로 일시정지한 뒤
+   다시 재생하면 현재 위치에서 이어집니다. Auto Stitch 뒤 보정 프리뷰 프레임이 아직
+   로딩 중일 때 Play를 눌러도 입력을 버리지 않고, 프리뷰가 끝난 뒤 새 스티치 값으로
+   Inspector 조정만으로 스티치 동영상 프록시를 다시 만들지는 않습니다. 따라서 값을 드래그하는 동안
+   우하단 `CACHE` 작업이 반복되지 않습니다. 기존 스티치 프록시가 최신이면 QMediaPlayer로
+   재생하고, 값이 바뀌어 낡았으면 소스 프록시 + 현재 Transform/Crop/Warp/Color 값을 쓰는
+   라이브 GPU/OpenCL 프리뷰로 자동 전환합니다. 라이브 경로는 3캠/5캠을 한 묶음으로 전진·역재생·
+   프레임 이동하며, 최종 렌더와 같은 TC 스킵 및 카메라별 수동 프레임 오프셋 계산을 공유합니다.
+   `P` 전체화면은 정지 프리뷰와 동영상 모두 별도 최상위 전체화면 창을 사용하며, 종횡비와
+   전체 캔버스를 유지한 채 화면 폭에 맞는 최대 크기로 표시합니다.
+13. `RENDER NOW` 또는 `ADD TO QUEUE`를 누르면 출력 폴더와 파일명을 확인하는 창이
+    열립니다. 큐 항목마다 확정된 전체 출력 경로와 설정 스냅샷을 별도로 보관하므로
+    `RENDER ALL` 실행 시 다른 타임라인의 경로나 이름이 섞이지 않습니다. Render Queue
+    하단은 `RENDER`와 `RENDER ALL`만 표시하며, 로드/제거는 더블클릭·우클릭 또는
+    `Backspace`/`Delete`로 처리합니다.
+
+프로젝트 변경은 작은 JSON 파일에 즉시 원자 저장됩니다. 추가로 내용이 바뀐 경우에만
+10분마다 `project.autosave.json` 복구 스냅샷을 갱신하므로 고해상도 영상 디코딩이나
+스티칭 렌더 부하를 추가하지 않습니다.
 
 ### Rig Profile은 무엇인가
 
@@ -49,10 +98,10 @@ macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합�
 
 P06–P08 세 개만 임포트하면 현재 5카메라 프로필의 좌·중앙·우 카메라를 사용한
 3카메라 작업 레이아웃으로 자동 전환합니다. 전방 3카메라 리그의 실제 렌즈나 물리
-각도가 후방 5카메라 리그와 다르면 전용 3카메라 `Rig Profile`을 열거나 `RIG ALIGN`으로
+각도가 후방 5카메라 리그와 다르면 전용 3카메라 `Rig Profile`을 열거나 `AUTO STITCH`로
 보정해야 합니다.
 
-`RIG ALIGN`은 동기화된 Preview 프레임을 분석해 카메라별 yaw/pitch/roll을 미세
+`AUTO STITCH`는 동기화된 Quick Preview 프레임을 분석해 카메라별 yaw/pitch/roll을 미세
 보정합니다. 렌즈 종류와 왜곡값을 영상만 보고 처음부터 자동 생성하는 기능은 아니며,
 다른 카메라·렌즈·물리 배치로 바뀌면 해당 리그의 렌즈 캘리브레이션 프로필이 필요합니다.
 Media Pool과 기술값은 기본 화면에서 분리되어 있고, 필요할 때 Inspector와 `PROFILE…`,
@@ -60,8 +109,15 @@ Media Pool과 기술값은 기본 화면에서 분리되어 있고, 필요할 �
 
 GUI 프리뷰는 모니터 표시를 위한 8-bit 축소 영상일 뿐입니다. 프리뷰 표시가 최종
 uint16/float32 스티칭 및 FFV1/EXR 마스터의 정밀도에는 영향을 주지 않습니다.
-프리뷰는 원본 종횡비를 유지한 채 UHD 4K(3840×2160) 안에 맞추므로 크롭이나 늘어남이
-없습니다. 프리뷰용 카메라 입력도 같은 비율로 먼저 축소해 메모리 사용량을 제한하며,
+Quick Preview는 원본 종횡비를 유지한 채 2K(2048×1152) 안에 맞추므로 크롭이나 늘어남이
+없습니다. Inspector를 드래그하는 동안에는 같은 대표 프레임으로 최대 1280×720의
+인터랙티브 합성을 사용하고, 원본 프레임과 변경되지 않은 카메라 와프를 메모리에서 재사용합니다.
+OpenCL 장치가 있으면 카메라 remap은 GPU에서 실행하며, macOS Metal/OpenCL 또는 Windows
+OpenCL 장치가 없을 때만 CPU로 폴백합니다.
+소스 프록시는 프리뷰 전용 8-bit 캐시이며 `fps_mode=passthrough`로 프레임 복제·누락을
+막습니다. Render Queue와 최종 렌더는 이 파일을 입력으로 사용하지 않고 큐에 잠근
+원본 10/12-bit 경로와 설정 스냅샷만 사용합니다.
+프리뷰용 카메라 입력도 같은 비율로 먼저 축소해 메모리 사용량을 제한하며,
 최종 렌더는 Rig Profile에 지정된 전체 해상도로 처리합니다.
 Inspector의 `FIT FULL PLATES`는 모든 카메라의 휘어진 외곽선을 샘플링해 H/V FOV와
 캔버스를 3% 여유로 자동 확장합니다. 또한 cylindrical 중심의 가로·세로 픽셀 스케일을
@@ -70,14 +126,14 @@ Horizontal/Vertical FOV는 직접 입력할 수 있으며 수동값도 프리뷰
 적용됩니다. 기본 Drive 5-Cam 프로필은 전체 플레이트 확인용 `20000×5504`,
 `H 241.29° / V 59.98°` no-crop 캔버스를 사용합니다.
 GUI는 플레이트 임포트 직후 각 소스의 픽셀 포맷과 비트 심도를 자동 감지합니다.
-8-bit 소스도 프리뷰와 Rig Align을 막지 않으며, Media Pool에
+8-bit 소스도 프리뷰와 Auto Stitch를 막지 않으며, Media Pool에
 `SOURCE 8-bit → MASTER 10/12-bit`처럼 표시합니다. GUI 최종 출력은 ProRes/H.264/HEVC
 10-bit 또는 DPX 12-bit만 제공합니다. 낮은 비트 심도 소스를 10-bit 코덱으로 인코딩해도
 원본에 없던 색 정밀도가 복원되는 것은 아닙니다.
 
 Media Pool에서 한 개 또는 여러 클립을 선택해 우클릭한 뒤 `INPUT SETTINGS…`를 열면
 DaVinci Resolve처럼 입력 색공간(자동/Rec.709/Rec.2020/Rec.601)과 Video Range
-(자동/Video/Full)를 명시할 수 있습니다. 이 값은 프리뷰, Rig Align 기준 프레임,
+(자동/Video/Full)를 명시할 수 있습니다. 이 값은 프리뷰, Auto Stitch 기준 프레임,
 최종 렌더에 동일하게 적용됩니다. 비트 심도와 비트레이트는 파일 자체의 속성이므로
 자동 감지해 읽기 전용으로 보여주며 입력 설정에서 임의로 바꾸지 않습니다.
 이 프로그램은 VideoStitch Studio의 소스코드나 UI 자산을 사용한 개조판이 아니라,
@@ -118,19 +174,24 @@ NumPy, OpenCV, FFmpeg, OpenColorIO를 사용하므로 Apple Silicon과 Intel Mac
 - ProRes/HEVC 인코딩 방식
 
 따라서 같은 CPU·SSD·출력 설정이면 Windows와 macOS의 차이는 크지 않으며, 최신
-Apple Silicon Mac은 일반적인 CPU 기반 렌더에서 충분히 경쟁력 있습니다. 다만 이
-프로젝트는 현재 CUDA/Metal 전용 가속 경로를 사용하지 않으므로 특정 Mac GPU가
-자동으로 전체 렌더를 가속하지는 않습니다. 실제 비교는 동일한 5개 입력과
-`--frames 24` 테스트로 측정해야 합니다.
+Apple Silicon Mac은 일반적인 CPU 기반 렌더에서 충분히 경쟁력 있습니다. VP Stitch는
+대표 remap에서 CPU와 OpenCL의 업로드·다운로드까지 포함해 측정하고, 품질 허용치를
+통과하면서 충분히 빠른 경로만 선택합니다. 따라서 GPU가 존재하더라도 CPU가 더 빠르면
+프리뷰와 최종 렌더의 remap은 CPU를 유지합니다. `VPSTITCH_REMAP_BACKEND=cpu|opencl|auto`
+환경변수로 진단용 강제 선택도 가능하지만 기본값은 `auto`입니다.
 
 15K~20K 출력, OCIO 또는 optical flow를 사용하면 Apple Silicon에서도 CPU·메모리·SSD
 부하가 크게 걸리는 정상적인 오프라인 렌더입니다. 현재는 타일 처리, 디스크 기반 투영
 맵 재사용, decoder frame-buffer 재사용, bounded 메모리, TC/트림 시작점의 정확한
-frame-index trim이 적용되어 있습니다.
+frame-index trim이 적용되어 있습니다. 동기화된 입력 프레임 한 묶음이 256 MiB 이하일
+때만 한 프레임 선읽기를 사용하며, 그보다 큰 고해상도 촬영본은 zero-copy 순차 경로로
+자동 전환합니다. FFmpeg 오류 출력은 256 KiB 링버퍼로 계속 배출해 장시간 렌더의 파이프
+정체를 방지합니다.
 가장 큰 속도 개선은 `flow.enabled=false`로 먼저 렌더하고, 반복 작업에서는 동일한
 projection cache를 유지하며, 프리뷰를 작은 canvas로 확인한 뒤 마스터를 렌더하는 것입니다.
-VideoToolbox/D3D11VA는 16-bit/float 처리 품질과 코덱 지원이 장비마다 달라 자동으로
-강제하지 않습니다.
+임포트 프록시는 macOS에서 VideoToolbox, Windows에서 NVENC/QSV/AMF를 가용 순서대로
+시도하고 초기화가 실패하면 자동으로 `libx264`로 되돌아갑니다. 이 경로는 저해상도
+8-bit 재생 프록시에만 적용되며 10/12-bit 마스터 렌더 품질에는 영향을 주지 않습니다.
 
 ## 품질 원칙
 
@@ -221,19 +282,31 @@ timecode를 읽습니다. 가장 늦게 시작한 플레이트를 공통 시작�
 
 ## 프록시 플레이백과 렌더 큐
 
-`RIG ALIGN`은 선택한 대표 프레임에서 카메라 회전을 한 번 계산하고, 최종 영상은 그
+`AUTO STITCH`는 선택한 대표 프레임에서 카메라 회전을 한 번 계산하고, 최종 영상은 그
 고정 투영 맵을 모든 프레임에 재사용합니다. 프록시 플레이백 역시 같은 맵을 사용하지만
-원본을 약 1280px로 디코드하고 optical flow를 끈 8-bit H.264 검수 프록시이므로 최종
-10/12-bit 마스터 품질에는 영향을 주지 않습니다. TC 정렬 또는 스티칭 프리뷰 직후
-백그라운드에서 미리 생성하며 이후에는 일반 플레이어처럼 재생·정지·스크럽합니다.
+원본을 약 960px로 디코드하고 optical flow를 끈 8-bit H.264 검수 프록시이므로 최종
+10/12-bit 마스터 품질에는 영향을 주지 않습니다. TC Align 직후 전체 선택 구간을 미리
+생성하며, 스티치·컬러·캔버스·IN/OUT 값이 바뀌면 마지막 대표 프레임 갱신을 우선하고
+새 설정의 프록시를 한 번만 다시 만듭니다. 투영 맵은 고정 재사용하지만 영상 픽셀은 각
+프레임마다 decode/warp/blend/encode해야 하므로 최초 캐시 준비 시간 자체는 필요합니다.
 
-Render Queue의 각 행은 하나의 타임라인 스냅숏입니다. 소스 경로, TC 정렬, IN/OUT,
-카메라 보정, 캔버스, OCIO, 코덱과 출력 경로를 독립 저장합니다. 현재 프로젝트 설정은
+최종 영상 렌더는 숨겨진 staging 경로에 먼저 완성한 뒤 검증된 파일이나 시퀀스 폴더만
+사용자가 지정한 이름으로 원자적으로 이동합니다. 실패·취소 시 불완전한 결과가 최종
+파일명으로 남지 않으며 Render Queue 상태도 최종 이동이 끝난 뒤에만 DONE이 됩니다.
+
+Render Queue의 각 행은 사진 스냅숏이 아니라 타임라인의 `Settings lock`입니다. 소스 경로,
+소스 순서, 정확한 FPS, TC 정렬, IN/OUT, 카메라 보정, 캔버스, OCIO, 코덱과 출력 경로를
+큐 등록 순간에 독립 저장합니다. 기본 `Match each plate set` 정책은 각 타임라인의 플레이트
+FPS를 감지해 23.976과 24.000을 구분하며, 같은 플레이트 세트 안의 FPS가 섞이면 큐 등록을
+막습니다. 의도적인 변환만 타임라인 설정의 `Custom conform`으로 지정할 수 있습니다.
+현재 프로젝트 설정은
 다음에 임포트하는 테이크의 기본값으로 이어지고, 큐의 타임라인을 `LOAD`하면 해당
-스냅숏을 다시 열어 개별 설정을 덮어쓸 수 있습니다. 큐 상태는 사용자 데이터 폴더의
+Settings lock을 다시 열어 새 작업으로 수정할 수 있습니다. 큐 상태는 사용자 데이터 폴더의
 `render-queue.json`에 원자적으로 저장되며 앱이 렌더 도중 종료되면 해당 작업은 다음
 실행에서 `QUEUED`로 복구됩니다. 동일한 리그/캔버스의 작업들은 projection-map 캐시를
-공유합니다.
+공유합니다. 큐 등록 시 설정에는 `Settings lock` 해시가 붙습니다. 이후 다른 타임라인이나
+현재 UI 값을 변경해도 이미 등록된 작업은 바뀌지 않으며, 렌더 직전 생성된 전체 해상도
+설정 JSON이 잠긴 설정과 완전히 같은지 다시 검증한 뒤에만 렌더를 시작합니다.
 
 CLI에서 정렬 계획만 JSON으로 확인할 수도 있습니다.
 
@@ -374,7 +447,12 @@ OCIO 출력이 ACEScg 같은 scene-linear 공간이라면 `exr-half-sequence`를
     "mode": "ocio",
     "ocio_config": "vpstitch://aces-studio-v4.0.0",
     "working_space": "ACEScg",
-    "output_space": "Gamma 2.4 Encoded Rec.709",
+    "output_mode": "display_view",
+    "display": "Rec.2100-PQ - Display",
+    "view": "ACES 2.0 - HDR 1000 nits (Rec.2020)",
+    "match_enabled": true,
+    "match_reference": "cam0",
+    "match_strength": 1.0,
     "integer_dither": true
   }
 }
@@ -393,6 +471,27 @@ macOS/Windows 패키지 내부의 실제 `.ocio` 파일로 해석합니다. 따�
 않습니다. `USE BUNDLED ACES 2.0 / REC.709` 버튼은
 `Camera Rec.709 → ACEScg → Gamma 2.4 Encoded Rec.709` 작업 설정을 채웁니다.
 프로젝트의 실제 입력 인코딩과 납품 색공간에 맞게 이름을 변경할 수 있습니다.
+
+`CAMERA MATCH`는 입력을 ACEScg 같은 scene-linear 작업공간으로 변환한 뒤 카메라 중첩부의
+색도 차이만 robust하게 계산합니다. 기준 카메라는 gain 1.0으로 고정하고 나머지 카메라의
+RGB gain은 밝기가 변하지 않도록 정규화합니다. 따라서 같은 매치값을 Rec.2100 PQ 1000 nit,
+P3-D65 PQ 1000 nit, Rec.709 또는 V-Log 납품에 재사용할 수 있습니다. 단, 입력 컬러스페이스나
+Working Space를 바꾸면 기존 매치값은 자동으로 해제되며 새 Quick Preview에서 다시 MATCH해야
+합니다. 카메라별 노출 차이까지 자동 보정하지는 않습니다.
+
+HDR 마스터는 `Delivery method: Display transform`에서 `P3-D65 PQ` 또는
+`Rec.2020 PQ`와 ACES 2.0 1000 nit View를 선택합니다. P3-PQ/Rec.2020-PQ 출력은
+FFmpeg primaries/transfer/matrix 메타데이터도 함께 설정됩니다. `Apple Display P3 HDR`은
+Apple EDR/sRGB-piecewise 모니터 인코딩이며 ST2084/PQ 파일 납품이 아닙니다. V-Log처럼
+scene/log 인코딩을 내보낼 때는 `Delivery method: Color space / Log`에서 맨 위에 배치된
+`V-Log V-Gamut`을 선택합니다.
+
+`COLOR > Viewer monitor`는 로컬 검수 화면에만 적용됩니다. 일반 SDR 모니터에서는
+`Standard Rec.709`를 사용합니다. 내부 ACES 변환은 표준 SDR 기준 ODT를 사용하지만 UI에서는
+모니터의 별도 nit 프로파일을 요구하지 않습니다.
+최종 Delivery가 P3-PQ/Rec.2020-PQ 1000 nits 또는 V-Log여도 Quick Preview와 재생 프록시만
+선택한 SDR 모니터 변환을 사용합니다. Viewer 설정은 최종 렌더 config와 Render Queue의
+Settings lock에 기록되지 않으므로 이미 큐에 넣은 납품 컬러스페이스를 바꾸지 않습니다.
 
 ```powershell
 .\.venv\Scripts\vpstitch.exe list-ocio-spaces `

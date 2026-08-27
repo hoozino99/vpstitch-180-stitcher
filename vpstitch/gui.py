@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import difflib
 import hashlib
 import json
 import os
@@ -9,12 +10,15 @@ import shutil
 import sys
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import (
     QCoreApplication,
+    QObject,
+    QPointF,
     QProcess,
     QSettings,
     QSize,
@@ -31,15 +35,19 @@ from PySide6.QtGui import (
     QFont,
     QImage,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPixmap,
+    QPen,
     QShortcut,
+    QWheelEvent,
 )
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -79,13 +87,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .ffmpegio import probe_video
 from .imageio import read_image
+from .interactive import InteractivePreviewRenderer
+from .autostitch import (
+    apply_auto_stitch_solution,
+    prepare_auto_stitch_config,
+    update_fine_tune_metadata,
+)
 
 from .canvas import recommend_full_plate_canvas
-from .color import BUNDLED_ACES_STUDIO_ID
-from .config import MAX_CANVAS_HEIGHT, MAX_CANVAS_WIDTH, load_config as parse_config
+from .color import BUNDLED_ACES_STUDIO_ID, load_ocio_config
+from .config import (
+    MAX_CANVAS_HEIGHT,
+    MAX_CANVAS_WIDTH,
+    load_config as parse_config,
+    repair_legacy_p3_pq_target,
+)
 from .project import (
     Bin,
+    MediaCacheStatus,
+    MediaRecord,
     PlaybackCacheStatus,
     ProjectError,
     ProjectStore,
@@ -93,12 +115,36 @@ from .project import (
     TimelineRecord,
 )
 from .renderqueue import RenderJob, RenderQueueError, RenderQueueStore, RenderStatus
+from .sourcecache import (
+    SourceProxyCommand,
+    SourceProxyPlan,
+    finalize_source_proxy,
+    plan_source_proxy,
+    source_proxy_commands,
+    source_proxy_ready,
+)
+from .liveplayback import AlignedFramePlan, LivePlaybackSession
 
 
 APP_NAME = "VP Stitch"
 BUILTIN_ACES_STUDIO = BUNDLED_ACES_STUDIO_ID
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
+AUTOSAVE_INTERVAL_MS = 10 * 60 * 1000
+FPS_MODE_MATCH_SOURCE = "match_source"
+FPS_MODE_CUSTOM = "custom"
+FPS_MATCH_TOLERANCE = 0.001
+STANDARD_FRAME_RATES = (
+    24_000 / 1_001,
+    24.0,
+    25.0,
+    30_000 / 1_001,
+    30.0,
+    48.0,
+    50.0,
+    60_000 / 1_001,
+    60.0,
+)
 PLATE_NUMBERS_BY_COUNT = {
     3: (6, 7, 8),
     5: (1, 2, 3, 4, 5),
@@ -111,6 +157,34 @@ GUI_MASTER_BIT_DEPTHS = {
     "hevc-444-10": 10,
     "dpx12-sequence": 12,
 }
+GUI_MASTER_CODEC_OPTIONS = (
+    ("ProRes HQ · 10-bit 4:2:2", "prores-hq"),
+    ("DPX · 12-bit RGB sequence", "dpx12-sequence"),
+    ("H.264 MP4 · 10-bit 4:2:0", "h264-mp4-10"),
+    ("ProRes 4444 · 10-bit YUV", "prores-4444"),
+    ("HEVC · 10-bit 4:4:4", "hevc-444-10"),
+)
+GUI_MASTER_CODEC_LABELS = {
+    value: label for label, value in GUI_MASTER_CODEC_OPTIONS
+}
+QUEUE_CODEC_LABELS = {
+    "prores-hq": "PRORES HQ 10b",
+    "dpx12-sequence": "DPX 12b",
+    "h264-mp4-10": "H.264 MP4 10b",
+    "prores-4444": "PRORES 4444 10b",
+    "hevc-444-10": "HEVC 444 10b",
+}
+OUTPUT_SUFFIX_BY_CODEC = {
+    "ffv1-16": ".mkv",
+    "exr-half-sequence": "",
+    "prores-hq": ".mov",
+    "prores-4444": ".mov",
+    "h264-mp4-10": ".mp4",
+    "h264-proxy": ".mp4",
+    "hevc-444-10": ".mkv",
+    "dpx12-sequence": "",
+}
+KNOWN_OUTPUT_SUFFIXES = (".mov", ".mp4", ".mkv", ".dpx", ".exr")
 INPUT_COLOR_SPACES = (
     ("Auto", None),
     ("Rec.709", "bt709"),
@@ -122,6 +196,170 @@ INPUT_VIDEO_RANGES = (
     ("Video (Limited)", "tv"),
     ("Full", "pc"),
 )
+VIEWER_MONITOR_TRANSFORMS = {
+    "sdr-rec709": (
+        "Standard Rec.709",
+        "sRGB - Display",
+        "ACES 2.0 - SDR 100 nits (Rec.709)",
+    ),
+}
+
+DELIVERY_DISPLAY_LABELS = {
+    "sRGB - Display": "Rec.709 SDR",
+    "ST2084-P3-D65 - Display": "P3-D65 PQ",
+    "Rec.2100-PQ - Display": "Rec.2020 PQ",
+    "Rec.2100-HLG - Display": "Rec.2020 HLG",
+    "Display P3 HDR - Display": "Apple Display P3 HDR · EDR, not PQ",
+}
+DELIVERY_DISPLAY_PRIORITY = tuple(DELIVERY_DISPLAY_LABELS)
+PREFERRED_OUTPUT_COLOR_SPACES = (
+    "V-Log V-Gamut",
+    "Gamma 2.4 Encoded Rec.709",
+    "Gamma 2.2 Encoded Rec.709",
+    "ACEScct",
+    "ACES2065-1",
+)
+
+
+def _ordered_output_spaces(spaces: tuple[str, ...]) -> tuple[str, ...]:
+    preferred = tuple(value for value in PREFERRED_OUTPUT_COLOR_SPACES if value in spaces)
+    return preferred + tuple(value for value in spaces if value not in preferred)
+
+
+def _delivery_display_value(combo: QComboBox) -> str:
+    return str(combo.currentData() or combo.currentText()).strip()
+
+
+def _populate_delivery_display_combo(
+    combo: QComboBox,
+    displays: tuple[str, ...],
+    current: str,
+) -> str:
+    ordered = tuple(value for value in DELIVERY_DISPLAY_PRIORITY if value in displays)
+    ordered += tuple(value for value in displays if value not in ordered)
+    resolved = _resolve_ocio_choice(ordered, current, DELIVERY_DISPLAY_PRIORITY)
+    combo.blockSignals(True)
+    combo.clear()
+    for value in ordered:
+        combo.addItem(DELIVERY_DISPLAY_LABELS.get(value, value), value)
+    combo.setCurrentIndex(max(0, combo.findData(resolved)))
+    combo.blockSignals(False)
+    return resolved
+
+
+def _display_view_video_tags(display: str, view: str) -> dict[str, str]:
+    """Return file metadata for known display encodings, never for monitor-only EDR."""
+    display_key = display.casefold()
+    view_key = view.casefold()
+    is_pq = "st2084" in display_key or "rec.2100-pq" in display_key
+    is_hlg = "rec.2100-hlg" in display_key
+    if is_pq or is_hlg:
+        if "rec.2020" in view_key:
+            primaries = "bt2020"
+        elif "p3" in view_key:
+            primaries = "smpte432"
+        else:
+            primaries = "smpte432" if "p3" in display_key else "bt2020"
+        return {
+            "color_primaries": primaries,
+            "color_trc": "arib-std-b67" if is_hlg else "smpte2084",
+            "colorspace": "bt2020nc",
+            "color_range": "tv",
+        }
+    if "sdr" in view_key or "rec.709" in view_key or display == "sRGB - Display":
+        return {
+            "color_primaries": "bt709",
+            "color_trc": "bt709",
+            "colorspace": "bt709",
+            "color_range": "tv",
+        }
+    return {}
+
+
+def _canonical_frame_rate(value: float) -> float:
+    """Keep common fractional rates exact while preserving unusual source rates."""
+
+    fps = float(value)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError("source frame rate must be positive")
+    return min(STANDARD_FRAME_RATES, key=lambda candidate: abs(candidate - fps)) \
+        if min(abs(candidate - fps) for candidate in STANDARD_FRAME_RATES) <= 0.001 \
+        else fps
+
+
+def _format_frame_rate(value: object) -> str:
+    try:
+        fps = _canonical_frame_rate(float(value))
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if abs(fps - round(fps)) <= 1e-6:
+        return f"{fps:.3f}"
+    return f"{fps:.3f}"
+
+
+def _matching_source_frame_rate(probes: list[dict[str, object]]) -> float | None:
+    rates = [
+        _canonical_frame_rate(float(probe["fps"]))
+        for probe in probes
+        if probe.get("fps") is not None
+    ]
+    if not rates:
+        return None
+    reference = rates[0]
+    mismatches = [rate for rate in rates[1:] if abs(rate - reference) > FPS_MATCH_TOLERANCE]
+    if mismatches:
+        values = ", ".join(_format_frame_rate(rate) for rate in rates)
+        raise ValueError(f"Plate frame rates do not match: {values}")
+    return reference
+
+
+def _frame_rate_mode(config: dict[str, object]) -> str:
+    metadata = config.get("_vpstitch")
+    if not isinstance(metadata, dict):
+        return FPS_MODE_MATCH_SOURCE
+    value = str(metadata.get("fps_mode") or FPS_MODE_MATCH_SOURCE)
+    return value if value in {FPS_MODE_MATCH_SOURCE, FPS_MODE_CUSTOM} else FPS_MODE_MATCH_SOURCE
+
+
+def resolved_render_output(
+    folder: str | Path,
+    base_name: str,
+    codec: str,
+) -> Path:
+    """Return one canonical output path from a folder, name, and codec."""
+    folder_text = str(folder).strip()
+    if not folder_text:
+        raise ValueError("Choose an output folder")
+    directory = Path(folder_text).expanduser()
+    name = str(base_name).strip()
+    if not name or name in {".", ".."}:
+        raise ValueError("Enter an output name")
+    if "/" in name or "\\" in name:
+        raise ValueError("Output name cannot contain folder separators")
+    if codec not in OUTPUT_SUFFIX_BY_CODEC:
+        raise ValueError(f"Unsupported output codec: {codec}")
+    lowered = name.lower()
+    removed = True
+    while removed:
+        removed = False
+        for suffix in KNOWN_OUTPUT_SUFFIXES:
+            if lowered.endswith(suffix):
+                name = name[: -len(suffix)].rstrip(" .")
+                lowered = name.lower()
+                removed = True
+                break
+    if not name:
+        raise ValueError("Enter an output name")
+    return directory / f"{name}{OUTPUT_SUFFIX_BY_CODEC[codec]}"
+
+
+def split_render_output(path: str | Path, codec: str) -> tuple[Path, str]:
+    output = Path(path)
+    suffix = OUTPUT_SUFFIX_BY_CODEC.get(codec, "")
+    name = output.name
+    if suffix and name.lower().endswith(suffix):
+        name = name[: -len(suffix)]
+    return output.parent, name
 _EXPLICIT_PLATE_NUMBER = re.compile(
     r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-8])(?=$|[^0-9])",
     re.IGNORECASE,
@@ -165,6 +403,46 @@ def order_camera_plates(paths: list[str]) -> tuple[list[str], list[int] | None]:
     return [path for _, path in ordered], [number for number, _ in ordered]
 
 
+def suggest_camera_assignment(
+    paths: list[str], camera_count: int
+) -> tuple[list[str], bool]:
+    """Return a deterministic slot order and whether operator confirmation is needed."""
+    if camera_count not in SUPPORTED_CAMERA_COUNTS or len(paths) != camera_count:
+        raise ValueError(f"Select exactly {camera_count} clips for this timeline")
+    expected = PLATE_NUMBERS_BY_COUNT[camera_count]
+    detected = [plate_number(path) for path in paths]
+    if sorted(number for number in detected if number is not None) == list(expected) and all(
+        number is not None for number in detected
+    ):
+        ordered = [
+            path
+            for _number, path in sorted(
+                zip((int(number) for number in detected), paths, strict=True),
+                key=lambda item: item[0],
+            )
+        ]
+        return ordered, False
+
+    slots: list[str | None] = [None] * camera_count
+    used: set[str] = set()
+    for path, number in zip(paths, detected, strict=True):
+        if number not in expected:
+            continue
+        index = expected.index(int(number))
+        if slots[index] is None:
+            slots[index] = path
+            used.add(path)
+    remaining = sorted(
+        (path for path in paths if path not in used),
+        key=lambda value: [
+            int(token) if token.isdigit() else token.casefold()
+            for token in re.split(r"(\d+)", Path(value).name)
+        ],
+    )
+    iterator = iter(remaining)
+    return [value if value is not None else next(iterator) for value in slots], True
+
+
 def _runtime_root() -> Path:
     """Return the directory that contains bundled read-only resources."""
     if getattr(sys, "frozen", False):
@@ -187,8 +465,126 @@ def preview_dimensions(
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
+def ocio_space_names(identifier: str) -> tuple[str, ...]:
+    """Return every named color space exposed by an OCIO config."""
+    config = load_ocio_config(identifier)
+    return tuple(str(name) for name in config.getColorSpaceNames())
+
+
+def ocio_display_views(identifier: str) -> dict[str, tuple[str, ...]]:
+    """Return every display and its views exposed by an OCIO config."""
+    config = load_ocio_config(identifier)
+    return {
+        str(display): tuple(str(view) for view in config.getViews(display))
+        for display in config.getDisplays()
+    }
+
+
+def _populate_combo(combo: QComboBox, values: tuple[str, ...], current: str) -> None:
+    requested = current.strip()
+    resolved = _resolve_ocio_choice(values, requested)
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItems(list(values))
+    index = combo.findText(resolved, Qt.MatchFlag.MatchExactly)
+    combo.setCurrentIndex(index if index >= 0 else (0 if values else -1))
+    combo.setProperty(
+        "recoveredFrom",
+        requested if requested and resolved and requested != resolved else "",
+    )
+    combo.blockSignals(False)
+
+
+def _resolve_ocio_choice(
+    values: tuple[str, ...],
+    requested: str,
+    preferred: tuple[str, ...] = (),
+) -> str:
+    """Resolve a saved OCIO value without letting free-text typos reach renders."""
+    if not values:
+        return ""
+    candidate = requested.strip()
+    if candidate in values:
+        return candidate
+    casefolded = {value.casefold(): value for value in values}
+    if candidate.casefold() in casefolded:
+        return casefolded[candidate.casefold()]
+    if candidate:
+        close = difflib.get_close_matches(candidate, values, n=1, cutoff=0.72)
+        if close:
+            return close[0]
+    for fallback in preferred:
+        if fallback in values:
+            return fallback
+    return values[0]
+
+
+def _new_ocio_space_combo(current: str = "", *, output: bool = False) -> QComboBox:
+    combo = ChevronComboBox()
+    combo.setEditable(False)
+    combo.setMaxVisibleItems(18)
+    combo.setMinimumContentsLength(18)
+    combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    combo.setProperty("ocioRequested", current.strip())
+    combo.setProperty("ocioPreferred", [current.strip()] if current.strip() else [])
+    combo.setProperty("ocioOutput", output)
+    combo.setToolTip("Select a color space read from the active OCIO config")
+    return combo
+
+
+def _request_ocio_combo_value(combo: QComboBox, value: str) -> None:
+    requested = value.strip()
+    combo.setProperty("ocioRequested", requested)
+    index = combo.findText(requested, Qt.MatchFlag.MatchExactly)
+    if index >= 0:
+        combo.setCurrentIndex(index)
+
+
+def _populate_ocio_combo(
+    combo: QComboBox,
+    spaces: tuple[str, ...],
+    current: str,
+) -> str:
+    if bool(combo.property("ocioOutput")):
+        spaces = _ordered_output_spaces(spaces)
+    requested = current.strip() or str(combo.property("ocioRequested") or "").strip()
+    preferred_value = combo.property("ocioPreferred")
+    preferred = (
+        tuple(str(value) for value in preferred_value)
+        if isinstance(preferred_value, list)
+        else ()
+    )
+    resolved = _resolve_ocio_choice(spaces, requested, preferred)
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItems(list(spaces))
+    index = combo.findText(resolved, Qt.MatchFlag.MatchExactly)
+    combo.setCurrentIndex(index if index >= 0 else -1)
+    combo.setProperty("ocioRequested", resolved)
+    combo.setProperty(
+        "recoveredFrom",
+        requested if requested and resolved and requested != resolved else "",
+    )
+    combo.blockSignals(False)
+    return resolved
+
+
+def _load_ocio_combo_group(identifier: str, combos: tuple[QComboBox, ...]) -> int:
+    spaces = ocio_space_names(identifier)
+    if not spaces:
+        raise ValueError("config contains no named color spaces")
+    for combo in combos:
+        requested = combo.currentText().strip() or str(
+            combo.property("ocioRequested") or ""
+        ).strip()
+        _populate_ocio_combo(combo, spaces, requested)
+    return len(spaces)
+
+
 def _stabilize_macos_accessibility_bridge() -> bool:
-    """Suppress Qt's unstable Cocoa child hierarchy during AX enumeration."""
+    """Expose a minimal safe Cocoa AX element without entering Qt's hierarchy."""
     global _MACOS_AX_SHIM
     if sys.platform != "darwin" or os.environ.get("VPSTITCH_ENABLE_ACCESSIBILITY") == "1":
         return False
@@ -202,11 +598,24 @@ def _stabilize_macos_accessibility_bridge() -> bool:
         if shim_path is None:
             return False
         shim = ctypes.CDLL(str(shim_path))
-        shim.vpstitch_no_accessible_children.argtypes = [
+        shim.vpstitch_empty_accessible_children.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
         ]
-        shim.vpstitch_no_accessible_children.restype = ctypes.c_void_p
+        shim.vpstitch_empty_accessible_children.restype = ctypes.c_void_p
+        shim.vpstitch_safe_accessibility_attribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        shim.vpstitch_safe_accessibility_attribute.restype = ctypes.c_void_p
+        shim.vpstitch_safe_accessibility_hit_test.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_double,
+            ctypes.c_double,
+        ]
+        shim.vpstitch_safe_accessibility_hit_test.restype = ctypes.c_void_p
         objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
         objc.objc_getClass.argtypes = [ctypes.c_char_p]
         objc.objc_getClass.restype = ctypes.c_void_p
@@ -227,15 +636,39 @@ def _stabilize_macos_accessibility_bridge() -> bool:
         if not qns_view:
             return False
 
-        selector = objc.sel_registerName(b"accessibilityChildren")
-        method = objc.class_getInstanceMethod(qns_view, selector)
-        encoding = objc.method_getTypeEncoding(method) if method else b"@@:"
-        objc.class_replaceMethod(
-            qns_view,
-            selector,
-            ctypes.cast(shim.vpstitch_no_accessible_children, ctypes.c_void_p),
-            encoding,
+        replacements = (
+            (
+                b"accessibilityChildren",
+                shim.vpstitch_empty_accessible_children,
+                b"@@:",
+            ),
+            # QNSView's legacy entry point builds Qt child interfaces. Crash
+            # reports show stale QAccessible children being dereferenced there.
+            # The shim supplies stable role/title/geometry values and an empty
+            # child list instead of returning nil for every AX attribute.
+            (
+                b"accessibilityAttributeValue:",
+                shim.vpstitch_safe_accessibility_attribute,
+                b"@@:@",
+            ),
+            (
+                b"accessibilityHitTest:",
+                shim.vpstitch_safe_accessibility_hit_test,
+                b"@@:{CGPoint=dd}",
+            ),
         )
+        for selector_name, replacement, fallback_encoding in replacements:
+            selector = objc.sel_registerName(selector_name)
+            method = objc.class_getInstanceMethod(qns_view, selector)
+            encoding = (
+                objc.method_getTypeEncoding(method) if method else fallback_encoding
+            )
+            objc.class_replaceMethod(
+                qns_view,
+                selector,
+                ctypes.cast(replacement, ctypes.c_void_p),
+                encoding,
+            )
         _MACOS_AX_SHIM = shim
         return True
     except (AttributeError, OSError, TypeError, ValueError):
@@ -257,6 +690,10 @@ def _display_image(array: np.ndarray) -> QImage:
     rgb8 = np.ascontiguousarray(rgb8)
     height, width, _ = rgb8.shape
     return QImage(rgb8.data, width, height, rgb8.strides[0], QImage.Format.Format_RGB888).copy()
+
+
+class _InteractivePreviewSignals(QObject):
+    finished = Signal(int, object, str)
 
 
 _PREVIEW_KEY_COMMANDS = {
@@ -292,6 +729,93 @@ class PlaybackVideoWidget(QVideoWidget):
         super().keyPressEvent(event)
 
 
+class FullscreenPreviewLabel(QLabel):
+    """Scale a preview from its original pixmap whenever the screen size changes."""
+
+    def __init__(self, source: QPixmap) -> None:
+        super().__init__()
+        self._source = QPixmap(source)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Ignored,
+        )
+
+    def set_source(self, source: QPixmap) -> None:
+        self._source = QPixmap(source)
+        if not self._source.isNull() and not self.size().isEmpty():
+            self.setPixmap(
+                self._source.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        if not self._source.isNull() and not self.size().isEmpty():
+            self.setPixmap(
+                self._source.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+
+class ScrubbableDoubleSpinBox(QDoubleSpinBox):
+    """Numeric field with vertical drag scrubbing and Shift precision."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._drag_last_y: float | None = None
+        self._dragging = False
+        self.setAccelerated(False)
+
+    def _drag_increment(
+        self,
+        pixels: float,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+    ) -> float:
+        precision = 0.1 if modifiers & Qt.KeyboardModifier.ShiftModifier else 1.0
+        return pixels * self.singleStep() * precision / 4.0
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_last_y = event.globalPosition().y()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._drag_last_y is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            current_y = event.globalPosition().y()
+            delta = self._drag_last_y - current_y
+            if self._dragging or abs(delta) >= 2.0:
+                self._dragging = True
+                self._drag_last_y = current_y
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+                self.setValue(
+                    self.value() + self._drag_increment(delta, event.modifiers())
+                )
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        dragged = self._dragging
+        self._drag_last_y = None
+        self._dragging = False
+        self.unsetCursor()
+        if dragged and event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class PreviewView(QGraphicsView):
     commandRequested = Signal(str)
 
@@ -301,13 +825,13 @@ class PreviewView(QGraphicsView):
         self._item: QGraphicsPixmapItem | None = None
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self.setBackgroundBrush(QColor("#090c11"))
+        self.setBackgroundBrush(QColor("#08090a"))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._empty = QLabel("P06–P08 또는 P01–P05를 넣고  PREVIEW  를 누르세요")
+        self._empty = QLabel("P06–P08 또는 P01–P05를 넣고 QUICK PREVIEW를 누르세요")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty.setStyleSheet("color:#7e8793; font-size:13px; letter-spacing:.5px;")
+        self._empty.setStyleSheet("color:#8a8f98; font-size:13px; letter-spacing:.5px;")
         self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._empty.setParent(self.viewport())
 
@@ -335,6 +859,11 @@ class PreviewView(QGraphicsView):
         self.scene().setSceneRect(self._item.boundingRect())
         self._empty.hide()
         self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def current_pixmap(self) -> QPixmap | None:
+        if self._item is None:
+            return None
+        return QPixmap(self._item.pixmap())
 
     def show_message(self, message: str) -> None:
         self.scene().clear()
@@ -410,14 +939,14 @@ class TrimRangeBar(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         left, right, center = self._track_bounds()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#30363f") if self.isEnabled() else QColor("#292e35"))
+        painter.setBrush(QColor("#34343a") if self.isEnabled() else QColor("#23252a"))
         painter.drawRoundedRect(left, center - 5.0, right - left, 10.0, 5.0, 5.0)
         lower_x = self._position(self._lower)
         upper_x = self._position(self._upper)
-        painter.setBrush(QColor("#55516f") if self.isEnabled() else QColor("#3e3d49"))
+        painter.setBrush(QColor("#5e6ad2") if self.isEnabled() else QColor("#34343a"))
         painter.drawRoundedRect(lower_x, center - 6.0, upper_x - lower_x, 12.0, 5.0, 5.0)
         for position in (lower_x, upper_x):
-            painter.setBrush(QColor("#9b96b8") if self.isEnabled() else QColor("#5d626b"))
+            painter.setBrush(QColor("#7170ff") if self.isEnabled() else QColor("#62666d"))
             painter.drawRoundedRect(position - 4.0, center - 14.0, 8.0, 28.0, 3.0, 3.0)
         playhead_x = self._position(self._playhead)
         painter.setPen(QColor("#f0eef7") if self.isEnabled() else QColor("#707680"))
@@ -563,10 +1092,10 @@ class InputSettingsDialog(QDialog):
         interpretation = QFormLayout()
         interpretation.setHorizontalSpacing(24)
         interpretation.setVerticalSpacing(8)
-        self.color_space = QComboBox()
+        self.color_space = ChevronComboBox()
         for label, value in INPUT_COLOR_SPACES:
             self.color_space.addItem(label, value)
-        self.video_range = QComboBox()
+        self.video_range = ChevronComboBox()
         for label, value in INPUT_VIDEO_RANGES:
             self.video_range.addItem(label, value)
 
@@ -599,6 +1128,237 @@ class InputSettingsDialog(QDialog):
             "input_color_space": self.color_space.currentData(),
             "input_video_range": self.video_range.currentData(),
         }
+
+
+class NewTimelineDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        default_name: str,
+        suggested_count: int,
+        selected_plate_count: int | None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Plate Set Timeline")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        heading = QLabel("NEW PLATE SET TIMELINE")
+        heading.setProperty("sectionTitle", True)
+        layout.addWidget(heading)
+        intro = QLabel(
+            "Choose the physical camera layout. Numbered files map automatically; other names open a camera-slot assignment step."
+        )
+        intro.setWordWrap(True)
+        intro.setProperty("muted", True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.name = QLineEdit(default_name)
+        self.name.selectAll()
+        form.addRow("Timeline name", self.name)
+        layout.addLayout(form)
+
+        layout_label = QLabel("CAMERA LAYOUT")
+        layout_label.setProperty("sectionTitle", True)
+        layout.addWidget(layout_label)
+        choices = QHBoxLayout()
+        choices.setSpacing(8)
+        self.layout_group = QButtonGroup(self)
+        self.layout_group.setExclusive(True)
+        self.layout_buttons: dict[int, QPushButton] = {}
+        for count, label in (
+            (3, "3 CAM · FRONT\nP06–P08"),
+            (5, "5 CAM · REAR\nP01–P05"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("layoutChoice")
+            button.setCheckable(True)
+            button.setMinimumHeight(62)
+            button.setAccessibleName(
+                f"{count} camera layout, plates "
+                + ("P06 through P08" if count == 3 else "P01 through P05")
+            )
+            self.layout_group.addButton(button, count)
+            self.layout_buttons[count] = button
+            choices.addWidget(button, 1)
+        self.layout_buttons[suggested_count].setChecked(True)
+        layout.addLayout(choices)
+
+        self.add_selected = QCheckBox()
+        self._selected_plate_count = selected_plate_count
+        self.layout_group.idClicked.connect(self._update_selected_media_option)
+        self._update_selected_media_option(suggested_count)
+        layout.addWidget(self.add_selected)
+
+        note = QLabel(
+            "You can replace the set later. Manual assignments stay in the saved timeline order."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        create = buttons.button(QDialogButtonBox.StandardButton.Save)
+        create.setText("CREATE TIMELINE")
+        create.setObjectName("primaryButton")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_selected_media_option(self, count: int) -> None:
+        matches = self._selected_plate_count == count
+        if self._selected_plate_count in SUPPORTED_CAMERA_COUNTS:
+            selected = int(self._selected_plate_count)
+            plate_range = "P06–P08" if selected == 3 else "P01–P05"
+            self.add_selected.setText(
+                f"Add the {selected} selected Media Pool plates ({plate_range}) now"
+            )
+        else:
+            self.add_selected.setText(
+                "Select 3 or 5 Media Pool clips to add them during creation"
+            )
+        self.add_selected.setEnabled(matches)
+        self.add_selected.setChecked(matches)
+
+    def values(self) -> tuple[str, int, bool]:
+        return (
+            self.name.text().strip(),
+            int(self.layout_group.checkedId()),
+            self.add_selected.isChecked(),
+        )
+
+
+class PlateAssignmentDialog(QDialog):
+    """Map arbitrary clip names to the physical camera slots of one timeline."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        paths: list[str],
+        camera_count: int,
+    ) -> None:
+        super().__init__(parent)
+        suggested, _manual = suggest_camera_assignment(paths, camera_count)
+        self.setWindowTitle("Assign Camera Slots")
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading = QLabel("ASSIGN CAMERA SLOTS")
+        heading.setProperty("sectionTitle", True)
+        layout.addWidget(heading)
+        note = QLabel(
+            "Camera numbers were not complete in the filenames. Choose which clip belongs to each physical plate; this order is saved with the timeline."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(7)
+        self.slot_combos: list[QComboBox] = []
+        expected = PLATE_NUMBERS_BY_COUNT[camera_count]
+        for index, plate in enumerate(expected):
+            combo = ChevronComboBox()
+            combo.setObjectName("cameraAssignmentCombo")
+            for path in paths:
+                combo.addItem(Path(path).name, path)
+                combo.setItemData(combo.count() - 1, path, Qt.ItemDataRole.ToolTipRole)
+            selected = combo.findData(suggested[index])
+            combo.setCurrentIndex(max(0, selected))
+            combo.currentIndexChanged.connect(self._update_validation)
+            self.slot_combos.append(combo)
+            form.addRow(f"SLOT {index + 1} · P{plate:02d}", combo)
+        layout.addLayout(form)
+
+        self.validation = QLabel()
+        self.validation.setProperty("muted", True)
+        layout.addWidget(self.validation)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.assign_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if self.assign_button is not None:
+            self.assign_button.setText("ASSIGN TO TIMELINE")
+            self.assign_button.setObjectName("primaryButton")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_validation()
+
+    def _update_validation(self, *_args) -> None:
+        selected = self.values()
+        valid = len(selected) == len(set(selected))
+        self.validation.setText(
+            "Each clip is assigned once."
+            if valid
+            else "Choose a different clip for every camera slot."
+        )
+        if self.assign_button is not None:
+            self.assign_button.setEnabled(valid)
+
+    def values(self) -> list[str]:
+        return [str(combo.currentData()) for combo in self.slot_combos]
+
+
+class ChevronComboBox(QComboBox):
+    """Draw a consistent dropdown chevron instead of relying on native style."""
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().paintEvent(event)
+        center = QPointF(self.width() - 11.0, self.height() / 2.0)
+        color = QColor("#d0d6e0" if self.isEnabled() else "#62666d")
+        pen = QPen(color, 1.6)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(pen)
+        painter.drawLine(
+            QPointF(center.x() - 3.5, center.y() - 1.5),
+            QPointF(center.x(), center.y() + 2.0),
+        )
+        painter.drawLine(
+            QPointF(center.x(), center.y() + 2.0),
+            QPointF(center.x() + 3.5, center.y() - 1.5),
+        )
+
+
+class ScrollableLibraryTree(QTreeWidget):
+    """Use native scrolling first, with a deterministic trackpad/wheel fallback."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        scrollbar = self.verticalScrollBar()
+        before = scrollbar.value()
+        super().wheelEvent(event)
+        if scrollbar.maximum() <= scrollbar.minimum() or scrollbar.value() != before:
+            return
+        pixel_delta = event.pixelDelta().y()
+        angle_delta = event.angleDelta().y()
+        if pixel_delta:
+            distance = -pixel_delta
+        elif angle_delta:
+            distance = int(
+                max(1.0, abs(angle_delta) / 120.0)
+                * max(24, scrollbar.singleStep())
+            )
+            distance = -distance if angle_delta > 0 else distance
+        else:
+            return
+        scrollbar.setValue(scrollbar.value() + distance)
+        event.accept()
 
 
 class SourceTable(QTableWidget):
@@ -659,9 +1419,10 @@ class SourceTable(QTableWidget):
             raise ValueError("camera count exceeds the source table capacity")
         paths = paths or [""] * len(cameras)
         self._active_count = len(cameras)
-        table_height = 34 + len(cameras) * self.verticalHeader().defaultSectionSize()
-        self.setMinimumHeight(table_height)
-        self.setMaximumHeight(table_height)
+        # The surrounding Active Timeline pane is resizable. Let this table
+        # scroll when the pane is compact and reveal every row as it grows.
+        self.setMinimumHeight(118)
+        self.setMaximumHeight(16_777_215)
         for row in range(self.rowCount()):
             active = row < self._active_count
             self.setRowHidden(row, not active)
@@ -728,6 +1489,20 @@ class SourceTable(QTableWidget):
                 self.setItem(row, 0, item)
             item.setText(f"CAM {number}")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+    def set_orientation(
+        self,
+        row: int,
+        yaw: float,
+        pitch: float,
+        roll: float,
+    ) -> None:
+        for column, value in ((5, yaw), (6, pitch), (7, roll)):
+            item = self.item(row, column)
+            if item is None:
+                item = QTableWidgetItem()
+                self.setItem(row, column, item)
+            item.setText(f"{float(value):.9g}")
 
     def clear_timing(self) -> None:
         for row in range(self.camera_count()):
@@ -818,16 +1593,18 @@ class ProjectManagerDialog(QDialog):
         self.setMinimumSize(760, 500)
         self.setStyleSheet(
             """
-            QDialog, QWidget { background:#0d1014; color:#e6e9ee; font-family:'-apple-system','SF Pro Text','Malgun Gothic','Segoe UI'; font-size:11px; }
+            QDialog, QWidget { background:#08090a; color:#f7f8f8; font-family:'Inter Variable','Inter','SF Pro Text','-apple-system','Segoe UI'; font-size:11px; }
             QLabel { background:transparent; }
-            QTreeWidget { background:#15191e; border:1px solid #2a3038; border-radius:4px; }
+            QTreeWidget { background:#0f1011; border:1px solid #23252a; border-radius:8px; }
             QTreeWidget::item { min-height:28px; padding:3px 6px; }
-            QTreeWidget::item:selected { background:#343147; color:#ffffff; }
-            QHeaderView::section { background:#15191e; color:#858d98; border:0; border-bottom:1px solid #2c323a; padding:6px; font-size:9px; font-weight:700; }
-            QLineEdit, QSpinBox { background:#101419; border:1px solid #343b44; border-radius:3px; padding:5px 7px; }
-            QPushButton { background:#20252c; color:#d1d6dd; border:1px solid #373e48; border-radius:3px; padding:6px 10px; font-weight:650; }
-            QPushButton:hover { background:#292f37; border-color:#666f7d; color:#ffffff; }
-            QPushButton#primaryButton { background:#5f5b83; color:#ffffff; border-color:#777199; }
+            QTreeWidget::item:selected { background:#28282c; color:#f7f8f8; }
+            QHeaderView::section { background:#0f1011; color:#8a8f98; border:0; border-bottom:1px solid #23252a; padding:6px; font-size:9px; font-weight:590; }
+            QLineEdit, QSpinBox, QComboBox { background:#191a1b; border:1px solid #34343a; border-radius:6px; padding:5px 7px; }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color:#7170ff; }
+            QPushButton { background:#191a1b; color:#d0d6e0; border:1px solid #23252a; border-radius:6px; padding:6px 10px; font-weight:510; }
+            QPushButton:hover { background:#28282c; border-color:#3e3e44; color:#f7f8f8; }
+            QPushButton#primaryButton { background:#5e6ad2; color:#f7f8f8; border-color:#7170ff; }
+            QPushButton#primaryButton:hover { background:#828fff; }
             """
         )
         self.project_path: Path | None = None
@@ -915,7 +1692,7 @@ class ProjectManagerDialog(QDialog):
     def create_project(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("New VP Stitch Project")
-        dialog.setMinimumWidth(520)
+        dialog.setMinimumWidth(620)
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
         name = QLineEdit("Untitled Project")
@@ -950,11 +1727,86 @@ class ProjectManagerDialog(QDialog):
         height.setValue(5_504)
         ocio = QLineEdit(BUNDLED_ACES_STUDIO_ID)
         ocio.setPlaceholderText("Bundled ACES Studio config · can be changed later")
+        input_space = _new_ocio_space_combo("Camera Rec.709")
+        working_space = _new_ocio_space_combo("ACEScg")
+        output_space = _new_ocio_space_combo("Gamma 2.4 Encoded Rec.709", output=True)
+        output_mode = ChevronComboBox()
+        output_mode.addItem("Color space / Log", "colorspace")
+        output_mode.addItem("Display transform", "display_view")
+        output_display = ChevronComboBox()
+        output_view = ChevronComboBox()
+        output_space_label = QLabel("Output color space")
+        output_display_label = QLabel("Display")
+        output_view_label = QLabel("View")
+        ocio_spaces_status = QLabel()
+        ocio_spaces_status.setProperty("muted", True)
+        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces.setObjectName("secondaryButton")
+        ocio_row = QWidget()
+        ocio_layout = QHBoxLayout(ocio_row)
+        ocio_layout.setContentsMargins(0, 0, 0, 0)
+        ocio_layout.addWidget(ocio)
+        ocio_layout.addWidget(load_spaces)
+        for field in (ocio, input_space, working_space, output_space):
+            field.setMinimumWidth(320)
+
+        def reload_spaces() -> None:
+            try:
+                count = _load_ocio_combo_group(
+                    ocio.text().strip(),
+                    (input_space, working_space, output_space),
+                )
+                displays = ocio_display_views(ocio.text().strip())
+                _populate_delivery_display_combo(
+                    output_display,
+                    tuple(displays),
+                    _delivery_display_value(output_display),
+                )
+                _populate_combo(
+                    output_view,
+                    displays.get(_delivery_display_value(output_display), ()),
+                    output_view.currentText(),
+                )
+                ocio_spaces_status.setText(f"{count} OCIO spaces loaded")
+            except Exception as error:
+                ocio_spaces_status.setText(f"Could not read OCIO config · {error}")
+
+        load_spaces.clicked.connect(reload_spaces)
+        ocio.editingFinished.connect(reload_spaces)
+        output_display.currentIndexChanged.connect(
+            lambda _index: _populate_combo(
+                output_view,
+                ocio_display_views(ocio.text().strip()).get(
+                    _delivery_display_value(output_display), ()
+                ),
+                "",
+            )
+        )
+
+        def update_delivery() -> None:
+            hdr = output_mode.currentData() == "display_view"
+            output_space.setVisible(not hdr)
+            output_space_label.setVisible(not hdr)
+            output_display.setVisible(hdr)
+            output_display_label.setVisible(hdr)
+            output_view.setVisible(hdr)
+            output_view_label.setVisible(hdr)
+
+        output_mode.currentIndexChanged.connect(update_delivery)
+        reload_spaces()
         form.addRow("Project name", name)
         form.addRow("Location", location_row)
         form.addRow("Default canvas width", width)
         form.addRow("Default canvas height", height)
-        form.addRow("Default OCIO", ocio)
+        form.addRow("OCIO config", ocio_row)
+        form.addRow("Input transform", input_space)
+        form.addRow("Working space", working_space)
+        form.addRow("Delivery method", output_mode)
+        form.addRow(output_space_label, output_space)
+        form.addRow(output_display_label, output_display)
+        form.addRow(output_view_label, output_view)
+        form.addRow(ocio_spaces_status)
+        update_delivery()
         layout.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -975,6 +1827,19 @@ class ProjectManagerDialog(QDialog):
         path = Path(location.text()).expanduser() / project_name / "project.json"
         try:
             ocio_value = ocio.text().strip()
+            delivery_mode = str(output_mode.currentData())
+            delivery = (
+                {
+                    "output_mode": "display_view",
+                    "display": _delivery_display_value(output_display),
+                    "view": output_view.currentText().strip(),
+                }
+                if delivery_mode == "display_view"
+                else {
+                    "output_mode": "colorspace",
+                    "output_space": output_space.currentText().strip(),
+                }
+            )
             store = ProjectStore.create(
                 path,
                 name=project_name,
@@ -985,13 +1850,16 @@ class ProjectManagerDialog(QDialog):
                         **(
                             {
                                 "ocio_config": ocio_value,
-                                "working_space": "ACEScg",
-                                "output_space": "Gamma 2.4 Encoded Rec.709",
+                                "working_space": working_space.currentText().strip(),
+                                **delivery,
                             }
                             if ocio_value
                             else {}
                         ),
                     },
+                    "cameras": [
+                        {"colorspace": input_space.currentText().strip()}
+                    ] if ocio_value else [],
                 },
             )
             store.add_bin(Bin.create("Master"))
@@ -1050,9 +1918,13 @@ class MainWindow(QMainWindow):
         self._rig_profiles: dict[int, dict[str, object]] = {}
         self._plate_numbers: list[int] | None = None
         self._source_probes: list[dict[str, object]] | None = None
+        self._source_fps_error: str | None = None
         self._source_overrides: dict[str, dict[str, str | None]] = {}
         self._closing = False
         self._loading_config = False
+        self._loading_plate_controls = False
+        self._selected_camera_row = 0
+        self._plate_reset_cameras: list[dict[str, object]] = []
         self._import_dialog: QFileDialog | None = None
         self._message_box: QMessageBox | None = None
         self._pending_log_lines: list[str] = []
@@ -1060,18 +1932,60 @@ class MainWindow(QMainWindow):
         self._log_flush_timer.setInterval(50)
         self._log_flush_timer.setSingleShot(True)
         self._log_flush_timer.timeout.connect(self._flush_log)
+        self._live_preview_timer = QTimer(self)
+        self._live_preview_timer.setInterval(180)
+        self._live_preview_timer.setSingleShot(True)
+        self._live_preview_timer.timeout.connect(self._run_live_preview)
+        self._live_preview_pending = False
+        self._live_preview_revision = 0
+        self._live_preview_message = "Live preview updated"
+        self._interactive_renderer = InteractivePreviewRenderer()
+        self._interactive_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vpstitch-preview",
+        )
+        self._interactive_future: Future[np.ndarray] | None = None
+        self._interactive_request: (
+            tuple[int, object, list[str], str] | None
+        ) = None
+        self._interactive_signals = _InteractivePreviewSignals(self)
+        self._interactive_signals.finished.connect(
+            self._interactive_preview_finished
+        )
+        self._live_playback_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vpstitch-live-playback",
+        )
+        self._live_playback_signals = _InteractivePreviewSignals(self)
+        self._live_playback_signals.finished.connect(
+            self._live_proxy_frame_finished
+        )
+        self._live_playback_future: Future[object] | None = None
+        self._live_playback_session: LivePlaybackSession | None = None
+        self._live_playback_key: str | None = None
+        self._live_playback_revision = 0
+        self._live_playback_pending: tuple[int, str, bool, int] | None = None
+        self._live_playing = False
+        self._live_direction = 1
+        self._live_close_pending = False
+        self._fullscreen_live_label: FullscreenPreviewLabel | None = None
         self.process: QProcess | None = None
         self._process_success: Callable[[], None] | None = None
         self._process_failure: Callable[[], None] | None = None
+        self._process_interactive = False
+        self._process_task_name = ""
         self._last_reference_dir: Path | None = None
         self._last_reference_config_path: Path | None = None
+        self._reference_frame_index: int | None = None
         self._preview_ready = False
         self._preview_in_progress = False
         self._pending_scrub_frame: int | None = None
         self._playback_path: Path | None = None
         self._playback_key: str | None = None
         self._playback_autostart = False
+        self._pending_playback_request = False
         self._last_auto_output: str | None = None
+        self._updating_output_destination = False
         self._tc_alignment: dict[str, object] | None = None
         self._tc_alignment_path: Path | None = None
         self._timeline_maximum = 1
@@ -1091,11 +2005,29 @@ class MainWindow(QMainWindow):
         self._loading_timeline = False
         self._auto_cache_requested = False
         self._auto_cache_in_progress = False
+        self._playback_cache_cancelled_for_interaction = False
+        self._source_proxy_queue: list[str] = []
+        self._source_proxy_current: tuple[str, SourceProxyPlan] | None = None
+        self._source_proxy_attempts: list[SourceProxyCommand] = []
+        self._source_proxy_backend = "unknown"
+        self._source_proxy_output = bytearray()
+        self._source_proxy_process = QProcess(self)
+        self._source_proxy_process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels
+        )
+        self._source_proxy_process.readyReadStandardOutput.connect(
+            self._read_source_proxy_process
+        )
+        self._source_proxy_process.finished.connect(
+            self._source_proxy_finished
+        )
         self._auto_workflows_enabled = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        self._last_autosave_digest: str | None = None
         self._fullscreen_preview: QDialog | None = None
+        self._fullscreen_video: PlaybackVideoWidget | None = None
         self._reverse_timer = QTimer(self)
         self._reverse_timer.setInterval(42)
-        self._reverse_timer.timeout.connect(lambda: self.step_playback(-1))
+        self._reverse_timer.timeout.connect(self._reverse_tick)
         self.project_store = self._open_project_store(project_path)
         project_directory = self.project_store.path.parent
         self._working_dir = project_directory / "work"
@@ -1114,6 +2046,12 @@ class MainWindow(QMainWindow):
             )
         self._build_ui()
         self._apply_style()
+        self._restore_workspace_layout()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(self._autosave_project_snapshot)
+        if self._auto_workflows_enabled:
+            self._autosave_timer.start()
         initial = Path(str(self.settings.value("lastConfig", "")))
         if not initial.is_file():
             initial = self.project_root / "configs" / "drive_5cam_180.prores-hq.json"
@@ -1125,10 +2063,14 @@ class MainWindow(QMainWindow):
             self.ocio_config.setText(BUNDLED_ACES_STUDIO_ID)
         self._apply_project_defaults()
         self._refresh_media_tree()
+        if self._auto_workflows_enabled:
+            self._queue_source_proxies(list(self.project_store.media))
         self._update_project_header()
         if self._auto_workflows_enabled:
             self._restore_active_timeline()
-        self.statusBar().showMessage("Ready · preview fits within 4K; final render stays full resolution")
+        self.statusBar().showMessage(
+            "Ready · Quick Preview uses one 2K frame; final render stays full resolution"
+        )
 
     def _open_project_store(self, project_path: Path | None) -> ProjectStore:
         testing = bool(os.environ.get("PYTEST_CURRENT_TEST"))
@@ -1181,92 +2123,185 @@ class MainWindow(QMainWindow):
         self.inspector_toggle.setChecked(True)
         self.inspector_toggle.clicked.connect(self._toggle_inspector)
         top_layout.addWidget(self.inspector_toggle)
+        self.inspector_toggle.hide()
         self.jobs_toggle = QPushButton("JOBS")
         self.jobs_toggle.setObjectName("topButton")
         self.jobs_toggle.setCheckable(True)
         self.jobs_toggle.clicked.connect(self._toggle_log)
         top_layout.addWidget(self.jobs_toggle)
+        self.jobs_toggle.hide()
 
         self.source_table = SourceTable()
         self.source_table.itemChanged.connect(self._source_item_changed)
+        self.source_table.itemSelectionChanged.connect(self._source_selection_changed)
         self.source_table.inputSettingsRequested.connect(self._open_input_settings)
         source_group = QFrame()
-        source_group.setObjectName("mediaPanel")
-        source_group.setMinimumWidth(300)
-        source_group.setMaximumWidth(390)
+        source_group.setObjectName("libraryPanel")
+        self.library_panel = source_group
+        source_group.setMinimumWidth(270)
+        source_group.setMaximumWidth(560)
+        source_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
         source_layout = QVBoxLayout(source_group)
-        source_layout.setContentsMargins(12, 10, 12, 10)
-        source_layout.setSpacing(7)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(0)
+
+        self.library_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.library_splitter.setObjectName("librarySplitter")
+        self.library_splitter.setAccessibleName("Resizable library sections")
+        self.library_splitter.setChildrenCollapsible(False)
+        self.library_splitter.setHandleWidth(7)
+
+        self.media_pool_section = QFrame()
+        self.media_pool_section.setObjectName("librarySection")
+        self.media_pool_section.setAccessibleName("Media Pool section")
+        self.media_pool_section.setMinimumHeight(145)
+        media_layout = QVBoxLayout(self.media_pool_section)
+        media_layout.setContentsMargins(11, 9, 11, 8)
+        media_layout.setSpacing(6)
         media_header = QHBoxLayout()
         media_title = QLabel("MEDIA POOL")
         media_title.setProperty("sectionTitle", True)
         media_header.addWidget(media_title)
         media_header.addStretch()
-        self.new_bin_button = QPushButton("+")
-        self.new_bin_button.setObjectName("iconButton")
-        self.new_bin_button.setFixedSize(26, 24)
+        self.new_bin_button = QPushButton("+ FOLDER")
+        self.new_bin_button.setObjectName("secondaryButton")
         self.new_bin_button.setToolTip("New folder")
         self.new_bin_button.clicked.connect(self.create_media_bin)
         media_header.addWidget(self.new_bin_button)
-        source_layout.addLayout(media_header)
+        media_layout.addLayout(media_header)
         self.media_hint = QLabel(
-            "One Plate Set contains 3 or 5 camera plates · double-click to open"
+            "Import clips here · numbered sets auto-map; other names open manual slot assignment"
         )
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
-        source_layout.addWidget(self.media_hint)
+        media_layout.addWidget(self.media_hint)
 
-        self.media_tree = QTreeWidget()
+        self.media_tree = ScrollableLibraryTree()
         self.media_tree.setObjectName("mediaTree")
-        self.media_tree.setAccessibleName("Plate Set media pool")
+        self.media_tree.setAccessibleName("Source Media Pool")
         self.media_tree.setAccessibleDescription(
-            "Folders contain named Plate Sets. Each Plate Set contains three or five camera plates."
+            "Project folders contain individual source clips. Select three or five clips to add them to a timeline."
         )
         self.media_tree.setHeaderHidden(True)
         self.media_tree.setIndentation(16)
-        self.media_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.media_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.media_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.media_tree.customContextMenuRequested.connect(self._media_tree_menu)
         self.media_tree.itemActivated.connect(self._media_item_activated)
-        self.media_tree.setMinimumHeight(180)
-        self.rename_plate_set_shortcut = QShortcut(
-            QKeySequence(Qt.Key.Key_F2), self.media_tree
+        self.media_tree.setMinimumHeight(120)
+        self.media_tree.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
         )
-        self.rename_plate_set_shortcut.activated.connect(self.rename_media_item)
-        source_layout.addWidget(self.media_tree, 1)
+        self.media_tree.verticalScrollBar().setSingleStep(28)
+        self.remove_media_shortcuts: list[QShortcut] = []
+        for key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            shortcut = QShortcut(QKeySequence(key), self.media_tree)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.delete_selected_media_items)
+            self.remove_media_shortcuts.append(shortcut)
+        media_layout.addWidget(self.media_tree, 1)
 
-        self.active_plates_title = QLabel("ACTIVE PLATE SET · NONE")
+        self.plate_sets_section = QFrame()
+        self.plate_sets_section.setObjectName("librarySection")
+        self.plate_sets_section.setAccessibleName("Plate Sets section")
+        self.plate_sets_section.setMinimumHeight(115)
+        timeline_layout = QVBoxLayout(self.plate_sets_section)
+        timeline_layout.setContentsMargins(11, 9, 11, 8)
+        timeline_layout.setSpacing(6)
+
+        timeline_header = QHBoxLayout()
+        timeline_title = QLabel("PLATE SETS")
+        timeline_title.setProperty("sectionTitle", True)
+        timeline_header.addWidget(timeline_title)
+        timeline_header.addStretch()
+        self.new_timeline_button = QPushButton("NEW TIMELINE")
+        self.new_timeline_button.setObjectName("secondaryButton")
+        self.new_timeline_button.setToolTip(
+            "Create a named 3-camera or 5-camera Plate Set timeline"
+        )
+        self.new_timeline_button.clicked.connect(self.create_timeline)
+        timeline_header.addWidget(self.new_timeline_button)
+        timeline_layout.addLayout(timeline_header)
+
+        self.timeline_tree = ScrollableLibraryTree()
+        self.timeline_tree.setObjectName("timelineTree")
+        self.timeline_tree.setAccessibleName("Plate Set timelines")
+        self.timeline_tree.setAccessibleDescription(
+            "Named timelines only. Source clips stay in the Media Pool above."
+        )
+        self.timeline_tree.setHeaderHidden(True)
+        self.timeline_tree.setRootIsDecorated(False)
+        self.timeline_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.timeline_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.timeline_tree.customContextMenuRequested.connect(self._timeline_tree_menu)
+        self.timeline_tree.itemActivated.connect(self._timeline_item_activated)
+        self.timeline_tree.setMinimumHeight(90)
+        self.timeline_tree.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.timeline_tree.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.timeline_tree.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.timeline_tree.verticalScrollBar().setSingleStep(28)
+        self.rename_plate_set_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self.timeline_tree)
+        self.rename_plate_set_shortcut.activated.connect(self.rename_timeline)
+        self.delete_plate_set_shortcuts: list[QShortcut] = []
+        for key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            shortcut = QShortcut(QKeySequence(key), self.timeline_tree)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.delete_selected_timeline)
+            self.delete_plate_set_shortcuts.append(shortcut)
+        timeline_layout.addWidget(self.timeline_tree, 1)
+
+        self.active_timeline_section = QFrame()
+        self.active_timeline_section.setObjectName("librarySection")
+        self.active_timeline_section.setAccessibleName("Active Timeline section")
+        self.active_timeline_section.setMinimumHeight(235)
+        active_layout = QVBoxLayout(self.active_timeline_section)
+        active_layout.setContentsMargins(11, 9, 11, 8)
+        active_layout.setSpacing(6)
+
+        self.active_plates_title = QLabel("ACTIVE TIMELINE · NONE")
         self.active_plates_title.setProperty("inspectorTitle", True)
         self.active_plates_title.setWordWrap(True)
-        source_layout.addWidget(self.active_plates_title)
-        source_layout.addWidget(self.source_table)
+        active_layout.addWidget(self.active_plates_title)
+        active_layout.addWidget(self.source_table, 1)
         source_buttons = QHBoxLayout()
-        self.import_button = QPushButton("NEW PLATE SET")
+        self.import_button = QPushButton("IMPORT MEDIA")
         self.import_button.setObjectName("primaryButton")
-        self.import_button.setAccessibleName("New Plate Set")
+        self.import_button.setAccessibleName("Import Media")
         self.import_button.setAccessibleDescription(
-            "Choose three or five camera plates and give the Plate Set a name"
+            "Add individual source clips to the project Media Pool"
         )
         self.import_button.setToolTip(
-            "Create one named Plate Set from P06-P08 or P01-P05 camera plates"
+            "Import clips without creating a timeline"
         )
         self.import_button.clicked.connect(self.choose_videos)
         self.clear_button = QPushButton("CLEAR")
         self.clear_button.setObjectName("secondaryButton")
         self.clear_button.clicked.connect(self.clear_sources)
         source_buttons.addWidget(self.import_button, 1)
-        self.new_timeline_button = QPushButton("NEW FOLDER")
-        self.new_timeline_button.setObjectName("secondaryButton")
-        self.new_timeline_button.setToolTip(
-            "Plate Sets become timelines automatically; folders organize both"
-        )
-        self.new_timeline_button.clicked.connect(self.create_media_bin)
-        source_buttons.addWidget(self.new_timeline_button)
-        source_layout.addLayout(source_buttons)
-        self.source_status = QLabel("Drop P06–P08 or P01–P05 clips here")
+        source_buttons.addWidget(self.clear_button)
+        active_layout.addLayout(source_buttons)
+        self.source_status = QLabel("Import clips, then add a complete camera set to a timeline")
         self.source_status.setObjectName("sourceStatus")
         self.source_status.setWordWrap(True)
-        source_layout.addWidget(self.source_status)
+        active_layout.addWidget(self.source_status)
+
+        self.library_splitter.addWidget(self.media_pool_section)
+        self.library_splitter.addWidget(self.plate_sets_section)
+        self.library_splitter.addWidget(self.active_timeline_section)
+        self.library_splitter.setStretchFactor(0, 3)
+        self.library_splitter.setStretchFactor(1, 2)
+        self.library_splitter.setStretchFactor(2, 4)
+        self.library_splitter.setSizes([245, 165, 300])
+        source_layout.addWidget(self.library_splitter, 1)
 
         self.preview = PreviewView()
         self.preview.commandRequested.connect(self._handle_preview_command)
@@ -1289,9 +2324,9 @@ class MainWindow(QMainWindow):
         preview_header = QHBoxLayout()
         title = QLabel("PANORAMA PREVIEW")
         title.setProperty("sectionTitle", True)
-        self.preview_context = QLabel("NO PLATE SET OPEN")
+        self.preview_context = QLabel("NO TIMELINE OPEN")
         self.preview_context.setProperty("muted", True)
-        preview_limit = QLabel("UHD 4K MAX  ·  FULL CANVAS")
+        preview_limit = QLabel("LIVE 960PX  ·  FINAL FULL QUALITY")
         preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
         preview_header.addSpacing(12)
@@ -1300,7 +2335,9 @@ class MainWindow(QMainWindow):
         preview_header.addWidget(preview_limit)
         preview_layout.addLayout(preview_header)
         preview_layout.addWidget(self.preview_stack, 1)
-        self.preview_note = QLabel("Fitted preview · UHD 4K max · master render stays full resolution")
+        self.preview_note = QLabel(
+            "Import builds lightweight source cache · TC Align enables synchronized playback"
+        )
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_note.setProperty("muted", True)
         preview_layout.addWidget(self.preview_note)
@@ -1308,13 +2345,16 @@ class MainWindow(QMainWindow):
         settings_scroll = QScrollArea()
         settings_scroll.setObjectName("settingsPanel")
         settings_scroll.setWidgetResizable(True)
-        settings_scroll.setMinimumWidth(286)
-        settings_scroll.setMaximumWidth(350)
+        settings_scroll.setMinimumWidth(330)
+        settings_scroll.setMaximumWidth(390)
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.settings_tabs = QTabWidget()
         self.settings_tabs.setMinimumWidth(0)
         self.settings_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.settings_tabs.addTab(self._stitch_settings(), "RIG")
+        self._plate_settings_index = self.settings_tabs.addTab(
+            self._plate_settings(), "PLATE"
+        )
         self.settings_tabs.addTab(self._color_settings(), "COLOR")
         self.settings_tabs.addTab(self._output_settings(), "DELIVER")
         settings_scroll.setWidget(self.settings_tabs)
@@ -1323,15 +2363,15 @@ class MainWindow(QMainWindow):
         inspector_page_layout = QVBoxLayout(inspector_page)
         inspector_page_layout.setContentsMargins(0, 0, 0, 0)
         inspector_page_layout.setSpacing(6)
-        inspector_title = QLabel("TIMELINE VALUES / STITCH CONTROLS")
+        inspector_title = QLabel("STITCH CONTROLS")
         inspector_title.setProperty("sectionTitle", True)
         inspector_page_layout.addWidget(inspector_title)
         inspector_page_layout.addWidget(settings_scroll, 1)
 
         self.inspector_panel = QFrame()
         self.inspector_panel.setObjectName("inspectorPanel")
-        self.inspector_panel.setMinimumWidth(310)
-        self.inspector_panel.setMaximumWidth(390)
+        self.inspector_panel.setMinimumWidth(360)
+        self.inspector_panel.setMaximumWidth(430)
         inspector_layout = QVBoxLayout(self.inspector_panel)
         inspector_layout.setContentsMargins(8, 7, 8, 7)
         inspector_layout.setSpacing(0)
@@ -1340,14 +2380,18 @@ class MainWindow(QMainWindow):
         self.right_tabs.addTab(inspector_page, "INSPECTOR")
         inspector_layout.addWidget(self.right_tabs, 1)
 
-        upper = QSplitter(Qt.Orientation.Horizontal)
-        upper.setObjectName("workspaceSplitter")
-        upper.setChildrenCollapsible(False)
-        upper.setHandleWidth(1)
-        upper.addWidget(source_group)
-        upper.addWidget(preview_box)
-        upper.addWidget(self.inspector_panel)
-        upper.setSizes([340, 900, 340])
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setObjectName("workspaceSplitter")
+        self.workspace_splitter.setAccessibleName("Resizable workspace panels")
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(7)
+        self.workspace_splitter.addWidget(source_group)
+        self.workspace_splitter.addWidget(preview_box)
+        self.workspace_splitter.addWidget(self.inspector_panel)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setStretchFactor(2, 0)
+        self.workspace_splitter.setSizes([340, 870, 390])
 
         timing_panel = QFrame()
         timing_panel.setObjectName("timingPanel")
@@ -1355,7 +2399,7 @@ class MainWindow(QMainWindow):
         timing_layout.setContentsMargins(12, 7, 12, 7)
         timing_layout.setSpacing(2)
         timing_header = QHBoxLayout()
-        self.timing_title = QLabel("TIMELINE RANGE · NO PLATE SET")
+        self.timing_title = QLabel("TIMELINE RANGE · NO TIMELINE")
         self.timing_title.setProperty("sectionTitle", True)
         self.timing_status = QLabel("TC Align finds the shortest common range across every camera")
         self.timing_status.setProperty("muted", True)
@@ -1403,7 +2447,7 @@ class MainWindow(QMainWindow):
         self.playback_button = QPushButton("▶  PLAY")
         self.playback_button.setObjectName("quietButton")
         self.playback_button.setToolTip(
-            "Space toggles a cached 1280px stitched playback proxy"
+            "Space plays the prewarmed 960px proxy; missing caches build automatically"
         )
         self.playback_button.clicked.connect(self.toggle_playback)
         timing_values.addWidget(self.playback_button)
@@ -1412,25 +2456,30 @@ class MainWindow(QMainWindow):
 
         self.playback_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         self.playback_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.playback_shortcut.activated.connect(self.toggle_playback)
+        self.playback_shortcut.activated.connect(self._toggle_playback_shortcut)
         self.preview_shortcuts: list[QShortcut] = []
         for key, command in (
-            ("P", "fullscreen"),
             ("J", "reverse"),
             ("K", "stop"),
             ("L", "forward"),
             (Qt.Key.Key_Left, "step-back"),
             (Qt.Key.Key_Right, "step-forward"),
         ):
-            shortcut = QShortcut(QKeySequence(key), preview_box)
-            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            # Keep transport available after clicking inspectors, the task log,
+            # or the timeline. The handler below still protects editable fields
+            # so typing J/L or using arrow keys in a value control is safe.
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(
+                Qt.ShortcutContext.ApplicationShortcut
+                if command == "fullscreen"
+                else Qt.ShortcutContext.WindowShortcut
+            )
             shortcut.activated.connect(
-                lambda selected=command: self._handle_preview_command(selected)
+                lambda selected=command: self._handle_preview_shortcut(selected)
             )
             self.preview_shortcuts.append(shortcut)
         shortcut_hint = QLabel(
-            "P FULL SCREEN  ·  SPACE PLAY/PAUSE  ·  J REVERSE  ·  K STOP  ·  "
-            "L FORWARD  ·  ←/→ FRAME"
+            "Space Play/Pause  ·  J/K/L Transport  ·  ←/→ Frame  ·  P Full Screen"
         )
         shortcut_hint.setProperty("muted", True)
         shortcut_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1442,8 +2491,8 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(10, 6, 10, 6)
         action_layout.setSpacing(6)
 
-        def workflow_button(text: str, callback: Callable[[], None], step: str) -> QPushButton:
-            button = QPushButton(f"{step}   {text}")
+        def workflow_button(text: str, callback: Callable[[], None]) -> QPushButton:
+            button = QPushButton(text)
             button.setObjectName("workflowButton")
             button.setMinimumSize(128, 34)
             button.setMaximumWidth(168)
@@ -1451,16 +2500,21 @@ class MainWindow(QMainWindow):
             action_layout.addWidget(button)
             return button
 
-        self.tc_align_button = workflow_button("TC ALIGN", self.align_timecode, "1")
-        self.preview_button = workflow_button("PREVIEW", self.create_preview, "2")
-        self.rig_align_button = workflow_button("RIG ALIGN", self.auto_align, "3")
+        self.tc_align_button = workflow_button("TC ALIGN", self.align_timecode)
+        self.preview_button = workflow_button("QUICK PREVIEW", self.create_preview)
+        self.preview_button.setToolTip(
+            "Stitch only the current playhead frame at 2K using the saved camera geometry"
+        )
+        self.rig_align_button = workflow_button("AUTO STITCH", self.auto_align)
         self.rig_align_button.setEnabled(False)
-        self.rig_align_button.setToolTip("Create a preview first. Rig Align then adjusts camera geometry and refreshes it.")
+        self.rig_align_button.setToolTip(
+            "Solve yaw, pitch and roll once from the Quick Preview frame, then reuse those values for the timeline"
+        )
         self.add_queue_button = workflow_button(
-            "ADD TO QUEUE", self.add_current_to_queue, "4"
+            "ADD TO QUEUE", self.add_current_to_queue
         )
         action_layout.addStretch()
-        self.render_button = workflow_button("RENDER NOW", self.render, "5")
+        self.render_button = workflow_button("RENDER NOW", self.render)
         self.render_button.setObjectName("renderButton")
         self.render_button.setMinimumWidth(156)
         self.cancel_button = QPushButton("CANCEL")
@@ -1482,7 +2536,7 @@ class MainWindow(QMainWindow):
         queue_layout.addWidget(queue_title)
         self.queue_table = QTableWidget(0, 5)
         self.queue_table.setHorizontalHeaderLabels(
-            ["TIMELINE", "RANGE", "CANVAS", "OUTPUT", "STATUS"]
+            ["TIMELINE", "FPS", "FORMAT", "FILE", "STATUS"]
         )
         self.queue_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1508,22 +2562,30 @@ class MainWindow(QMainWindow):
             4, QHeaderView.ResizeMode.ResizeToContents
         )
         self.queue_table.doubleClicked.connect(self.load_selected_queue_job)
+        self.queue_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.queue_table.customContextMenuRequested.connect(self._queue_table_menu)
+        self.remove_queue_shortcuts: list[QShortcut] = []
+        for key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            shortcut = QShortcut(QKeySequence(key), self.queue_table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self.remove_selected_queue_job)
+            self.remove_queue_shortcuts.append(shortcut)
         queue_layout.addWidget(self.queue_table)
         queue_actions = QHBoxLayout()
-        for text_value, callback in (
-            ("ADD CURRENT", self.add_current_to_queue),
-            ("LOAD", self.load_selected_queue_job),
-            ("REMOVE", self.remove_selected_queue_job),
-            ("RENDER SELECTED", self.render_selected_queue_job),
-            ("RENDER ALL", self.render_all_queue_jobs),
-        ):
-            button = QPushButton(text_value)
-            button.setObjectName(
-                "primaryButton" if text_value == "RENDER ALL" else "secondaryButton"
-            )
-            button.clicked.connect(callback)
-            queue_actions.addWidget(button)
         queue_actions.addStretch()
+        self.render_selected_queue_button = QPushButton("RENDER")
+        self.render_selected_queue_button.setObjectName("secondaryButton")
+        self.render_selected_queue_button.setToolTip("Render the selected queue item")
+        self.render_selected_queue_button.clicked.connect(
+            self.render_selected_queue_job
+        )
+        queue_actions.addWidget(self.render_selected_queue_button)
+        self.render_all_queue_button = QPushButton("RENDER ALL")
+        self.render_all_queue_button.setObjectName("primaryButton")
+        self.render_all_queue_button.clicked.connect(self.render_all_queue_jobs)
+        queue_actions.addWidget(self.render_all_queue_button)
         queue_layout.addLayout(queue_actions)
         log_page = QWidget()
         task_log_layout = QVBoxLayout(log_page)
@@ -1541,7 +2603,7 @@ class MainWindow(QMainWindow):
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(8, 8, 8, 7)
         workspace_layout.setSpacing(6)
-        workspace_layout.addWidget(upper, 1)
+        workspace_layout.addWidget(self.workspace_splitter, 1)
         workspace_layout.addWidget(timing_panel)
         workspace_layout.addWidget(action_bar)
 
@@ -1555,17 +2617,46 @@ class MainWindow(QMainWindow):
         self._build_menus()
 
         status = QStatusBar()
+        self.autosave_status = QLabel("AUTOSAVE · ON · 10 MIN RECOVERY")
+        self.autosave_status.setObjectName("autosaveStatus")
+        self.autosave_status.setToolTip(
+            "Project edits save atomically as they happen. A recovery snapshot is refreshed every 10 minutes only when content changed."
+        )
         self.task_label = QLabel("IDLE")
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setFixedWidth(180)
+        status.addPermanentWidget(self.autosave_status)
         status.addPermanentWidget(self.task_label)
         status.addPermanentWidget(self.progress)
         self.setStatusBar(status)
         self._refresh_queue_table()
         if self._queue_load_error:
             self._append_log(f"RENDER QUEUE RECOVERY: {self._queue_load_error}")
+
+    def _restore_workspace_layout(self) -> None:
+        if not self._auto_workflows_enabled:
+            return
+        for splitter, key in (
+            (self.workspace_splitter, "layout/workspaceSplitter"),
+            (self.library_splitter, "layout/librarySplitter"),
+        ):
+            state = self.settings.value(key)
+            if state is not None:
+                splitter.restoreState(state)
+
+    def _save_workspace_layout(self) -> None:
+        if not self._auto_workflows_enabled:
+            return
+        self.settings.setValue(
+            "layout/workspaceSplitter",
+            self.workspace_splitter.saveState(),
+        )
+        self.settings.setValue(
+            "layout/librarySplitter",
+            self.library_splitter.saveState(),
+        )
 
     def _build_menus(self) -> None:
         bar = self.menuBar()
@@ -1581,28 +2672,44 @@ class MainWindow(QMainWindow):
         action(file_menu, "New Project…", self.new_project)
         action(file_menu, "Open Project…", self.open_project)
         file_menu.addSeparator()
-        action(file_menu, "Import Plates…", self.choose_videos)
+        action(file_menu, "Import Media…", self.choose_videos)
         file_menu.addSeparator()
         action(file_menu, "Quit", self.close)
 
         edit_menu = bar.addMenu("Edit")
         action(edit_menu, "New Folder…", self.create_media_bin)
-        action(edit_menu, "Rename Selected…", self.rename_media_item)
+        action(edit_menu, "Rename Selected…", self.rename_focused_item)
+        action(edit_menu, "Delete Selected…", self.delete_focused_item)
 
         project_menu = bar.addMenu("Project")
         action(project_menu, "Project Settings…", self.edit_project_settings)
         action(project_menu, "Open Project Folder", self.open_project_folder)
 
         timeline_menu = bar.addMenu("Timeline")
-        action(timeline_menu, "Open Selected Plate Set", self.open_selected_timeline)
-        action(timeline_menu, "Rename Plate Set…", self.rename_media_item)
-        action(timeline_menu, "Duplicate Plate Set", self.duplicate_selected_timeline)
-        action(timeline_menu, "Delete Plate Set…", self.delete_selected_timeline)
+        action(timeline_menu, "New Timeline…", self.create_timeline)
+        action(
+            timeline_menu,
+            "Add Selected Media to Active Timeline",
+            self.add_selected_media_to_active_timeline,
+        )
+        action(timeline_menu, "Open Selected Timeline", self.open_selected_timeline)
+        action(timeline_menu, "Timeline Settings…", self.edit_timeline_settings)
+        action(timeline_menu, "Rename Timeline…", self.rename_timeline)
+        action(timeline_menu, "Duplicate Timeline", self.duplicate_selected_timeline)
+        action(timeline_menu, "Delete Timeline…", self.delete_selected_timeline)
         timeline_menu.addSeparator()
-        action(timeline_menu, "Add Plate Set to Render Queue", self.add_current_to_queue)
+        action(timeline_menu, "Add Timeline to Render Queue", self.add_current_to_queue)
 
         playback_menu = bar.addMenu("Playback")
-        action(playback_menu, "Full Screen Preview    P", lambda: self._handle_preview_command("fullscreen"))
+        self.fullscreen_action = action(
+            playback_menu,
+            "Full Screen Preview",
+            lambda: self._handle_preview_command("fullscreen"),
+        )
+        self.fullscreen_action.setShortcut(QKeySequence(Qt.Key.Key_P))
+        self.fullscreen_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
         action(playback_menu, "Play / Pause    Space", self.toggle_playback)
         action(playback_menu, "Reverse    J", lambda: self._handle_preview_command("reverse"))
         action(playback_menu, "Stop    K", lambda: self._handle_preview_command("stop"))
@@ -1612,8 +2719,8 @@ class MainWindow(QMainWindow):
 
         tools_menu = bar.addMenu("Tools")
         action(tools_menu, "TC Align", self.align_timecode)
-        action(tools_menu, "Build Preview", self.create_preview)
-        action(tools_menu, "Rig Align", self.auto_align)
+        action(tools_menu, "Quick Preview", self.create_preview)
+        action(tools_menu, "Auto Stitch", self.auto_align)
 
         window_menu = bar.addMenu("Window")
         action(window_menu, "Inspector", lambda: self._show_right_tab(0))
@@ -1674,9 +2781,9 @@ class MainWindow(QMainWindow):
     def _update_plate_set_context(self) -> None:
         timeline = self._active_timeline_record()
         if timeline is None:
-            active_label = "ACTIVE PLATE SET · NONE"
-            preview_label = f"{self.project_store.settings.name} / NO PLATE SET OPEN"
-            range_label = "TIMELINE RANGE · NO PLATE SET"
+            active_label = "ACTIVE TIMELINE · NONE"
+            preview_label = f"{self.project_store.settings.name} / NO TIMELINE OPEN"
+            range_label = "TIMELINE RANGE · NO TIMELINE"
         else:
             folder = next(
                 (
@@ -1687,7 +2794,8 @@ class MainWindow(QMainWindow):
                 "Master",
             )
             plate_count = len(timeline.source_paths)
-            active_label = f"ACTIVE PLATE SET · {timeline.name} · {plate_count} PLATES"
+            plate_state = f"{plate_count} PLATES" if plate_count else "PLATES UNASSIGNED"
+            active_label = f"ACTIVE TIMELINE · {timeline.name} · {plate_state}"
             preview_label = (
                 f"{self.project_store.settings.name} / {folder} / {timeline.name}"
             )
@@ -1702,67 +2810,244 @@ class MainWindow(QMainWindow):
             self.timing_title.setText(range_label)
             self.timing_title.setToolTip(range_label)
 
-    def _apply_project_defaults(self) -> None:
-        snapshot = self.project_store.settings.settings_snapshot
-        output = snapshot.get("output") if isinstance(snapshot, dict) else None
-        if isinstance(output, dict):
-            if hasattr(self, "canvas_width") and output.get("width") is not None:
-                self.canvas_width.setValue(int(output["width"]))
-            if hasattr(self, "canvas_height") and output.get("height") is not None:
-                self.canvas_height.setValue(int(output["height"]))
-        color = snapshot.get("color") if isinstance(snapshot, dict) else None
-        if isinstance(color, dict) and hasattr(self, "color_mode"):
-            index = self.color_mode.findData(color.get("mode"))
-            if index >= 0:
-                self.color_mode.setCurrentIndex(index)
-            if color.get("ocio_config"):
-                self.ocio_config.setText(str(color["ocio_config"]))
-            if color.get("working_space"):
-                self.working_space.setText(str(color["working_space"]))
-            if color.get("output_space"):
-                self.output_space.setText(str(color["output_space"]))
-            if color.get("mode") == "ocio":
-                if not self.input_space.text().strip():
-                    self.input_space.setText("Camera Rec.709")
-                if not self.working_space.text().strip():
-                    self.working_space.setText("ACEScg")
-                if not self.output_space.text().strip():
-                    self.output_space.setText("Gamma 2.4 Encoded Rec.709")
-        cameras = snapshot.get("cameras") if isinstance(snapshot, dict) else None
+    @staticmethod
+    def _settings_values(snapshot: dict[str, object]) -> dict[str, object]:
+        output = snapshot.get("output")
+        output = output if isinstance(output, dict) else {}
+        video = snapshot.get("video")
+        video = video if isinstance(video, dict) else {}
+        metadata = snapshot.get("_vpstitch")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        color = snapshot.get("color")
+        color = color if isinstance(color, dict) else {}
+        cameras = snapshot.get("cameras")
+        input_space = "Camera Rec.709"
         if isinstance(cameras, list) and cameras and isinstance(cameras[0], dict):
-            if cameras[0].get("colorspace"):
-                self.input_space.setText(str(cameras[0]["colorspace"]))
+            input_space = str(cameras[0].get("colorspace") or input_space)
+        return {
+            "width": int(output.get("width") or 20_000),
+            "height": int(output.get("height") or 5_504),
+            "fps_mode": str(metadata.get("fps_mode") or FPS_MODE_MATCH_SOURCE),
+            "fps": float(video.get("fps") or 24.0),
+            "mode": str(color.get("mode") or "ocio"),
+            "ocio_config": str(color.get("ocio_config") or BUNDLED_ACES_STUDIO_ID),
+            "input_space": input_space,
+            "working_space": str(color.get("working_space") or "ACEScg"),
+            "output_space": str(color.get("output_space") or "Gamma 2.4 Encoded Rec.709"),
+            "output_mode": str(color.get("output_mode") or "colorspace"),
+            "display": str(color.get("display") or "Rec.2100-PQ - Display"),
+            "view": str(
+                color.get("view") or "ACES 2.0 - HDR 1000 nits (Rec.2020)"
+            ),
+        }
+
+    def _config_with_project_defaults(self, base: dict[str, object]) -> dict[str, object]:
+        merged = json.loads(json.dumps(base))
+        defaults = self._settings_values(self.project_store.settings.settings_snapshot)
+        output = merged.setdefault("output", {})
+        if isinstance(output, dict):
+            output["width"] = defaults["width"]
+            output["height"] = defaults["height"]
+        metadata = merged.setdefault("_vpstitch", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            merged["_vpstitch"] = metadata
+        metadata["fps_mode"] = defaults["fps_mode"]
+        video = merged.setdefault("video", {})
+        if isinstance(video, dict) and defaults["fps_mode"] == FPS_MODE_CUSTOM:
+            video["fps"] = defaults["fps"]
+        color = merged.setdefault("color", {})
+        if isinstance(color, dict):
+            color["mode"] = defaults["mode"]
+            if defaults["mode"] == "ocio":
+                color["ocio_config"] = defaults["ocio_config"]
+                color["working_space"] = defaults["working_space"]
+                color["output_mode"] = defaults["output_mode"]
+                if defaults["output_mode"] == "display_view":
+                    color["display"] = defaults["display"]
+                    color["view"] = defaults["view"]
+                    color.pop("output_space", None)
+                else:
+                    color["output_space"] = defaults["output_space"]
+                    color.pop("display", None)
+                    color.pop("view", None)
+            else:
+                for key in (
+                    "ocio_config", "working_space", "output_space",
+                    "output_mode", "display", "view",
+                ):
+                    color.pop(key, None)
+        cameras = merged.get("cameras")
+        if isinstance(cameras, list):
+            for camera in cameras:
+                if not isinstance(camera, dict):
+                    continue
+                if defaults["mode"] == "ocio":
+                    camera["colorspace"] = defaults["input_space"]
+                else:
+                    camera.pop("colorspace", None)
+        return merged
+
+    def _effective_timeline_config(self, timeline: TimelineRecord) -> dict[str, object]:
+        base = json.loads(json.dumps(timeline.config_snapshot))
+        return self._config_with_project_defaults(base) if timeline.inherits_project_settings else base
+
+    def _apply_project_defaults(self) -> None:
+        if not hasattr(self, "canvas_width"):
+            return
+        values = self._settings_values(self.project_store.settings.settings_snapshot)
+        self._loading_config = True
+        self.canvas_width.setValue(int(values["width"]))
+        self.canvas_height.setValue(int(values["height"]))
+        self.fps_mode.setCurrentIndex(
+            max(0, self.fps_mode.findData(str(values["fps_mode"])))
+        )
+        if values["fps_mode"] == FPS_MODE_CUSTOM:
+            self.fps.setValue(float(values["fps"]))
+        elif self._source_probes:
+            source_fps = _matching_source_frame_rate(self._source_probes)
+            if source_fps is not None:
+                self.fps.setValue(source_fps)
+        self.fps.setEnabled(values["fps_mode"] == FPS_MODE_CUSTOM)
+        index = self.color_mode.findData(values["mode"])
+        if index >= 0:
+            self.color_mode.setCurrentIndex(index)
+        self.ocio_config.setText(str(values["ocio_config"]))
+        self.ocio_config.setCursorPosition(0)
+        _request_ocio_combo_value(self.input_space, str(values["input_space"]))
+        _request_ocio_combo_value(self.working_space, str(values["working_space"]))
+        _request_ocio_combo_value(self.output_space, str(values["output_space"]))
+        self.output_mode.setCurrentIndex(
+            max(0, self.output_mode.findData(str(values["output_mode"])))
+        )
+        if values["mode"] == "ocio":
+            self._reload_ocio_spaces(quiet=True)
+            self._reload_ocio_delivery(
+                display=str(values["display"]),
+                view=str(values["view"]),
+                quiet=True,
+            )
+        self._loading_config = False
 
     def edit_project_settings(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Project Settings")
-        dialog.setMinimumWidth(460)
+        dialog.setMinimumWidth(620)
         layout = QVBoxLayout(dialog)
         title = QLabel("PROJECT DEFAULTS")
         title.setProperty("sectionTitle", True)
         layout.addWidget(title)
         form = QFormLayout()
+        defaults = self._settings_values(self.project_store.settings.settings_snapshot)
         name = QLineEdit(self.project_store.settings.name)
         width = QSpinBox()
         width.setRange(640, MAX_CANVAS_WIDTH)
-        width.setValue(self.canvas_width.value())
+        width.setValue(int(defaults["width"]))
         height = QSpinBox()
         height.setRange(320, MAX_CANVAS_HEIGHT)
-        height.setValue(self.canvas_height.value())
-        color_mode = QComboBox()
+        height.setValue(int(defaults["height"]))
+        fps_mode = ChevronComboBox()
+        fps_mode.addItem("Match each plate set", FPS_MODE_MATCH_SOURCE)
+        fps_mode.addItem("Custom conform", FPS_MODE_CUSTOM)
+        fps_mode.setCurrentIndex(max(0, fps_mode.findData(defaults["fps_mode"])))
+        fps = QDoubleSpinBox()
+        fps.setRange(1.0, 240.0)
+        fps.setDecimals(6)
+        fps.setValue(float(defaults["fps"]))
+        fps.setEnabled(fps_mode.currentData() == FPS_MODE_CUSTOM)
+        fps_mode.currentIndexChanged.connect(
+            lambda _index: fps.setEnabled(fps_mode.currentData() == FPS_MODE_CUSTOM)
+        )
+        color_mode = ChevronComboBox()
         color_mode.addItem("Passthrough", "passthrough")
         color_mode.addItem("OCIO", "ocio")
-        current_mode = color_mode.findData(self.color_mode.currentData())
+        current_mode = color_mode.findData(defaults["mode"])
         color_mode.setCurrentIndex(max(0, current_mode))
-        ocio = QLineEdit(self.ocio_config.text())
+        ocio = QLineEdit(str(defaults["ocio_config"]))
+        input_space = _new_ocio_space_combo(str(defaults["input_space"]))
+        working_space = _new_ocio_space_combo(str(defaults["working_space"]))
+        output_space = _new_ocio_space_combo(str(defaults["output_space"]), output=True)
+        output_mode = ChevronComboBox()
+        output_mode.addItem("Color space / Log", "colorspace")
+        output_mode.addItem("Display transform", "display_view")
+        output_mode.setCurrentIndex(max(0, output_mode.findData(defaults["output_mode"])))
+        output_display = ChevronComboBox()
+        output_view = ChevronComboBox()
+        output_space_label = QLabel("Output color space")
+        output_display_label = QLabel("Display")
+        output_view_label = QLabel("View")
+        ocio_spaces_status = QLabel()
+        ocio_spaces_status.setProperty("muted", True)
+        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces.setObjectName("secondaryButton")
+        ocio_row = QWidget()
+        ocio_layout = QHBoxLayout(ocio_row)
+        ocio_layout.setContentsMargins(0, 0, 0, 0)
+        ocio_layout.addWidget(ocio)
+        ocio_layout.addWidget(load_spaces)
+        for field in (ocio, input_space, working_space, output_space):
+            field.setMinimumWidth(320)
+
+        def reload_spaces() -> None:
+            try:
+                count = _load_ocio_combo_group(
+                    ocio.text().strip(),
+                    (input_space, working_space, output_space),
+                )
+                displays = ocio_display_views(ocio.text().strip())
+                _populate_delivery_display_combo(
+                    output_display, tuple(displays), str(defaults["display"])
+                )
+                _populate_combo(
+                    output_view,
+                    displays.get(_delivery_display_value(output_display), ()),
+                    str(defaults["view"]),
+                )
+                ocio_spaces_status.setText(f"{count} OCIO spaces loaded")
+            except Exception as error:
+                ocio_spaces_status.setText(f"Could not read OCIO config · {error}")
+
+        load_spaces.clicked.connect(reload_spaces)
+        ocio.editingFinished.connect(reload_spaces)
+        output_display.currentIndexChanged.connect(
+            lambda _index: _populate_combo(
+                output_view,
+                ocio_display_views(ocio.text().strip()).get(
+                    _delivery_display_value(output_display), ()
+                ),
+                "",
+            )
+        )
+
+        def update_delivery() -> None:
+            hdr = output_mode.currentData() == "display_view"
+            output_space.setVisible(not hdr)
+            output_space_label.setVisible(not hdr)
+            output_display.setVisible(hdr)
+            output_display_label.setVisible(hdr)
+            output_view.setVisible(hdr)
+            output_view_label.setVisible(hdr)
+
+        output_mode.currentIndexChanged.connect(update_delivery)
+        reload_spaces()
         form.addRow("Project name", name)
         form.addRow("Default canvas width", width)
         form.addRow("Default canvas height", height)
+        form.addRow("Timeline frame rate", fps_mode)
+        form.addRow("Custom FPS", fps)
         form.addRow("Color pipeline", color_mode)
-        form.addRow("Default OCIO", ocio)
+        form.addRow("OCIO config", ocio_row)
+        form.addRow("Input transform", input_space)
+        form.addRow("Working space", working_space)
+        form.addRow("Delivery method", output_mode)
+        form.addRow(output_space_label, output_space)
+        form.addRow(output_display_label, output_display)
+        form.addRow(output_view_label, output_view)
+        form.addRow(ocio_spaces_status)
+        update_delivery()
         layout.addLayout(form)
         note = QLabel(
-            "New Plate Set timelines inherit these values. Existing timeline overrides stay unchanged."
+            "New timelines inherit these values. Timelines set to Use Project Settings update immediately."
         )
         note.setWordWrap(True)
         note.setProperty("muted", True)
@@ -1776,22 +3061,392 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.canvas_width.setValue(width.value())
-        self.canvas_height.setValue(height.value())
-        mode_index = self.color_mode.findData(color_mode.currentData())
-        if mode_index >= 0:
-            self.color_mode.setCurrentIndex(mode_index)
-        self.ocio_config.setText(ocio.text().strip())
         try:
-            defaults = self._collect_config()
+            settings_snapshot = json.loads(
+                json.dumps(self.project_store.settings.settings_snapshot)
+            )
+            previous_basis = self._color_match_basis(settings_snapshot)
+            previous_color = dict(settings_snapshot.get("color") or {})
+            output = settings_snapshot.get("output")
+            if not isinstance(output, dict):
+                output = {}
+                settings_snapshot["output"] = output
+            output.update({"width": width.value(), "height": height.value()})
+            metadata = settings_snapshot.setdefault("_vpstitch", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+                settings_snapshot["_vpstitch"] = metadata
+            selected_fps_mode = str(fps_mode.currentData())
+            metadata["fps_mode"] = selected_fps_mode
+            if selected_fps_mode == FPS_MODE_CUSTOM:
+                settings_snapshot.setdefault("video", {})["fps"] = fps.value()
+            mode = str(color_mode.currentData())
+            settings_snapshot["color"] = {"mode": mode}
+            if mode == "ocio":
+                delivery_mode = str(output_mode.currentData())
+                required = [
+                    ocio.text().strip(), input_space.currentText().strip(),
+                    working_space.currentText().strip(),
+                ]
+                if delivery_mode == "display_view":
+                    required.extend(
+                        [_delivery_display_value(output_display), output_view.currentText().strip()]
+                    )
+                else:
+                    required.append(output_space.currentText().strip())
+                if not all(required):
+                    raise ValueError("OCIO config and selected delivery fields are required")
+                settings_snapshot["color"].update(
+                    {
+                        "ocio_config": required[0],
+                        "working_space": required[2],
+                        "output_mode": delivery_mode,
+                    }
+                )
+                if delivery_mode == "display_view":
+                    settings_snapshot["color"].update(
+                        {"display": required[3], "view": required[4]}
+                    )
+                else:
+                    settings_snapshot["color"]["output_space"] = required[3]
+                cameras = settings_snapshot.get("cameras")
+                if not isinstance(cameras, list) or not cameras:
+                    cameras = [{}]
+                    settings_snapshot["cameras"] = cameras
+                for camera in cameras:
+                    if isinstance(camera, dict):
+                        camera["colorspace"] = required[1]
+            for key in ("match_reference", "match_strength", "preserve_luminance"):
+                if key in previous_color:
+                    settings_snapshot["color"][key] = previous_color[key]
+            color_basis_changed = (
+                previous_basis != self._color_match_basis(settings_snapshot)
+            )
+            if color_basis_changed:
+                self._clear_color_match_snapshot(settings_snapshot)
+            elif "match_enabled" in previous_color:
+                settings_snapshot["color"]["match_enabled"] = bool(
+                    previous_color["match_enabled"]
+                )
             self.project_store.update_settings(
-                name=name.text().strip(), settings_snapshot=defaults
+                name=name.text().strip(), settings_snapshot=settings_snapshot
+            )
+            self._invalidate_inherited_timeline_caches(
+                reset_color_match=color_basis_changed
             )
         except Exception as error:
             self._error("Project Settings", str(error))
             return
+        active = self._active_timeline_record()
+        if active is None or active.inherits_project_settings:
+            self._apply_project_defaults()
+        if active is not None and active.inherits_project_settings:
+            self._stop_playback(clear=True)
+            self._cleanup_reference_dir(self._last_reference_dir)
+            self._last_reference_dir = None
+            self._last_reference_config_path = None
+            self._reference_frame_index = None
+            self._preview_ready = False
+            self.rig_align_button.setEnabled(False)
+            self.preview.show_message("PROJECT SETTINGS CHANGED · QUICK PREVIEW")
         self._update_project_header()
         self._refresh_media_tree()
+
+    @staticmethod
+    def _color_match_basis(config: dict[str, object]) -> tuple[object, ...]:
+        color = config.get("color")
+        color = color if isinstance(color, dict) else {}
+        mode = str(color.get("mode", "passthrough"))
+        if mode != "ocio":
+            return (mode,)
+        cameras = config.get("cameras")
+        camera_spaces = tuple(
+            str(camera.get("colorspace", ""))
+            for camera in (cameras if isinstance(cameras, list) else [])
+            if isinstance(camera, dict)
+        )
+        return (
+            mode,
+            str(color.get("ocio_config", "")),
+            str(color.get("working_space", "")),
+            camera_spaces,
+        )
+
+    @staticmethod
+    def _clear_color_match_snapshot(config: dict[str, object]) -> None:
+        color = config.get("color")
+        if not isinstance(color, dict):
+            color = {"mode": "passthrough"}
+            config["color"] = color
+        color["match_enabled"] = False
+        cameras = config.get("cameras")
+        if not isinstance(cameras, list):
+            return
+        for camera in cameras:
+            if isinstance(camera, dict):
+                camera["color_gain"] = [1.0, 1.0, 1.0]
+                camera.pop("color_match_confidence", None)
+
+    def _invalidate_inherited_timeline_caches(
+        self, *, reset_color_match: bool = False
+    ) -> None:
+        for timeline in tuple(self.project_store.timelines):
+            if not timeline.inherits_project_settings:
+                continue
+            updates: dict[str, object] = {}
+            if reset_color_match:
+                snapshot = json.loads(json.dumps(timeline.config_snapshot))
+                self._clear_color_match_snapshot(snapshot)
+                updates["config_snapshot"] = snapshot
+            self.project_store.update_timeline(
+                timeline.id,
+                playback_cache_path=None,
+                playback_cache_status=(
+                    PlaybackCacheStatus.PENDING
+                    if timeline.source_paths else PlaybackCacheStatus.EMPTY
+                ),
+                stitch_status=StitchStatus.UNSTITCHED,
+                **updates,
+            )
+
+    def edit_timeline_settings(self) -> None:
+        kind, timeline_id = self._selected_timeline_item()
+        if kind != "timeline" or not timeline_id:
+            timeline_id = self._active_timeline_id
+        timeline = next(
+            (item for item in self.project_store.timelines if item.id == timeline_id),
+            None,
+        )
+        if timeline is None:
+            self._error("Timeline Settings", "Create or open a timeline first")
+            return
+        values = self._settings_values(self._effective_timeline_config(timeline))
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Timeline Settings · {timeline.name}")
+        dialog.setMinimumWidth(620)
+        layout = QVBoxLayout(dialog)
+        title = QLabel("TIMELINE OVERRIDES")
+        title.setProperty("sectionTitle", True)
+        layout.addWidget(title)
+        inherit = QCheckBox("Use Project Settings")
+        inherit.setChecked(timeline.inherits_project_settings)
+        inherit.setToolTip("When enabled, project resolution and OCIO transforms stay linked")
+        layout.addWidget(inherit)
+        form = QFormLayout()
+        width = QSpinBox()
+        width.setRange(640, MAX_CANVAS_WIDTH)
+        width.setValue(int(values["width"]))
+        height = QSpinBox()
+        height.setRange(320, MAX_CANVAS_HEIGHT)
+        height.setValue(int(values["height"]))
+        fps_mode = ChevronComboBox()
+        fps_mode.addItem("Match plate set", FPS_MODE_MATCH_SOURCE)
+        fps_mode.addItem("Custom conform", FPS_MODE_CUSTOM)
+        fps_mode.setCurrentIndex(max(0, fps_mode.findData(values["fps_mode"])))
+        fps = QDoubleSpinBox()
+        fps.setRange(1.0, 240.0)
+        fps.setDecimals(6)
+        fps.setSingleStep(0.001)
+        fps.setValue(float(values["fps"]))
+        fps.setEnabled(fps_mode.currentData() == FPS_MODE_CUSTOM)
+        fps_mode.currentIndexChanged.connect(
+            lambda _index: fps.setEnabled(
+                not inherit.isChecked()
+                and fps_mode.currentData() == FPS_MODE_CUSTOM
+            )
+        )
+        color_mode = ChevronComboBox()
+        color_mode.addItem("Passthrough", "passthrough")
+        color_mode.addItem("OCIO", "ocio")
+        color_mode.setCurrentIndex(max(0, color_mode.findData(values["mode"])))
+        ocio = QLineEdit(str(values["ocio_config"]))
+        input_space = _new_ocio_space_combo(str(values["input_space"]))
+        working_space = _new_ocio_space_combo(str(values["working_space"]))
+        output_space = _new_ocio_space_combo(str(values["output_space"]), output=True)
+        output_mode = ChevronComboBox()
+        output_mode.addItem("Color space / Log", "colorspace")
+        output_mode.addItem("Display transform", "display_view")
+        output_mode.setCurrentIndex(max(0, output_mode.findData(values["output_mode"])))
+        output_display = ChevronComboBox()
+        output_view = ChevronComboBox()
+        output_space_label = QLabel("Output color space")
+        output_display_label = QLabel("Display")
+        output_view_label = QLabel("View")
+        ocio_spaces_status = QLabel()
+        ocio_spaces_status.setProperty("muted", True)
+        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces.setObjectName("secondaryButton")
+        ocio_row = QWidget()
+        ocio_layout = QHBoxLayout(ocio_row)
+        ocio_layout.setContentsMargins(0, 0, 0, 0)
+        ocio_layout.addWidget(ocio)
+        ocio_layout.addWidget(load_spaces)
+        for field in (ocio, input_space, working_space, output_space):
+            field.setMinimumWidth(320)
+
+        def reload_spaces() -> None:
+            try:
+                count = _load_ocio_combo_group(
+                    ocio.text().strip(),
+                    (input_space, working_space, output_space),
+                )
+                displays = ocio_display_views(ocio.text().strip())
+                _populate_delivery_display_combo(
+                    output_display, tuple(displays), str(values["display"])
+                )
+                _populate_combo(
+                    output_view,
+                    displays.get(_delivery_display_value(output_display), ()),
+                    str(values["view"]),
+                )
+                ocio_spaces_status.setText(f"{count} OCIO spaces loaded")
+            except Exception as error:
+                ocio_spaces_status.setText(f"Could not read OCIO config · {error}")
+
+        load_spaces.clicked.connect(reload_spaces)
+        ocio.editingFinished.connect(reload_spaces)
+        output_display.currentIndexChanged.connect(
+            lambda _index: _populate_combo(
+                output_view,
+                ocio_display_views(ocio.text().strip()).get(
+                    _delivery_display_value(output_display), ()
+                ),
+                "",
+            )
+        )
+
+        def update_delivery() -> None:
+            hdr = output_mode.currentData() == "display_view"
+            output_space.setVisible(not hdr)
+            output_space_label.setVisible(not hdr)
+            output_display.setVisible(hdr)
+            output_display_label.setVisible(hdr)
+            output_view.setVisible(hdr)
+            output_view_label.setVisible(hdr)
+
+        output_mode.currentIndexChanged.connect(update_delivery)
+        reload_spaces()
+        form.addRow("Canvas width", width)
+        form.addRow("Canvas height", height)
+        form.addRow("Timeline frame rate", fps_mode)
+        form.addRow("Custom FPS", fps)
+        form.addRow("Color pipeline", color_mode)
+        form.addRow("OCIO config", ocio_row)
+        form.addRow("Input transform", input_space)
+        form.addRow("Working space", working_space)
+        form.addRow("Delivery method", output_mode)
+        form.addRow(output_space_label, output_space)
+        form.addRow(output_display_label, output_display)
+        form.addRow(output_view_label, output_view)
+        form.addRow(ocio_spaces_status)
+        update_delivery()
+        layout.addLayout(form)
+        override_widgets = (
+            width, height, fps_mode, fps, color_mode, ocio_row, input_space, working_space,
+            output_mode, output_space, output_display, output_view,
+            ocio_spaces_status
+        )
+
+        def update_override_state(checked: bool) -> None:
+            for widget in override_widgets:
+                widget.setEnabled(not checked)
+            fps.setEnabled(
+                not checked and fps_mode.currentData() == FPS_MODE_CUSTOM
+            )
+
+        inherit.toggled.connect(update_override_state)
+        update_override_state(inherit.isChecked())
+        note = QLabel(
+            "Disable Use Project Settings only when this timeline needs a different canvas, frame rate, or color transform."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            config = self._effective_timeline_config(timeline)
+            if not inherit.isChecked():
+                previous_basis = self._color_match_basis(config)
+                previous_color = dict(config.get("color") or {})
+                config.setdefault("output", {}).update(
+                    {"width": width.value(), "height": height.value()}
+                )
+                metadata = config.setdefault("_vpstitch", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                    config["_vpstitch"] = metadata
+                selected_fps_mode = str(fps_mode.currentData())
+                metadata["fps_mode"] = selected_fps_mode
+                if selected_fps_mode == FPS_MODE_CUSTOM:
+                    config.setdefault("video", {})["fps"] = fps.value()
+                mode = str(color_mode.currentData())
+                config["color"] = {"mode": mode}
+                if mode == "ocio":
+                    delivery_mode = str(output_mode.currentData())
+                    required = [
+                        ocio.text().strip(), input_space.currentText().strip(),
+                        working_space.currentText().strip(),
+                    ]
+                    if delivery_mode == "display_view":
+                        required.extend(
+                            [_delivery_display_value(output_display), output_view.currentText().strip()]
+                        )
+                    else:
+                        required.append(output_space.currentText().strip())
+                    if not all(required):
+                        raise ValueError(
+                            "OCIO config and selected delivery fields are required"
+                        )
+                    config["color"].update(
+                        {
+                            "ocio_config": required[0],
+                            "working_space": required[2],
+                            "output_mode": delivery_mode,
+                        }
+                    )
+                    if delivery_mode == "display_view":
+                        config["color"].update(
+                            {"display": required[3], "view": required[4]}
+                        )
+                    else:
+                        config["color"]["output_space"] = required[3]
+                    for camera in config.get("cameras", []):
+                        if isinstance(camera, dict):
+                            camera["colorspace"] = required[1]
+                else:
+                    for camera in config.get("cameras", []):
+                        if isinstance(camera, dict):
+                            camera.pop("colorspace", None)
+                for key in (
+                    "match_reference", "match_strength", "preserve_luminance"
+                ):
+                    if key in previous_color:
+                        config["color"][key] = previous_color[key]
+                if previous_basis != self._color_match_basis(config):
+                    self._clear_color_match_snapshot(config)
+                elif "match_enabled" in previous_color:
+                    config["color"]["match_enabled"] = bool(
+                        previous_color["match_enabled"]
+                    )
+            updated = self.project_store.update_timeline(
+                timeline.id,
+                config_snapshot=config,
+                inherits_project_settings=inherit.isChecked(),
+            )
+            if self._active_timeline_id == updated.id:
+                self._active_timeline_id = None
+                self.load_project_timeline(updated.id)
+            self._refresh_media_tree()
+        except Exception as error:
+            self._error("Timeline Settings", str(error))
 
     def new_project(self) -> None:
         parent = QFileDialog.getExistingDirectory(
@@ -1832,7 +3487,9 @@ class MainWindow(QMainWindow):
 
     def _switch_project(self, store: ProjectStore) -> None:
         self._save_active_timeline()
+        self._cancel_source_proxy_items()
         self.project_store = store
+        self._last_autosave_digest = None
         self._active_timeline_id = None
         self._active_bin_id = None
         project_directory = store.path.parent
@@ -1854,6 +3511,33 @@ class MainWindow(QMainWindow):
         self._refresh_queue_table()
         if self._auto_workflows_enabled:
             self._restore_active_timeline()
+            self._queue_source_proxies(list(self.project_store.media))
+
+    def _autosave_project_snapshot(self, *, force: bool = False) -> bool:
+        """Refresh a low-frequency recovery copy only when project data changed."""
+        try:
+            self._save_active_timeline(strict=True)
+            encoded = json.dumps(
+                self.project_store.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            if not force and digest == self._last_autosave_digest:
+                self.autosave_status.setText("AUTOSAVE · UP TO DATE")
+                return False
+            self.project_store.save()
+            self.project_store.save_copy(
+                self.project_store.path.with_name("project.autosave.json")
+            )
+            self._last_autosave_digest = digest
+            self.autosave_status.setText(f"AUTOSAVED · {time.strftime('%H:%M')}")
+            return True
+        except (OSError, ProjectError, TypeError, ValueError) as error:
+            self.autosave_status.setText("AUTOSAVE · ERROR")
+            self._append_log(f"AUTOSAVE ERROR: {error}")
+            return False
 
     def open_project_folder(self) -> None:
         QProcess.startDetached("open" if sys.platform == "darwin" else "explorer", [str(self.project_store.path.parent)])
@@ -1863,6 +3547,119 @@ class MainWindow(QMainWindow):
         if item is None:
             return None, None
         return item.data(0, Qt.ItemDataRole.UserRole), item.data(0, Qt.ItemDataRole.UserRole + 1)
+
+    def _selected_timeline_item(self) -> tuple[str | None, str | None]:
+        item = self.timeline_tree.currentItem()
+        if item is None:
+            return None, None
+        return item.data(0, Qt.ItemDataRole.UserRole), item.data(0, Qt.ItemDataRole.UserRole + 1)
+
+    def _selected_media_records(self) -> list[MediaRecord]:
+        selected_ids = {
+            str(item.data(0, Qt.ItemDataRole.UserRole + 1))
+            for item in self.media_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole) == "media"
+        }
+        return [item for item in self.project_store.media if item.id in selected_ids]
+
+    def delete_focused_item(self) -> None:
+        if self.timeline_tree.hasFocus():
+            self.delete_selected_timeline()
+        else:
+            self.delete_selected_media_items()
+
+    def delete_selected_media_items(self) -> None:
+        records = self._selected_media_records()
+        kind, item_id = self._selected_media_item()
+        if records:
+            count = len(records)
+            names = ", ".join(Path(str(item.path)).name for item in records[:3])
+            if count > 3:
+                names += f" and {count - 3} more"
+            if self._show_message(
+                QMessageBox.Icon.Question,
+                "Remove Media from Project",
+                (
+                    f"Remove {count} selected clip{'s' if count != 1 else ''} from the Media Pool?\n\n"
+                    f"{names}\n\nSource files stay on disk. Existing timelines keep their source references."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._cancel_source_proxy_items({record.id for record in records})
+            try:
+                for record in records:
+                    self.project_store.remove_media(record.id)
+            except ProjectError as error:
+                self._error("Remove Media", str(error))
+                return
+            self._refresh_media_tree()
+            self.statusBar().showMessage(
+                f"Removed {count} clip{'s' if count != 1 else ''} from Media Pool · files remain on disk",
+                8000,
+            )
+            return
+
+        if kind != "bin" or not item_id:
+            return
+        folder = next(
+            (item for item in self.project_store.bins if item.id == item_id),
+            None,
+        )
+        if folder is None:
+            return
+        descendants = {folder.id}
+        changed = True
+        while changed:
+            before = len(descendants)
+            descendants.update(
+                item.id
+                for item in self.project_store.bins
+                if item.parent_id in descendants
+            )
+            changed = len(descendants) != before
+        media_count = sum(
+            item.bin_id in descendants for item in self.project_store.media
+        )
+        timeline_count = sum(
+            item.bin_id in descendants for item in self.project_store.timelines
+        )
+        if self._show_message(
+            QMessageBox.Icon.Question,
+            "Remove Folder from Project",
+            (
+                f'Remove folder “{folder.name}” and its contents from this project?\n\n'
+                f"{media_count} media clip(s) · {timeline_count} timeline(s)\n\n"
+                "Source files stay on disk."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        removed_media_ids = {
+            item.id for item in self.project_store.media if item.bin_id in descendants
+        }
+        self._cancel_source_proxy_items(removed_media_ids)
+        try:
+            self.project_store.remove_bin(
+                folder.id,
+                recursive=(len(descendants) > 1 or media_count > 0 or timeline_count > 0),
+            )
+        except ProjectError as error:
+            self._error("Remove Folder", str(error))
+            return
+        remaining_timeline_ids = {item.id for item in self.project_store.timelines}
+        if self._active_timeline_id not in remaining_timeline_ids:
+            self._active_timeline_id = None
+            self.settings.remove(self._last_timeline_setting_key())
+            self.clear_sources()
+        self._active_bin_id = folder.parent_id
+        self._refresh_media_tree()
+        self.statusBar().showMessage(
+            f'Removed folder “{folder.name}” from project · files remain on disk',
+            8000,
+        )
 
     def create_media_bin(self) -> None:
         kind, selected_id = self._selected_media_item()
@@ -1879,10 +3676,90 @@ class MainWindow(QMainWindow):
         except ProjectError as error:
             self._error("New Folder", str(error))
 
+    def _request_new_timeline(
+        self, default_name: str
+    ) -> tuple[str, int, bool] | None:
+        records = self._selected_media_records()
+        selected_count = len(records) if len(records) in SUPPORTED_CAMERA_COUNTS else None
+        cameras = self.config_data.get("cameras")
+        current_count = len(cameras) if isinstance(cameras, list) else 5
+        suggested_count = (
+            selected_count
+            if selected_count in SUPPORTED_CAMERA_COUNTS
+            else current_count
+            if current_count in SUPPORTED_CAMERA_COUNTS
+            else 5
+        )
+        dialog = NewTimelineDialog(
+            self,
+            default_name=default_name,
+            suggested_count=suggested_count,
+            selected_plate_count=selected_count,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name, count, add_selected = dialog.values()
+        if not name:
+            return None
+        return name, count, add_selected
+
+    def create_timeline(self) -> None:
+        existing_names = {item.name for item in self.project_store.timelines}
+        number = 1
+        default_name = f"Timeline {number:02d}"
+        while default_name in existing_names:
+            number += 1
+            default_name = f"Timeline {number:02d}"
+        requested = self._request_new_timeline(default_name)
+        if requested is None:
+            return
+        name, camera_count, add_selected = requested
+        bin_id = self._active_bin_id
+        if bin_id is None and self.project_store.bins:
+            bin_id = self.project_store.list_bins()[0].id
+        try:
+            source_paths: tuple[str, ...] = ()
+            plate_range = (
+                "P06–P08" if camera_count == 3 else "P01–P05"
+            )
+            if add_selected:
+                ordered = self._request_camera_assignment(
+                    self._selected_media_records(), camera_count
+                )
+                if ordered is None:
+                    return
+                source_paths = tuple(ordered)
+            config = self._config_with_project_defaults(
+                self._profile_for_count(camera_count)
+            )
+            timeline = TimelineRecord.create(
+                name=self._unique_timeline_name(name),
+                source_paths=source_paths,
+                config_snapshot=config,
+                inherits_project_settings=True,
+                bin_id=bin_id,
+                playback_cache_status=(
+                    PlaybackCacheStatus.PENDING
+                    if source_paths
+                    else PlaybackCacheStatus.EMPTY
+                ),
+            )
+            self.project_store.add_timeline(timeline)
+            self.load_project_timeline(timeline.id)
+            if source_paths and self._auto_workflows_enabled:
+                self._analyze_imported_sources()
+            self.statusBar().showMessage(
+                f"Created {timeline.name} · {camera_count}-camera {plate_range}"
+                + (" · selected plates added" if source_paths else " · ready for plates"),
+                10000,
+            )
+        except Exception as error:
+            self._error("New Timeline", str(error))
+
     def _refresh_media_tree(self) -> None:
         if not hasattr(self, "media_tree"):
             return
-        selected_id = self._active_timeline_id or self._active_bin_id
+        selected_id = self._active_bin_id
         self.media_tree.clear()
         root = QTreeWidgetItem([self.project_store.settings.name])
         root.setData(0, Qt.ItemDataRole.UserRole, "project")
@@ -1894,12 +3771,12 @@ class MainWindow(QMainWindow):
                 folder_item.setData(0, Qt.ItemDataRole.UserRole, "bin")
                 folder_item.setData(0, Qt.ItemDataRole.UserRole + 1, folder.id)
                 parent_item.addChild(folder_item)
-                for timeline in self.project_store.list_timelines(folder.id):
-                    self._append_timeline_tree_item(folder_item, timeline)
+                for media in self.project_store.list_media(folder.id):
+                    self._append_media_tree_item(folder_item, media)
                 add_bin(folder_item, folder.id)
 
-        for timeline in self.project_store.list_timelines(None):
-            self._append_timeline_tree_item(root, timeline)
+        for media in self.project_store.list_media(None):
+            self._append_media_tree_item(root, media)
         add_bin(root, None)
         root.setExpanded(True)
         self.media_tree.expandToDepth(1)
@@ -1912,102 +3789,208 @@ class MainWindow(QMainWindow):
                     item.setExpanded(True)
                     break
                 iterator += 1
+        self._refresh_timeline_tree()
         self._update_plate_set_context()
 
-    def _append_timeline_tree_item(
-        self, parent: QTreeWidgetItem, timeline: TimelineRecord
-    ) -> None:
+    def _append_media_tree_item(self, parent: QTreeWidgetItem, media: MediaRecord) -> None:
+        number = plate_number(media.path)
+        prefix = f"P{number:02d}  " if number is not None else ""
+        cache_suffix = {
+            MediaCacheStatus.BUILDING: "  · CACHE",
+            MediaCacheStatus.FAILED: "  · CACHE !",
+        }.get(media.source_cache_status, "")
+        item = QTreeWidgetItem(
+            [f"{prefix}{Path(str(media.path)).name}{cache_suffix}"]
+        )
+        cache_detail = {
+            MediaCacheStatus.EMPTY: "Source proxy not queued",
+            MediaCacheStatus.PENDING: "Source proxy queued",
+            MediaCacheStatus.BUILDING: "Source proxy building in background",
+            MediaCacheStatus.READY: f"Source proxy ready: {media.source_cache_path}",
+            MediaCacheStatus.FAILED: f"Source proxy failed: {media.source_cache_error or 'unknown error'}",
+        }[media.source_cache_status]
+        item.setToolTip(0, f"{media.path}\n{cache_detail}")
+        item.setData(0, Qt.ItemDataRole.UserRole, "media")
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, media.id)
+        parent.addChild(item)
+
+    def _refresh_timeline_tree(self) -> None:
+        if not hasattr(self, "timeline_tree"):
+            return
+        self.timeline_tree.clear()
+        for timeline in sorted(self.project_store.timelines, key=lambda item: item.order):
+            self._append_timeline_tree_item(timeline)
+
+    def _append_timeline_tree_item(self, timeline: TimelineRecord) -> None:
         numbers = [plate_number(path) for path in timeline.source_paths]
-        plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
-        cache = timeline.playback_cache_status.value.upper()
+        expected = PLATE_NUMBERS_BY_COUNT.get(len(numbers), ())
+        if numbers and tuple(numbers) == expected:
+            plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
+        elif numbers:
+            plate_label = f"{len(numbers)}-CAM · MANUAL ORDER"
+        else:
+            cameras = timeline.config_snapshot.get("cameras")
+            count = len(cameras) if isinstance(cameras, list) else 0
+            if count in SUPPORTED_CAMERA_COUNTS:
+                expected = PLATE_NUMBERS_BY_COUNT[count]
+                plate_label = (
+                    f"{count}-CAM · P{expected[0]:02d}–P{expected[-1]:02d} · EMPTY"
+                )
+            else:
+                plate_label = "NO PLATES"
         active = timeline.id == self._active_timeline_id
-        marker = "● " if active else ""
-        details = f"{plate_label} · {len(timeline.source_paths)} PLATES · {cache}"
+        folder = next(
+            (item.name for item in self.project_store.bins if item.id == timeline.bin_id),
+            "Master",
+        )
+        details = f"{plate_label} · {folder}"
         if active:
             details = f"{details} · ACTIVE"
-        item = QTreeWidgetItem([f"{marker}{timeline.name}\n{details}"])
+        item = QTreeWidgetItem([f"{timeline.name}\n{details}"])
         item.setSizeHint(0, QSize(0, 40))
         item.setToolTip(0, f"{timeline.name} · {details}")
         if active:
             active_font = item.font(0)
             active_font.setBold(True)
             item.setFont(0, active_font)
+            item.setBackground(0, QColor("#28282c"))
+            item.setForeground(0, QColor("#f7f8f8"))
         item.setData(0, Qt.ItemDataRole.UserRole, "timeline")
         item.setData(0, Qt.ItemDataRole.UserRole + 1, timeline.id)
-        parent.addChild(item)
-        for source in timeline.source_paths:
-            child = QTreeWidgetItem([Path(str(source)).name])
-            child.setData(0, Qt.ItemDataRole.UserRole, "plate")
-            child.setData(0, Qt.ItemDataRole.UserRole + 1, timeline.id)
-            item.addChild(child)
+        self.timeline_tree.addTopLevelItem(item)
+        if active:
+            self.timeline_tree.setCurrentItem(item)
 
     def _media_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
         kind = item.data(0, Qt.ItemDataRole.UserRole)
         item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
-        if kind == "timeline" and item_id:
-            self.load_project_timeline(str(item_id))
-        elif kind == "bin" and item_id:
+        if kind == "bin" and item_id:
             self._active_bin_id = str(item_id)
+
+    def _timeline_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
+        if item.data(0, Qt.ItemDataRole.UserRole) == "timeline":
+            item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            if item_id:
+                self.load_project_timeline(str(item_id))
 
     def _media_tree_menu(self, position) -> None:  # type: ignore[no-untyped-def]
         item = self.media_tree.itemAt(position)
-        if item is not None:
+        if item is not None and not item.isSelected():
             self.media_tree.setCurrentItem(item)
         kind, _item_id = self._selected_media_item()
         menu = QMenu(self)
+        menu.addAction("Import Media…", self.choose_videos)
         menu.addAction("New Folder…", self.create_media_bin)
         if kind == "bin":
             menu.addAction("Rename Folder…", self.rename_media_item)
-        if kind == "timeline":
-            menu.addAction("Open Plate Set", self.open_selected_timeline)
-            menu.addAction("Rename Plate Set…", self.rename_media_item)
-            menu.addAction("Duplicate Plate Set", self.duplicate_selected_timeline)
+        selected_media = self._selected_media_records()
+        if selected_media:
             menu.addSeparator()
-            menu.addAction("Delete Plate Set…", self.delete_selected_timeline)
+            active = self._active_timeline_record()
+            if active is not None:
+                action = menu.addAction(
+                    f'Add {len(selected_media)} Selected to “{active.name}”',
+                    lambda checked=False, timeline_id=active.id: self.add_selected_media_to_timeline(timeline_id),
+                )
+                action.setEnabled(True)
+            submenu = menu.addMenu("Add Selected to Timeline")
+            for timeline in self.project_store.timelines:
+                submenu.addAction(
+                    timeline.name,
+                    lambda checked=False, timeline_id=timeline.id: self.add_selected_media_to_timeline(timeline_id),
+                )
+            submenu.setEnabled(bool(self.project_store.timelines))
+        if kind in {"bin", "media"} or selected_media:
+            menu.addSeparator()
+            menu.addAction("Remove from Project…", self.delete_selected_media_items)
         menu.exec(self.media_tree.viewport().mapToGlobal(position))
+
+    def _timeline_tree_menu(self, position) -> None:  # type: ignore[no-untyped-def]
+        item = self.timeline_tree.itemAt(position)
+        if item is not None:
+            self.timeline_tree.setCurrentItem(item)
+        kind, _item_id = self._selected_timeline_item()
+        menu = QMenu(self)
+        menu.addAction("New Timeline…", self.create_timeline)
+        if kind == "timeline":
+            menu.addAction("Open Timeline", self.open_selected_timeline)
+            menu.addAction("Timeline Settings…", self.edit_timeline_settings)
+            menu.addAction("Rename Timeline…", self.rename_timeline)
+            menu.addAction("Duplicate Timeline", self.duplicate_selected_timeline)
+            menu.addSeparator()
+            menu.addAction("Delete Timeline…", self.delete_selected_timeline)
+            menu.addAction(
+                "Add Timeline to Render Queue", self.add_selected_timeline_to_queue
+            )
+        menu.exec(self.timeline_tree.viewport().mapToGlobal(position))
 
     def rename_media_item(self) -> None:
         kind, item_id = self._selected_media_item()
-        if kind not in {"bin", "timeline"} or not item_id:
+        if kind != "bin" or not item_id:
             return
         current = next(
             (
                 item.name
-                for item in (
-                    self.project_store.bins if kind == "bin" else self.project_store.timelines
-                )
+                for item in self.project_store.bins
                 if item.id == item_id
             ),
             "",
         )
-        title = "Rename Plate Set" if kind == "timeline" else "Rename Folder"
-        label = "Plate Set name" if kind == "timeline" else "Folder name"
-        name, accepted = QInputDialog.getText(self, title, label, text=current)
+        name, accepted = QInputDialog.getText(
+            self, "Rename Folder", "Folder name", text=current
+        )
         if not accepted or not name.strip():
             return
         try:
-            if kind == "bin":
-                self.project_store.update_bin(item_id, name=name.strip())
-            else:
-                self.project_store.update_timeline(item_id, name=name.strip())
+            self.project_store.update_bin(item_id, name=name.strip())
             self._refresh_media_tree()
         except ProjectError as error:
             self._error("Rename", str(error))
 
+    def rename_timeline(self) -> None:
+        kind, item_id = self._selected_timeline_item()
+        if kind != "timeline" or not item_id:
+            item_id = self._active_timeline_id
+        timeline = next(
+            (item for item in self.project_store.timelines if item.id == item_id),
+            None,
+        )
+        if timeline is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename Timeline", "Timeline name", text=timeline.name
+        )
+        if not accepted or not name.strip():
+            return
+        try:
+            self.project_store.update_timeline(timeline.id, name=name.strip())
+            self._refresh_media_tree()
+        except ProjectError as error:
+            self._error("Rename Timeline", str(error))
+
+    def rename_focused_item(self) -> None:
+        if self.timeline_tree.hasFocus():
+            self.rename_timeline()
+        else:
+            self.rename_media_item()
+
     def open_selected_timeline(self) -> None:
-        kind, item_id = self._selected_media_item()
+        kind, item_id = self._selected_timeline_item()
         if kind == "timeline" and item_id:
             self.load_project_timeline(item_id)
 
     def duplicate_selected_timeline(self) -> None:
-        kind, item_id = self._selected_media_item()
+        kind, item_id = self._selected_timeline_item()
         if kind != "timeline" or not item_id:
+            item_id = self._active_timeline_id
+        if not item_id:
             return
         source = next(item for item in self.project_store.timelines if item.id == item_id)
         duplicate = TimelineRecord.create(
             name=f"{source.name} Copy",
             source_paths=source.source_paths,
             config_snapshot=source.config_snapshot,
+            inherits_project_settings=source.inherits_project_settings,
             bin_id=source.bin_id,
             tc_alignment_snapshot=source.tc_alignment_snapshot,
             in_frame=source.in_frame,
@@ -2026,8 +4009,10 @@ class MainWindow(QMainWindow):
             self._error("Duplicate Timeline", str(error))
 
     def delete_selected_timeline(self) -> None:
-        kind, item_id = self._selected_media_item()
+        kind, item_id = self._selected_timeline_item()
         if kind != "timeline" or not item_id:
+            item_id = self._active_timeline_id
+        if not item_id:
             return
         timeline = next(
             (item for item in self.project_store.timelines if item.id == item_id),
@@ -2037,9 +4022,9 @@ class MainWindow(QMainWindow):
             return
         if self._show_message(
             QMessageBox.Icon.Question,
-            "Delete Plate Set",
+            "Delete Timeline",
             (
-                f'Delete Plate Set “{timeline.name}”? '
+                f'Delete timeline “{timeline.name}”? '
                 f"Its {len(timeline.source_paths)} source media files will remain on disk."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2053,19 +4038,86 @@ class MainWindow(QMainWindow):
             self.clear_sources()
         self._refresh_media_tree()
 
-    def _timeline_for_sources(self, sources: list[str]) -> TimelineRecord | None:
-        normalized = tuple(str(Path(path)) for path in sources)
-        return next(
-            (
-                item
-                for item in self.project_store.timelines
-                if tuple(str(path) for path in item.source_paths) == normalized
-            ),
+    def _request_camera_assignment(
+        self,
+        records: list[MediaRecord],
+        camera_count: int,
+    ) -> list[str] | None:
+        paths = [str(item.path) for item in records]
+        suggested, manual = suggest_camera_assignment(paths, camera_count)
+        if not manual:
+            return suggested
+        dialog = PlateAssignmentDialog(
+            self,
+            paths=paths,
+            camera_count=camera_count,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.values()
+
+    def add_selected_media_to_timeline(self, timeline_id: str) -> None:
+        timeline = next(
+            (item for item in self.project_store.timelines if item.id == timeline_id),
             None,
         )
+        if timeline is None:
+            self._error("Add to Timeline", "Create or select a timeline first")
+            return
+        records = self._selected_media_records()
+        if not records:
+            self._error("Add to Timeline", "Select camera clips in the Media Pool first")
+            return
+        try:
+            camera_count = len(records)
+            if camera_count not in SUPPORTED_CAMERA_COUNTS:
+                raise ValueError("Select exactly 3 or 5 clips")
+            ordered = self._request_camera_assignment(records, camera_count)
+            if ordered is None:
+                return
+            detected = [plate_number(path) for path in ordered]
+            expected = list(PLATE_NUMBERS_BY_COUNT[camera_count])
+            automatic = detected == expected
+            was_active = self._active_timeline_id == timeline.id
+            self._save_active_timeline()
+            self.project_store.update_timeline(
+                timeline.id,
+                source_paths=tuple(ordered),
+                tc_alignment_snapshot=None,
+                in_frame=0,
+                out_frame=None,
+                playback_cache_path=None,
+                playback_cache_status=PlaybackCacheStatus.PENDING,
+                stitch_status=StitchStatus.UNSTITCHED,
+            )
+            if was_active:
+                self._active_timeline_id = None
+            self.load_project_timeline(timeline.id)
+            if self._auto_workflows_enabled:
+                self._analyze_imported_sources()
+            self.statusBar().showMessage(
+                (
+                    f"Added P{expected[0]:02d}–P{expected[-1]:02d} to {timeline.name}"
+                    if automatic
+                    else f"Assigned {camera_count} clips to camera slots in {timeline.name}"
+                ),
+                10000,
+            )
+        except Exception as error:
+            self._error(
+                "Add to Timeline",
+                "Select the exact 3- or 5-camera count required by the timeline."
+                f"\n\n{error}",
+            )
 
-    def _unique_plate_set_name(self, requested: str, sources: list[str]) -> str:
-        base = requested.strip() or self._timeline_name(sources)
+    def add_selected_media_to_active_timeline(self) -> None:
+        if not self._active_timeline_id:
+            self._error("Add to Timeline", "Create or open a timeline first")
+            return
+        self.add_selected_media_to_timeline(self._active_timeline_id)
+
+    def _unique_timeline_name(self, requested: str) -> str:
+        base = requested.strip() or "Timeline"
         project_names = {item.name for item in self.project_store.timelines}
         name = base
         suffix = 2
@@ -2074,69 +4126,57 @@ class MainWindow(QMainWindow):
             suffix += 1
         return name
 
-    def _ensure_project_timeline(
-        self, sources: list[str], *, plate_set_name: str | None = None
-    ) -> None:
-        if self._loading_timeline:
-            return
-        existing = self._timeline_for_sources(sources)
-        if existing is not None:
-            self._active_timeline_id = existing.id
-            self._active_bin_id = existing.bin_id
-            self._remember_active_timeline()
-            self._refresh_media_tree()
-            return
-        bin_id = self._active_bin_id
-        if bin_id is None and self.project_store.bins:
-            bin_id = self.project_store.list_bins()[0].id
-        name = self._unique_plate_set_name(plate_set_name or "", sources)
-        try:
-            timeline = TimelineRecord.create(
-                name=name,
-                source_paths=sources,
-                config_snapshot=self._collect_config(),
-                bin_id=bin_id,
-                playback_cache_status=PlaybackCacheStatus.PENDING,
-                stitch_status=StitchStatus.UNSTITCHED,
-            )
-            self.project_store.add_timeline(timeline)
-            self._active_timeline_id = timeline.id
-            self._active_bin_id = timeline.bin_id
-            self._remember_active_timeline()
-            self._refresh_media_tree()
-        except ProjectError as error:
-            self._append_log(f"PROJECT TIMELINE: {error}")
-
-    def _save_active_timeline(self) -> None:
+    def _save_active_timeline(self, *, strict: bool = False) -> bool:
         if not self._active_timeline_id or self._loading_timeline:
-            return
-        if not any(item.id == self._active_timeline_id for item in self.project_store.timelines):
-            return
+            return True
+        active = self._active_timeline_record()
+        if active is None:
+            return True
         try:
-            sources = self._validate_sources()
+            table_paths = self.source_table.paths()
+            sources = self._validate_sources() if any(table_paths) else []
             lower = self.timeline_in.value() if self._tc_alignment else 0
             upper = self.timeline_out.value() if self._tc_alignment else None
             cache_ready = self._playback_path is not None and self._playback_path.is_file()
+            config_snapshot = self._collect_config()
+            playback_status = (
+                PlaybackCacheStatus.READY
+                if cache_ready
+                else PlaybackCacheStatus.PENDING
+                if sources
+                else PlaybackCacheStatus.EMPTY
+            )
+            stitch_status = (
+                StitchStatus.READY if self._preview_ready else StitchStatus.UNSTITCHED
+            )
+            if (
+                active.source_paths == tuple(Path(path) for path in sources)
+                and active.config_snapshot == config_snapshot
+                and active.tc_alignment_snapshot == self._tc_alignment
+                and active.in_frame == lower
+                and active.out_frame == upper
+                and active.playback_cache_path == self._playback_path
+                and active.playback_cache_status is playback_status
+                and active.stitch_status is stitch_status
+            ):
+                return True
             self.project_store.update_timeline(
                 self._active_timeline_id,
                 source_paths=tuple(sources),
-                config_snapshot=self._collect_config(),
+                config_snapshot=config_snapshot,
                 tc_alignment_snapshot=self._tc_alignment,
                 in_frame=lower,
                 out_frame=upper,
                 playback_cache_path=self._playback_path,
-                playback_cache_status=(
-                    PlaybackCacheStatus.READY
-                    if cache_ready
-                    else PlaybackCacheStatus.PENDING
-                ),
-                stitch_status=(
-                    StitchStatus.READY if self._preview_ready else StitchStatus.UNSTITCHED
-                ),
+                playback_cache_status=playback_status,
+                stitch_status=stitch_status,
             )
             self._refresh_media_tree()
+            return True
         except (ProjectError, ValueError, OSError):
-            pass
+            if strict:
+                raise
+            return False
 
     def load_project_timeline(self, timeline_id: str) -> None:
         timeline = next(
@@ -2154,9 +4194,21 @@ class MainWindow(QMainWindow):
             directory = self._working_dir / "timelines" / timeline.id
             directory.mkdir(parents=True, exist_ok=True)
             config_path = directory / "config.json"
-            config_path.write_text(json.dumps(timeline.config_snapshot, indent=2), encoding="utf-8")
+            config_path.write_text(
+                json.dumps(self._effective_timeline_config(timeline), indent=2),
+                encoding="utf-8",
+            )
             self.load_config(config_path)
-            self._set_video_sources([str(path) for path in timeline.source_paths])
+            loaded_cameras = self.config_data.get("cameras")
+            if isinstance(loaded_cameras, list):
+                self._plate_reset_cameras = json.loads(json.dumps(loaded_cameras))
+            if timeline.source_paths:
+                self._set_video_sources(
+                    [str(path) for path in timeline.source_paths],
+                    preserve_order=True,
+                )
+            else:
+                self.clear_sources()
             self._active_timeline_id = timeline.id
             self._active_bin_id = timeline.bin_id
             self._remember_active_timeline()
@@ -2175,13 +4227,20 @@ class MainWindow(QMainWindow):
                 cache_path = Path(str(timeline.playback_cache_path))
                 if cache_path.is_file() and cache_path.stat().st_size > 0:
                     key, _ = self._playback_signature()
-                    self._load_playback(cache_path, key, autoplay=False)
+                    if cache_path.stem == key:
+                        self._load_playback(cache_path, key, autoplay=False)
             self.statusBar().showMessage(f"Opened timeline: {timeline.name}", 8000)
         except Exception as error:
             self._error("Open Timeline", str(error))
         finally:
             self._loading_timeline = False
             self._refresh_media_tree()
+        if (
+            self._auto_workflows_enabled
+            and self._tc_alignment is not None
+            and self._playback_path is None
+        ):
+            self._request_playback_warmup()
 
     def show_shortcuts(self) -> None:
         self._show_message(
@@ -2229,14 +4288,29 @@ class MainWindow(QMainWindow):
         if count == 3 and 5 in self._rig_profiles:
             profile = json.loads(json.dumps(self._rig_profiles[5]))
             cameras = profile["cameras"]
-            profile["cameras"] = [cameras[0], cameras[len(cameras) // 2], cameras[-1]]
+            # P06–P08 is the three-camera/front configuration.  Use the
+            # center three positions from the five-camera 180° rig so the
+            # adjacent views retain the calibrated overlap.  Taking the two
+            # outer cameras would leave roughly 77° between views and makes
+            # the three-camera auto-stitch guard reject otherwise good media.
+            center = len(cameras) // 2
+            selected = cameras[center - 1 : center + 2]
+            for index, camera in enumerate(selected):
+                # Keep camera ids stable across 3- and 5-camera timelines so
+                # inherited color.match_reference values remain valid.
+                camera["name"] = f"cam{index}"
+            profile["cameras"] = selected
             self._rig_profiles[3] = json.loads(json.dumps(profile))
             return profile
         raise ValueError(f"Load a calibrated {count}-camera Rig Profile first")
 
     def _activate_camera_count(self, count: int) -> None:
-        profile = self._profile_for_count(count)
-        cameras = profile.get("cameras")
+        current = self.config_data.get("cameras")
+        if isinstance(current, list) and len(current) == count:
+            cameras = current
+        else:
+            profile = self._profile_for_count(count)
+            cameras = profile.get("cameras")
         if not isinstance(cameras, list) or len(cameras) != count:
             raise ValueError(f"The active Rig Profile does not contain {count} cameras")
         self.config_data["cameras"] = json.loads(json.dumps(cameras))
@@ -2250,12 +4324,25 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME}  —  {count}-Camera 180°")
 
     def _set_video_sources(
-        self, files: list[str], *, plate_set_name: str | None = None
+        self,
+        files: list[str],
+        *,
+        preserve_order: bool = False,
     ) -> None:
-        ordered, numbers = order_camera_plates(files)
+        if preserve_order:
+            if len(files) not in SUPPORTED_CAMERA_COUNTS:
+                raise ValueError("A saved timeline must contain 3 or 5 camera slots")
+            ordered = list(files)
+            detected = [plate_number(path) for path in ordered]
+            expected = list(PLATE_NUMBERS_BY_COUNT[len(ordered)])
+            numbers = detected if detected == expected else None
+        else:
+            ordered, numbers = order_camera_plates(files)
         self._activate_camera_count(len(ordered))
-        self._plate_numbers = numbers
+        slot_numbers = list(PLATE_NUMBERS_BY_COUNT[len(ordered)])
+        self._plate_numbers = numbers or slot_numbers
         self._source_probes = None
+        self._source_fps_error = None
         cameras = self.config_data["cameras"]
         self._source_overrides = {
             path: {
@@ -2265,21 +4352,21 @@ class MainWindow(QMainWindow):
             for path, camera in zip(ordered, cameras, strict=True)
         }
         self.source_table.set_paths(ordered)
-        self.source_table.set_camera_numbers(
-            numbers or list(PLATE_NUMBERS_BY_COUNT[len(ordered)])
-        )
+        self.source_table.set_camera_numbers(slot_numbers)
         current_output = self.output_path.text().strip()
         if not current_output or current_output == self._last_auto_output:
             self._last_auto_output = self._suggest_output_path(ordered)
-            self.output_path.setText(self._last_auto_output)
+            self._set_output_destination(self._last_auto_output)
         self._reset_timing()
         order_note = (
             f"P{numbers[0]:02d} → P{numbers[-1]:02d}"
             if numbers
-            else "natural filename order"
+            else "manual camera-slot order"
         )
         self._append_log(f"Imported {len(ordered)} plates · {order_note}")
-        self._ensure_project_timeline(ordered, plate_set_name=plate_set_name)
+        self.source_table.setCurrentCell(0, 0)
+        self._selected_camera_row = 0
+        self._load_plate_controls(0)
 
     def _suggest_output_path(self, sources: list[str]) -> str:
         stem = re.sub(
@@ -2291,20 +4378,212 @@ class MainWindow(QMainWindow):
             stem = Path(sources[0]).parent.name or "timeline"
         safe = re.sub(r"[^A-Za-z0-9가-힣._-]+", "_", stem).strip("._-")
         codec = str(self.output_codec.currentData())
+        return str(resolved_render_output(self._output_root, f"{safe}_stitched", codec))
+
+    def _output_codec_changed(self) -> None:
+        self._update_output_hint()
+        self._output_fields_changed()
+
+    def _output_fields_changed(self) -> None:
+        if self._updating_output_destination:
+            return
+        try:
+            path = resolved_render_output(
+                self.output_directory.text(),
+                self.output_name.text(),
+                str(self.output_codec.currentData()),
+            )
+        except ValueError as error:
+            self.output_path.clear()
+            self.output_path_preview.setText(str(error))
+            return
+        self.output_path.setText(str(path))
+        self.output_path_preview.setText(str(path))
+
+    def _set_output_destination(self, path: str | Path) -> None:
+        codec = str(self.output_codec.currentData())
+        folder, name = split_render_output(path, codec)
+        self._updating_output_destination = True
+        self.output_directory.setText(str(folder))
+        self.output_name.setText(name)
+        self.output_path.setText(str(path))
+        self.output_path_preview.setText(str(path))
+        self._updating_output_destination = False
+
+    @staticmethod
+    def _output_collision_key(path: str | Path) -> str:
+        expanded = Path(path).expanduser().resolve(strict=False)
+        return os.path.normcase(os.path.normpath(str(expanded)))
+
+    @staticmethod
+    def _prepare_output_destination(output: Path, codec: str) -> None:
+        if codec not in OUTPUT_SUFFIX_BY_CODEC:
+            raise ValueError(f"Unsupported output codec: {codec}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if not output.parent.is_dir():
+            raise ValueError(f"Output folder is not a directory: {output.parent}")
         if codec.endswith("sequence"):
-            return str(self._output_root / f"{safe}_stitched")
-        suffix = (
-            ".mov"
-            if codec.startswith("prores")
-            else ".mp4"
-            if codec == "h264-mp4-10"
-            else ".mkv"
+            if output.exists() and not output.is_dir():
+                raise ValueError(f"Sequence output must be a folder: {output}")
+            if output.is_dir() and any(output.iterdir()):
+                raise ValueError(f"Sequence output folder is not empty: {output}")
+            return
+        if output.exists():
+            raise ValueError(f"Output already exists: {output}")
+
+    @staticmethod
+    def _render_staging_path(output: Path, codec: str, token: str) -> Path:
+        safe_token = re.sub(r"[^A-Za-z0-9_-]+", "-", token)[:32]
+        if codec.endswith("sequence"):
+            return output.with_name(f".{output.name}.vpstitch-part-{safe_token}")
+        return output.with_name(
+            f".{output.stem}.vpstitch-part-{safe_token}{output.suffix}"
         )
-        return str(self._output_root / f"{safe}_stitched{suffix}")
+
+    @staticmethod
+    def _discard_render_staging(path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _commit_render_staging(staging: Path, output: Path) -> None:
+        if not staging.exists():
+            raise ValueError(f"Render finished without creating output: {staging}")
+        if staging.is_dir():
+            if not any(staging.iterdir()):
+                raise ValueError("Render finished with an empty sequence folder")
+        elif staging.stat().st_size < 1:
+            raise ValueError("Render finished with an empty output file")
+        if output.exists():
+            raise ValueError(f"Output appeared while rendering: {output}")
+        os.replace(staging, output)
+        try:
+            directory_fd = os.open(output.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+
+    def _request_render_destination(
+        self,
+        *,
+        title: str,
+        action_label: str,
+    ) -> str | None:
+        if not self._auto_workflows_enabled:
+            self._output_fields_changed()
+            return self.output_path.text().strip() or None
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setMinimumSize(700, 340)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel("RENDER DESTINATION")
+        heading.setProperty("sectionTitle", True)
+        layout.addWidget(heading)
+        note = QLabel(
+            "This exact folder and name are stored with the queue item. Render All will not reuse another timeline's destination."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        folder = QLineEdit(self.output_directory.text())
+        folder.setMinimumWidth(380)
+        browse = QPushButton("…")
+        browse.setObjectName("iconButton")
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.addWidget(folder)
+        folder_layout.addWidget(browse)
+        name = QLineEdit(self.output_name.text())
+        name.setMinimumWidth(380)
+        codec = ChevronComboBox()
+        codec.setObjectName("renderCodec")
+        for label, value in GUI_MASTER_CODEC_OPTIONS:
+            codec.addItem(label, value)
+        current_codec = codec.findData(self.output_codec.currentData())
+        codec.setCurrentIndex(max(0, current_codec))
+        extension = QLabel()
+        resolved = QLineEdit()
+        resolved.setMinimumWidth(380)
+        resolved.setReadOnly(True)
+        resolved.setProperty("muted", True)
+        form.addRow("Output folder", folder_row)
+        form.addRow("File name", name)
+        form.addRow("Format", codec)
+        form.addRow("Format suffix", extension)
+        form.addRow("Resolved path", resolved)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        accept = buttons.button(QDialogButtonBox.StandardButton.Save)
+        accept.setText(action_label)
+        accept.setObjectName("primaryButton")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def refresh() -> None:
+            selected_codec = str(codec.currentData())
+            extension.setText(
+                OUTPUT_SUFFIX_BY_CODEC.get(selected_codec, "") or "Sequence folder"
+            )
+            try:
+                path = resolved_render_output(
+                    folder.text(), name.text(), selected_codec
+                )
+            except ValueError as error:
+                resolved.setText(str(error))
+                accept.setEnabled(False)
+                return
+            resolved.setText(str(path))
+            resolved.setToolTip(str(path))
+            accept.setEnabled(True)
+
+        def browse_folder() -> None:
+            selected = QFileDialog.getExistingDirectory(
+                dialog,
+                "Select render folder",
+                folder.text() or str(self._output_root),
+            )
+            if selected:
+                folder.setText(selected)
+
+        browse.clicked.connect(browse_folder)
+        folder.textChanged.connect(refresh)
+        name.textChanged.connect(refresh)
+        codec.currentIndexChanged.connect(refresh)
+        refresh()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected_codec = str(codec.currentData())
+        main_codec_index = self.output_codec.findData(selected_codec)
+        if main_codec_index < 0:
+            raise ValueError(f"Unsupported output codec: {selected_codec}")
+        self.output_codec.setCurrentIndex(main_codec_index)
+        path = resolved_render_output(folder.text(), name.text(), selected_codec)
+        self._set_output_destination(path)
+        self._last_auto_output = None
+        return str(path)
 
     def _update_source_status(self) -> None:
         loaded = sum(bool(path) for path in self.source_table.paths())
         expected = self.source_table.camera_count()
+        ready = loaded == expected and expected in SUPPORTED_CAMERA_COUNTS
+        for name in ("tc_align_button", "preview_button", "add_queue_button", "render_button"):
+            button = getattr(self, name, None)
+            if button is not None and self.process is None:
+                button.setEnabled(ready)
         if loaded == self.source_table.camera_count():
             order_note = (
                 f"P{self._plate_numbers[0]:02d} → P{self._plate_numbers[-1]:02d}"
@@ -2333,7 +4612,11 @@ class MainWindow(QMainWindow):
         elif loaded:
             self.source_status.setText(f"●  {loaded} of {expected} plates loaded")
         else:
-            self.source_status.setText("Drop P06–P08 or P01–P05 clips here")
+            self.source_status.setText(
+                "No plates assigned · select Media Pool clips and add them to this timeline"
+                if self._active_timeline_id else
+                "Import media, create a timeline, then assign P01–P05 or P06–P08"
+            )
 
     def _stitch_settings(self) -> QWidget:
         panel = QWidget()
@@ -2354,7 +4637,7 @@ class MainWindow(QMainWindow):
         profile_note.setProperty("muted", True)
         profile_layout.addWidget(profile_note)
         align_note = QLabel(
-            "Rig Align corrects camera rotation only, then refreshes Preview."
+            "Auto Stitch solves camera rotation once, then refreshes Quick Preview."
         )
         align_note.setWordWrap(True)
         profile_layout.addWidget(align_note)
@@ -2426,6 +4709,9 @@ class MainWindow(QMainWindow):
             self.canvas_height,
             self.h_fov,
             self.v_fov,
+            self.center_yaw,
+            self.center_pitch,
+            self.seam_feather,
         ):
             widget.valueChanged.connect(self._canvas_controls_changed)
         layout.addWidget(canvas)
@@ -2438,11 +4724,14 @@ class MainWindow(QMainWindow):
         flow_form.setHorizontalSpacing(8)
         flow_form.setVerticalSpacing(5)
         self.flow_enabled = QCheckBox("Enable DIS optical flow")
-        self.flow_preset = QComboBox()
+        self.flow_preset = ChevronComboBox()
         self.flow_preset.addItems(["ultrafast", "fast", "medium"])
         self.flow_max = QDoubleSpinBox()
         self.flow_max.setRange(1.0, 256.0)
         self.flow_max.setSuffix(" px")
+        self.flow_enabled.toggled.connect(self._stitch_setting_changed)
+        self.flow_preset.currentTextChanged.connect(self._stitch_setting_changed)
+        self.flow_max.valueChanged.connect(self._stitch_setting_changed)
         flow_form.addRow(self.flow_enabled)
         flow_form.addRow("Quality", self.flow_preset)
         flow_form.addRow("Max displacement", self.flow_max)
@@ -2465,52 +4754,456 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return panel
 
+    def _plate_settings(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 8)
+        layout.setSpacing(7)
+
+        self.plate_inspector_title = QLabel("SELECT A TIMELINE PLATE")
+        self.plate_inspector_title.setProperty("inspectorTitle", True)
+        layout.addWidget(self.plate_inspector_title)
+        note = QLabel(
+            "Select a plate in ACTIVE TIMELINE. Adjustments stay on this timeline and "
+            "are used by Preview, playback proxy, and final render.\n"
+            "Drag values ↑↓ · Shift-drag for 10× precision."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+
+        transform = QGroupBox("TRANSFORM")
+        transform_form = QFormLayout(transform)
+        transform_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.plate_position_x = ScrubbableDoubleSpinBox()
+        self.plate_position_x.setRange(-180.0, 180.0)
+        self.plate_position_x.setDecimals(3)
+        self.plate_position_x.setSingleStep(0.05)
+        self.plate_position_x.setSuffix("°")
+        self.plate_position_x.setToolTip("Horizontal placement; adjusts camera yaw")
+        self.plate_position_y = ScrubbableDoubleSpinBox()
+        self.plate_position_y.setRange(-89.0, 89.0)
+        self.plate_position_y.setDecimals(3)
+        self.plate_position_y.setSingleStep(0.05)
+        self.plate_position_y.setSuffix("°")
+        self.plate_position_y.setToolTip("Vertical placement; adjusts camera pitch")
+        self.plate_rotation = ScrubbableDoubleSpinBox()
+        self.plate_rotation.setRange(-45.0, 45.0)
+        self.plate_rotation.setDecimals(3)
+        self.plate_rotation.setSingleStep(0.05)
+        self.plate_rotation.setSuffix("°")
+        self.plate_scale = ScrubbableDoubleSpinBox()
+        self.plate_scale.setRange(10.0, 400.0)
+        self.plate_scale.setDecimals(2)
+        self.plate_scale.setSingleStep(0.25)
+        self.plate_scale.setSuffix("%")
+        for label, widget in (
+            ("Position X", self.plate_position_x),
+            ("Position Y", self.plate_position_y),
+            ("Rotation", self.plate_rotation),
+            ("Scale", self.plate_scale),
+        ):
+            transform_form.addRow(label, widget)
+        layout.addWidget(transform)
+
+        crop = QGroupBox("SOURCE CROP")
+        crop_form = QFormLayout(crop)
+        crop_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.plate_crop_left = ScrubbableDoubleSpinBox()
+        self.plate_crop_right = ScrubbableDoubleSpinBox()
+        self.plate_crop_top = ScrubbableDoubleSpinBox()
+        self.plate_crop_bottom = ScrubbableDoubleSpinBox()
+        for label, widget in (
+            ("Left", self.plate_crop_left),
+            ("Right", self.plate_crop_right),
+            ("Top", self.plate_crop_top),
+            ("Bottom", self.plate_crop_bottom),
+        ):
+            widget.setRange(0.0, 49.0)
+            widget.setDecimals(2)
+            widget.setSingleStep(0.25)
+            widget.setSuffix("%")
+            crop_form.addRow(label, widget)
+        layout.addWidget(crop)
+
+        warp = QGroupBox("LENS WARP")
+        warp_form = QFormLayout(warp)
+        warp_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.plate_warp_controls = tuple(
+            ScrubbableDoubleSpinBox() for _ in range(4)
+        )
+        for index, widget in enumerate(self.plate_warp_controls, start=1):
+            widget.setRange(-2.0, 2.0)
+            widget.setDecimals(5)
+            widget.setSingleStep(0.0005)
+            widget.setToolTip(
+                "Lens distortion coefficient used by Preview, proxy and final render"
+            )
+            warp_form.addRow(f"Warp {index}", widget)
+        layout.addWidget(warp)
+
+        blend = QGroupBox("EDGE BLEND")
+        blend_form = QFormLayout(blend)
+        blend_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.plate_feather_left = ScrubbableDoubleSpinBox()
+        self.plate_feather_right = ScrubbableDoubleSpinBox()
+        for label, widget in (
+            ("Left feather", self.plate_feather_left),
+            ("Right feather", self.plate_feather_right),
+        ):
+            widget.setRange(0.05, 30.0)
+            widget.setDecimals(2)
+            widget.setSingleStep(0.1)
+            widget.setSuffix("°")
+            blend_form.addRow(label, widget)
+        layout.addWidget(blend)
+
+        for widget in self._plate_control_widgets():
+            widget.setToolTip(
+                (widget.toolTip() + "\n" if widget.toolTip() else "")
+                + "Drag up/down to scrub · hold Shift for 10× finer control"
+            )
+            widget.valueChanged.connect(self._plate_control_changed)
+
+        actions = QHBoxLayout()
+        reset = QPushButton("RESET PLATE")
+        reset.setObjectName("secondaryButton")
+        reset.clicked.connect(self._reset_selected_plate)
+        refresh = QPushButton("REFRESH FRAME")
+        refresh.setObjectName("primaryButton")
+        refresh.setToolTip(
+            "Live Preview updates automatically; use this only to retry the current frame"
+        )
+        refresh.clicked.connect(self._refresh_plate_preview)
+        actions.addWidget(reset)
+        actions.addWidget(refresh, 1)
+        layout.addLayout(actions)
+        layout.addStretch()
+        self._set_plate_controls_enabled(False)
+        return panel
+
+    def _plate_control_widgets(self) -> tuple[QDoubleSpinBox, ...]:
+        return (
+            self.plate_position_x,
+            self.plate_position_y,
+            self.plate_rotation,
+            self.plate_scale,
+            self.plate_crop_left,
+            self.plate_crop_right,
+            self.plate_crop_top,
+            self.plate_crop_bottom,
+            *self.plate_warp_controls,
+            self.plate_feather_left,
+            self.plate_feather_right,
+        )
+
+    def _set_plate_controls_enabled(self, enabled: bool) -> None:
+        for widget in self._plate_control_widgets():
+            widget.setEnabled(enabled)
+
+    def _source_selection_changed(self) -> None:
+        row = self.source_table.currentRow()
+        if row < 0 or row >= self.source_table.camera_count():
+            self._set_plate_controls_enabled(False)
+            self.plate_inspector_title.setText("SELECT A TIMELINE PLATE")
+            return
+        self._selected_camera_row = row
+        self._load_plate_controls(row)
+        if hasattr(self, "_plate_settings_index"):
+            self.settings_tabs.setCurrentIndex(self._plate_settings_index)
+
+    def _load_plate_controls(self, row: int) -> None:
+        cameras = self.config_data.get("cameras")
+        if not isinstance(cameras, list) or not 0 <= row < len(cameras):
+            self._set_plate_controls_enabled(False)
+            return
+        camera = cameras[row]
+        if not isinstance(camera, dict):
+            self._set_plate_controls_enabled(False)
+            return
+        paths = self.source_table.paths()
+        number = (
+            self._plate_numbers[row]
+            if self._plate_numbers and row < len(self._plate_numbers)
+            else row + 1
+        )
+        clip = Path(paths[row]).name if row < len(paths) and paths[row] else "UNASSIGNED"
+        self.plate_inspector_title.setText(f"P{number:02d}  ·  {clip}")
+        self._loading_plate_controls = True
+        self.plate_position_x.setValue(float(camera.get("yaw_deg", 0.0)))
+        self.plate_position_y.setValue(float(camera.get("pitch_deg", 0.0)))
+        self.plate_rotation.setValue(float(camera.get("roll_deg", 0.0)))
+        self.plate_scale.setValue(float(camera.get("scale", 1.0)) * 100.0)
+        self.plate_crop_left.setValue(float(camera.get("crop_left", 0.0)) * 100.0)
+        self.plate_crop_right.setValue(float(camera.get("crop_right", 0.0)) * 100.0)
+        self.plate_crop_top.setValue(float(camera.get("crop_top", 0.0)) * 100.0)
+        self.plate_crop_bottom.setValue(float(camera.get("crop_bottom", 0.0)) * 100.0)
+        lens = camera.get("lens")
+        distortion = (
+            list(lens.get("distortion", [0.0, 0.0, 0.0, 0.0]))
+            if isinstance(lens, dict)
+            else [0.0, 0.0, 0.0, 0.0]
+        )
+        distortion = (distortion + [0.0] * 4)[:4]
+        for widget, value in zip(self.plate_warp_controls, distortion, strict=True):
+            widget.setValue(float(value))
+        global_feather = self.seam_feather.value() if hasattr(self, "seam_feather") else 4.0
+        self.plate_feather_left.setValue(
+            float(camera.get("feather_left_deg", global_feather))
+        )
+        self.plate_feather_right.setValue(
+            float(camera.get("feather_right_deg", global_feather))
+        )
+        self._loading_plate_controls = False
+        self._set_plate_controls_enabled(bool(paths[row] if row < len(paths) else ""))
+
+    def _plate_control_changed(self) -> None:
+        if self._loading_plate_controls or self._loading_config:
+            return
+        cameras = self.config_data.get("cameras")
+        row = self._selected_camera_row
+        if not isinstance(cameras, list) or not 0 <= row < len(cameras):
+            return
+        camera = cameras[row]
+        if not isinstance(camera, dict):
+            return
+        horizontal_crop = (
+            self.plate_crop_left.value() + self.plate_crop_right.value()
+        ) / 100.0
+        vertical_crop = (
+            self.plate_crop_top.value() + self.plate_crop_bottom.value()
+        ) / 100.0
+        if horizontal_crop >= 0.99 or vertical_crop >= 0.99:
+            self.statusBar().showMessage("Crop must leave at least 1% of the plate", 5000)
+            return
+        camera.update(
+            {
+                "yaw_deg": self.plate_position_x.value(),
+                "pitch_deg": self.plate_position_y.value(),
+                "roll_deg": self.plate_rotation.value(),
+                "scale": self.plate_scale.value() / 100.0,
+                "crop_left": self.plate_crop_left.value() / 100.0,
+                "crop_right": self.plate_crop_right.value() / 100.0,
+                "crop_top": self.plate_crop_top.value() / 100.0,
+                "crop_bottom": self.plate_crop_bottom.value() / 100.0,
+                "feather_left_deg": self.plate_feather_left.value(),
+                "feather_right_deg": self.plate_feather_right.value(),
+            }
+        )
+        lens = camera.setdefault("lens", {})
+        if isinstance(lens, dict):
+            lens["distortion"] = [
+                widget.value() for widget in self.plate_warp_controls
+            ]
+        update_fine_tune_metadata(camera)
+        self.source_table.blockSignals(True)
+        self.source_table.set_orientation(
+            row,
+            camera["yaw_deg"],
+            camera["pitch_deg"],
+            camera["roll_deg"],
+        )
+        self.source_table.blockSignals(False)
+        self._invalidate_plate_preview()
+
+    def _invalidate_plate_preview(self) -> None:
+        self._schedule_live_preview("Plate fine-tune applied")
+
+    def _reset_selected_plate(self) -> None:
+        cameras = self.config_data.get("cameras")
+        row = self._selected_camera_row
+        profile_cameras = self._plate_reset_cameras
+        if (
+            not isinstance(cameras, list)
+            or not isinstance(profile_cameras, list)
+            or not 0 <= row < min(len(cameras), len(profile_cameras))
+        ):
+            return
+        base = json.loads(json.dumps(profile_cameras[row]))
+        for key in (
+            "yaw_deg", "pitch_deg", "roll_deg", "scale", "crop_left",
+            "crop_right", "crop_top", "crop_bottom", "feather_left_deg",
+            "feather_right_deg",
+        ):
+            if key in base:
+                cameras[row][key] = base[key]
+            else:
+                cameras[row].pop(key, None)
+        if isinstance(base.get("lens"), dict):
+            cameras[row]["lens"] = json.loads(json.dumps(base["lens"]))
+        self._load_plate_controls(row)
+        self.source_table.blockSignals(True)
+        self.source_table.set_orientation(
+            row,
+            cameras[row].get("yaw_deg", 0.0),
+            cameras[row].get("pitch_deg", 0.0),
+            cameras[row].get("roll_deg", 0.0),
+        )
+        self.source_table.blockSignals(False)
+        self._invalidate_plate_preview()
+
+    def _refresh_plate_preview(self) -> None:
+        if self._last_reference_dir is None:
+            self.create_preview()
+            return
+        self._schedule_live_preview("Plate fine-tune applied", immediate=True)
+
     def _color_settings(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        color = QGroupBox("COLOR PIPELINE")
-        form = QFormLayout(color)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(8)
+
+        pipeline = QGroupBox("PIPELINE")
+        form = QFormLayout(pipeline)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.setHorizontalSpacing(8)
         form.setVerticalSpacing(5)
-        self.color_mode = QComboBox()
-        self.color_mode.addItem("Passthrough original code space", "passthrough")
+        self.color_mode = ChevronComboBox()
+        self.color_mode.addItem("Passthrough", "passthrough")
         self.color_mode.addItem("OCIO managed", "ocio")
         self.color_mode.currentIndexChanged.connect(self._update_color_controls)
+        self.color_mode.currentIndexChanged.connect(self._color_basis_changed)
         self.ocio_config = QLineEdit()
+        self.ocio_config.setToolTip("Bundled OCIO identifier or a custom .ocio file")
+        self.ocio_config.editingFinished.connect(self._reload_ocio_spaces)
         ocio_row = QWidget()
         ocio_layout = QHBoxLayout(ocio_row)
         ocio_layout.setContentsMargins(0, 0, 0, 0)
         ocio_layout.addWidget(self.ocio_config)
-        ocio_button = QPushButton("…")
-        ocio_button.setObjectName("iconButton")
-        ocio_button.setFixedWidth(34)
+        ocio_button = QPushButton("OPEN")
+        ocio_button.setObjectName("secondaryButton")
+        ocio_button.setFixedWidth(48)
         ocio_button.clicked.connect(self.choose_ocio)
         ocio_layout.addWidget(ocio_button)
-        aces_button = QPushButton("USE BUNDLED ACES 2.0 / REC.709")
-        aces_button.setObjectName("secondaryButton")
-        aces_button.clicked.connect(self.apply_aces_preset)
-        self.input_space = QLineEdit()
-        self.working_space = QLineEdit()
-        self.output_space = QLineEdit()
-        self.integer_dither = QCheckBox("TPDF dither when writing integer masters")
+        self.ocio_reload_button = QPushButton("LOAD SPACES")
+        self.ocio_reload_button.setObjectName("secondaryButton")
+        self.ocio_reload_button.clicked.connect(self._reload_ocio_spaces)
+        self.input_space = _new_ocio_space_combo("Camera Rec.709")
+        self.working_space = _new_ocio_space_combo("ACEScg")
+        self.input_space.currentTextChanged.connect(self._color_basis_changed)
+        self.working_space.currentTextChanged.connect(self._color_basis_changed)
+        self.output_mode = ChevronComboBox()
+        self.output_mode.addItem("Color space / Log", "colorspace")
+        self.output_mode.addItem("Display transform", "display_view")
+        self.output_mode.currentIndexChanged.connect(self._update_delivery_controls)
+        self.output_mode.currentIndexChanged.connect(self._color_pipeline_setting_changed)
+        self.output_space = _new_ocio_space_combo(
+            "Gamma 2.4 Encoded Rec.709", output=True
+        )
+        self.output_space.currentTextChanged.connect(self._color_pipeline_setting_changed)
+        self.output_display = ChevronComboBox()
+        self.output_display.currentIndexChanged.connect(self._delivery_display_changed)
+        self.output_display.currentIndexChanged.connect(
+            self._color_pipeline_setting_changed
+        )
+        self.output_view = ChevronComboBox()
+        self.output_view.currentIndexChanged.connect(self._color_pipeline_setting_changed)
+        self.output_space_label = QLabel("Output color space")
+        self.output_display_label = QLabel("Delivery display")
+        self.output_view_label = QLabel("Delivery view")
+        self.viewer_monitor = ChevronComboBox()
+        for key, (label, _display, _view) in VIEWER_MONITOR_TRANSFORMS.items():
+            self.viewer_monitor.addItem(label, key)
+        self.viewer_monitor.addItem("Match delivery target", "delivery")
+        saved_viewer = str(self.settings.value("viewer/monitor", "sdr-rec709"))
+        self.viewer_monitor.setCurrentIndex(
+            max(0, self.viewer_monitor.findData(saved_viewer))
+        )
+        self.viewer_monitor.currentIndexChanged.connect(
+            self._viewer_monitor_changed
+        )
+        self.viewer_status = QLabel(
+            "Managed Rec.709 viewer · delivery and Render Queue stay unchanged."
+        )
+        self.viewer_status.setProperty("muted", True)
+        self.viewer_status.setWordWrap(True)
+        self.integer_dither = QCheckBox("TPDF dither for integer masters")
+        self.delivery_status = QLabel("Scene/log or managed display output.")
+        self.delivery_status.setProperty("muted", True)
+        self.delivery_status.setWordWrap(True)
+        self.ocio_space_status = QLabel("Choose an OCIO config, then load its spaces")
+        self.ocio_space_status.setProperty("muted", True)
+        self.ocio_space_status.setWordWrap(True)
         form.addRow("Mode", self.color_mode)
         form.addRow("OCIO config", ocio_row)
-        form.addRow("All camera inputs", self.input_space)
+        form.addRow(self.ocio_reload_button)
+        form.addRow("Input transform", self.input_space)
         form.addRow("Working space", self.working_space)
-        form.addRow("Output space", self.output_space)
+        pipeline_separator = QFrame()
+        pipeline_separator.setObjectName("formSeparator")
+        pipeline_separator.setFrameShape(QFrame.Shape.HLine)
+        form.addRow(pipeline_separator)
+        form.addRow("Delivery method", self.output_mode)
+        form.addRow(self.output_space_label, self.output_space)
+        form.addRow(self.output_display_label, self.output_display)
+        form.addRow(self.output_view_label, self.output_view)
         form.addRow(self.integer_dither)
-        form.addRow(aces_button)
-        layout.addWidget(color)
-        note = QLabel(
-            "OCIO 모드는 리샘플링 전에 모든 카메라를 scene-linear 작업공간으로 변환합니다. "
-            "GUI 마스터 출력은 10/12-bit로 제한됩니다."
+        form.addRow(self.delivery_status)
+        viewer_separator = QFrame()
+        viewer_separator.setObjectName("formSeparator")
+        viewer_separator.setFrameShape(QFrame.Shape.HLine)
+        form.addRow(viewer_separator)
+        form.addRow("Viewer monitor", self.viewer_monitor)
+        form.addRow(self.viewer_status)
+        form.addRow(self.ocio_space_status)
+        layout.addWidget(pipeline)
+
+        match = QGroupBox("CAMERA MATCH")
+        match_form = QFormLayout(match)
+        match_form.setHorizontalSpacing(8)
+        match_form.setVerticalSpacing(5)
+        self.color_match_enabled = QCheckBox("Apply match")
+        self.color_match_enabled.toggled.connect(self._color_match_setting_changed)
+        self.color_match_reference = ChevronComboBox()
+        self.color_match_reference.currentIndexChanged.connect(
+            self._color_match_reference_changed
         )
-        note.setWordWrap(True)
-        note.setProperty("muted", True)
-        layout.addWidget(note)
+        self.color_match_strength = QSpinBox()
+        self.color_match_strength.setRange(0, 100)
+        self.color_match_strength.setSuffix("%")
+        self.color_match_strength.setValue(100)
+        self.color_match_strength.setToolTip(
+            "Blend the saved white-point correction without changing exposure"
+        )
+        self.color_match_strength.valueChanged.connect(
+            self._color_match_setting_changed
+        )
+        match_actions = QWidget()
+        match_actions_layout = QHBoxLayout(match_actions)
+        match_actions_layout.setContentsMargins(0, 0, 0, 0)
+        match_actions_layout.setSpacing(5)
+        self.color_match_button = QPushButton("MATCH")
+        self.color_match_button.setObjectName("primaryButton")
+        self.color_match_button.setToolTip(
+            "Match camera white points from the current Quick Preview overlaps"
+        )
+        self.color_match_button.clicked.connect(self.match_cameras)
+        self.color_match_reset_button = QPushButton("RESET")
+        self.color_match_reset_button.setObjectName("secondaryButton")
+        self.color_match_reset_button.clicked.connect(self.reset_color_match)
+        match_actions_layout.addWidget(self.color_match_button, 1)
+        match_actions_layout.addWidget(self.color_match_reset_button)
+        self.color_match_status = QLabel("Create a Quick Preview, then match")
+        self.color_match_status.setProperty("muted", True)
+        self.color_match_status.setWordWrap(True)
+        match_form.addRow(self.color_match_enabled)
+        match_form.addRow("Reference", self.color_match_reference)
+        match_form.addRow("Strength", self.color_match_strength)
+        match_form.addRow(match_actions)
+        match_form.addRow(self.color_match_status)
+        layout.addWidget(match)
+
         layout.addStretch()
         return panel
 
@@ -2524,32 +5217,51 @@ class MainWindow(QMainWindow):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.setHorizontalSpacing(8)
         form.setVerticalSpacing(5)
-        self.output_codec = QComboBox()
-        self.output_codec.addItem("ProRes HQ · 10-bit 4:2:2", "prores-hq")
-        self.output_codec.addItem("DPX · 12-bit RGB sequence", "dpx12-sequence")
-        self.output_codec.addItem("H.264 MP4 · 10-bit 4:2:0", "h264-mp4-10")
-        self.output_codec.addItem("ProRes 4444 · 10-bit YUV", "prores-4444")
-        self.output_codec.addItem("HEVC · 10-bit 4:4:4", "hevc-444-10")
-        self.output_codec.currentIndexChanged.connect(self._update_output_hint)
+        self.output_codec = ChevronComboBox()
+        for label, value in GUI_MASTER_CODEC_OPTIONS:
+            self.output_codec.addItem(label, value)
+        self.output_codec.currentIndexChanged.connect(self._output_codec_changed)
         self.output_path = QLineEdit()
-        path_row = QWidget()
-        path_layout = QHBoxLayout(path_row)
-        path_layout.setContentsMargins(0, 0, 0, 0)
-        path_layout.addWidget(self.output_path)
+        self.output_path.hide()
+        self.output_directory = QLineEdit(str(self._output_root))
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.addWidget(self.output_directory)
         path_button = QPushButton("…")
         path_button.setObjectName("iconButton")
         path_button.setFixedWidth(34)
         path_button.clicked.connect(self.choose_output)
-        path_layout.addWidget(path_button)
+        folder_layout.addWidget(path_button)
+        self.output_name = QLineEdit("stitched")
+        self.output_name.setPlaceholderText("Timeline or take name")
+        self.output_directory.textChanged.connect(self._output_fields_changed)
+        self.output_name.textChanged.connect(self._output_fields_changed)
+        self.output_path_preview = QLabel()
+        self.output_path_preview.setWordWrap(True)
+        self.output_path_preview.setProperty("muted", True)
+        self.fps_mode = ChevronComboBox()
+        self.fps_mode.setObjectName("fpsMode")
+        self.fps_mode.addItem("MATCH PLATE", FPS_MODE_MATCH_SOURCE)
+        self.fps_mode.addItem("CUSTOM CONFORM", FPS_MODE_CUSTOM)
         self.fps = QDoubleSpinBox()
         self.fps.setRange(1.0, 240.0)
-        self.fps.setDecimals(3)
+        self.fps.setDecimals(6)
+        self.fps.setSingleStep(0.001)
+        self.fps_mode.currentIndexChanged.connect(
+            lambda _index: self.fps.setEnabled(
+                self.fps_mode.currentData() == FPS_MODE_CUSTOM
+            )
+        )
         self.frame_limit = QSpinBox()
         self.frame_limit.setRange(0, 10_000_000)
         self.frame_limit.setSpecialValueText("FULL CLIP")
         form.addRow("Codec", self.output_codec)
-        form.addRow("Destination", path_row)
-        form.addRow("FPS", self.fps)
+        form.addRow("Output folder", folder_row)
+        form.addRow("File name", self.output_name)
+        form.addRow("Resolved path", self.output_path_preview)
+        form.addRow("Frame rate", self.fps_mode)
+        form.addRow("Output FPS", self.fps)
         form.addRow("Frame limit", self.frame_limit)
         layout.addWidget(output)
         self.output_hint = QLabel()
@@ -2561,145 +5273,213 @@ class MainWindow(QMainWindow):
         resources.clicked.connect(self.estimate_resources)
         layout.addWidget(resources)
         layout.addStretch()
+        self._output_fields_changed()
+        self._last_auto_output = self.output_path.text().strip() or None
         return panel
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background:#0d1014;
-                color:#e6e9ee;
-                font-family:'-apple-system','SF Pro Text','Malgun Gothic','Segoe UI';
+                background:#08090a;
+                color:#f7f8f8;
+                font-family:'Inter Variable','Inter','SF Pro Text','-apple-system','Segoe UI';
                 font-size:11px;
             }
             QLabel { background:transparent; }
-            QFrame#topBar { background:#15191e; border-bottom:1px solid #2a3038; }
-            QLabel#appTitle { color:#f3f4f6; font-size:15px; font-weight:750; }
-            QLabel#appSubtitle { color:#747c86; font-size:9px; letter-spacing:.8px; }
-            QLabel#projectTitle { color:#eef0f3; font-size:11px; font-weight:700; }
-            QLabel#profileLabel { color:#aeb5be; font-size:10px; }
+            QFrame#topBar { background:#0f1011; border-bottom:1px solid #23252a; }
+            QLabel#appTitle { color:#f7f8f8; font-size:15px; font-weight:590; }
+            QLabel#appSubtitle { color:#62666d; font-size:9px; letter-spacing:.8px; }
+            QLabel#projectTitle { color:#f7f8f8; font-size:11px; font-weight:590; }
+            QLabel#profileLabel { color:#d0d6e0; font-size:10px; }
             QLabel#statusPill {
-                color:#74d89a;
-                border:1px solid #315b41;
-                border-radius:4px;
+                color:#10b981;
+                border:1px solid #23252a;
+                border-radius:6px;
                 padding:3px 7px;
                 font-size:8px;
-                font-weight:800;
+                font-weight:590;
                 letter-spacing:1px;
             }
-            QFrame#mediaPanel, QFrame#inspectorPanel, QFrame#previewPanel,
+            QFrame#inspectorPanel, QFrame#previewPanel,
             QFrame#timingPanel, QFrame#actionBar, QFrame#logPanel {
-                background:#15191e;
-                border:1px solid #2a3038;
-                border-radius:4px;
+                background:#0f1011;
+                border:1px solid #23252a;
+                border-radius:8px;
             }
-            QFrame#previewPanel { background:#111419; }
-            QFrame#inspectorSection { background:transparent; border:0; border-bottom:1px solid #2a3038; }
+            QFrame#libraryPanel { background:transparent; border:0; }
+            QFrame#librarySection {
+                background:#0f1011;
+                border:1px solid #23252a;
+                border-radius:8px;
+            }
+            QFrame#previewPanel { background:#0f1011; }
+            QFrame#inspectorSection { background:transparent; border:0; border-bottom:1px solid #23252a; }
+            QFrame#formSeparator {
+                background:#23252a;
+                border:0;
+                min-height:1px;
+                max-height:1px;
+                margin:3px 0;
+            }
             QGroupBox {
                 background:transparent;
                 border:0;
-                border-top:1px solid #2a3038;
+                border-top:1px solid #23252a;
                 border-radius:0;
                 margin-top:10px;
                 padding:12px 2px 5px;
-                color:#aeb5bf;
-                font-weight:650;
+                color:#d0d6e0;
+                font-weight:510;
             }
-            QGroupBox::title { subcontrol-origin:margin; left:2px; padding:0 4px; color:#aeb5bf; }
+            QGroupBox::title { subcontrol-origin:margin; left:2px; padding:0 4px; color:#d0d6e0; }
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {
-                background:#101318;
-                border:1px solid #303740;
-                border-radius:3px;
+                background:#191a1b;
+                border:1px solid #34343a;
+                border-radius:5px;
                 padding:4px;
-                selection-background-color:#5b577f;
-                selection-color:#ffffff;
+                selection-background-color:#5e6ad2;
+                selection-color:#f7f8f8;
             }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#777199; }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#7170ff; }
+            QComboBox::drop-down {
+                width:22px;
+                border:0;
+                border-left:1px solid #34343a;
+                background:#191a1b;
+            }
+            QComboBox::drop-down:hover { background:#28282c; }
+            QComboBox::down-arrow { width:9px; height:7px; }
+            QComboBox QAbstractItemView {
+                background:#191a1b;
+                border:1px solid #34343a;
+                outline:0;
+                padding:3px;
+                selection-background-color:#5e6ad2;
+            }
             QPushButton {
-                background:#20252c;
-                color:#d1d6dd;
-                border:1px solid #373e48;
-                border-radius:3px;
+                background:#191a1b;
+                color:#d0d6e0;
+                border:1px solid #23252a;
+                border-radius:6px;
                 padding:5px 8px;
-                font-weight:650;
+                font-weight:510;
             }
-            QPushButton:hover { background:#292f37; border-color:#666f7d; color:#ffffff; }
-            QPushButton:pressed { background:#181c21; }
-            QPushButton:checked { color:#ffffff; border-color:#6c678e; background:#24232e; }
-            QPushButton:disabled { color:#626a75; background:#171b20; border-color:#282e35; }
-            QPushButton#topButton { background:transparent; padding:4px 7px; color:#aab1bb; }
-            QPushButton#primaryButton { background:#5f5b83; color:#ffffff; border-color:#777199; }
-            QPushButton#primaryButton:hover { background:#6b668f; }
-            QPushButton#secondaryButton, QPushButton#quietButton { background:#1c2127; color:#b9c0ca; }
+            QPushButton:hover { background:#28282c; border-color:#3e3e44; color:#f7f8f8; }
+            QPushButton:pressed { background:#0f1011; }
+            QPushButton:checked { color:#f7f8f8; border-color:#7170ff; background:#28282c; }
+            QPushButton:disabled { color:#62666d; background:#0f1011; border-color:#23252a; }
+            QPushButton#topButton { background:transparent; padding:4px 7px; color:#d0d6e0; }
+            QPushButton#primaryButton { background:#5e6ad2; color:#f7f8f8; border-color:#7170ff; }
+            QPushButton#primaryButton:hover { background:#828fff; }
+            QPushButton#secondaryButton, QPushButton#quietButton { background:#191a1b; color:#d0d6e0; }
             QPushButton#quietButton { padding:6px 10px; }
             QPushButton#iconButton { padding:5px 9px; min-width:28px; }
+            QPushButton#dangerButton { background:#1c2026; color:#bd8998; border-color:#48333a; }
+            QPushButton#dangerButton:hover { background:#2b2025; color:#f0b3c3; border-color:#80505e; }
+            QPushButton#dangerButton:disabled { color:#5f565b; background:#171a1f; border-color:#29272a; }
+            QPushButton#layoutChoice {
+                background:#191a1b;
+                color:#d0d6e0;
+                border:1px solid #34343a;
+                padding:10px 12px;
+                text-align:left;
+            }
+            QPushButton#layoutChoice:hover { background:#28282c; border-color:#3e3e44; }
+            QPushButton#layoutChoice:checked {
+                background:#28282c;
+                color:#f7f8f8;
+                border:1px solid #7170ff;
+            }
             QPushButton#workflowButton {
-                background:#191d23;
-                color:#cbd0d7;
-                border-color:#343b44;
+                background:#191a1b;
+                color:#d0d6e0;
+                border-color:#34343a;
                 font-size:10px;
                 letter-spacing:.3px;
             }
-            QPushButton#workflowButton:hover { border-color:#6d688c; background:#23232b; }
-            QPushButton#renderButton { background:#5f5b83; color:#ffffff; border-color:#777199; }
-            QPushButton#renderButton:hover { background:#6b668f; }
+            QPushButton#workflowButton:hover { border-color:#7170ff; background:#28282c; }
+            QPushButton#renderButton { background:#5e6ad2; color:#f7f8f8; border-color:#7170ff; }
+            QPushButton#renderButton:hover { background:#828fff; }
             QPushButton#cancelButton { color:#e4a2b9; border-color:#694050; max-width:90px; }
             QHeaderView::section {
-                background:#15191e;
-                color:#858d98;
+                background:#0f1011;
+                color:#8a8f98;
                 border:0;
-                border-bottom:1px solid #2c323a;
+                border-bottom:1px solid #23252a;
                 padding:5px 4px;
                 font-size:9px;
-                font-weight:700;
+                font-weight:590;
             }
-            QTableWidget { border:0; background:#15191e; }
-            QTableWidget::item { border-bottom:1px solid #252b32; padding:3px; }
-            QTableWidget::item:selected { background:#292833; color:#ffffff; }
-            QTreeWidget#mediaTree { border:0; background:#15191e; padding:2px 0; }
-            QTreeWidget#mediaTree::item { min-height:24px; padding:2px 4px; border:0; }
-            QTreeWidget#mediaTree::item:selected { background:#343147; color:#ffffff; }
-            QTreeWidget#mediaTree::branch { background:#15191e; }
+            QTableWidget { border:0; background:#0f1011; }
+            QTableWidget::item { border-bottom:1px solid #23252a; padding:3px; }
+            QTableWidget::item:selected { background:#28282c; color:#f7f8f8; }
+            QTreeWidget#mediaTree, QTreeWidget#timelineTree {
+                border:0;
+                border-top:1px solid #23252a;
+                border-radius:0;
+                background:#0f1011;
+                padding:5px 0 2px;
+            }
+            QTreeWidget#mediaTree::item, QTreeWidget#timelineTree::item { min-height:24px; padding:2px 4px; border:0; }
+            QTreeWidget#mediaTree::item:selected, QTreeWidget#timelineTree::item:selected { background:#28282c; color:#f7f8f8; }
+            QTreeWidget#mediaTree::branch { background:#0f1011; }
             QTabWidget::pane { border:0; }
             QTabBar::tab {
-                background:#15191e;
-                color:#777f8b;
+                background:#0f1011;
+                color:#62666d;
                 border:0;
                 border-bottom:2px solid transparent;
                 padding:7px 11px;
-                font-weight:700;
+                font-weight:510;
             }
-            QTabBar::tab:selected { color:#efedf7; border-bottom:2px solid #6d688c; }
-            QLabel#durationBadge { color:#aaa5c8; padding:2px 5px; font-weight:700; }
+            QTabBar::tab:selected { color:#f7f8f8; border-bottom:2px solid #7170ff; }
+            QLabel#durationBadge { color:#d0d6e0; padding:2px 5px; font-weight:590; }
             QLabel#previewLimit {
-                color:#8f96a1;
-                border:1px solid #303740;
-                border-radius:3px;
+                color:#8a8f98;
+                border:1px solid #34343a;
+                border-radius:6px;
                 padding:3px 7px;
                 font-size:9px;
-                font-weight:700;
+                font-weight:590;
             }
             QLabel#playheadTime {
-                color:#d8d5e6;
+                color:#d0d6e0;
                 padding:2px 5px;
                 font-family:'Cascadia Mono','SF Mono','Menlo';
                 font-size:10px;
             }
-            QLabel#sourceStatus { color:#858d98; font-size:10px; }
+            QLabel#sourceStatus { color:#8a8f98; font-size:10px; }
+            QLabel#autosaveStatus { color:#10b981; font-size:9px; padding:0 8px; }
             QScrollArea { border:0; background:transparent; }
-            QSplitter#workspaceSplitter::handle { background:#2a3038; }
-            QProgressBar {
-                border:1px solid #303740;
-                border-radius:4px;
-                background:#101318;
-                text-align:center;
-                color:#aeb5bf;
+            QSplitter#workspaceSplitter::handle:horizontal {
+                background:#23252a;
+                margin:9px 2px;
+                border-radius:2px;
             }
-            QProgressBar::chunk { background:#5f5b83; border-radius:3px; }
-            QLabel[muted='true'] { color:#7d8590; }
-            QLabel[sectionTitle='true'] { color:#eef0f3; font-size:11px; font-weight:800; letter-spacing:.7px; }
-            QLabel[inspectorTitle='true'] { color:#b9c0c9; font-size:10px; font-weight:800; letter-spacing:.6px; }
-            QStatusBar { background:#15191e; border-top:1px solid #2a3038; color:#858d98; }
+            QSplitter#workspaceSplitter::handle:horizontal:hover {
+                background:#7170ff;
+            }
+            QSplitter#librarySplitter::handle:vertical {
+                background:transparent;
+                border-top:1px solid #34343a;
+                margin:3px 10px;
+            }
+            QSplitter#librarySplitter::handle:vertical:hover {
+                border-top:2px solid #7170ff;
+            }
+            QProgressBar {
+                border:1px solid #34343a;
+                border-radius:6px;
+                background:#191a1b;
+                text-align:center;
+                color:#d0d6e0;
+            }
+            QProgressBar::chunk { background:#5e6ad2; border-radius:5px; }
+            QLabel[muted='true'] { color:#8a8f98; }
+            QLabel[sectionTitle='true'] { color:#f7f8f8; font-size:11px; font-weight:590; letter-spacing:.7px; }
+            QLabel[inspectorTitle='true'] { color:#d0d6e0; font-size:10px; font-weight:590; letter-spacing:.6px; }
+            QStatusBar { background:#0f1011; border-top:1px solid #23252a; color:#8a8f98; }
             """
         )
 
@@ -2716,11 +5496,21 @@ class MainWindow(QMainWindow):
             return
         self.config_path = path
         self.config_data = raw
-        if len(cameras) == 5:
-            self._rig_profiles.pop(3, None)
-        self._rig_profiles[len(cameras)] = json.loads(json.dumps(raw))
+        try:
+            is_working_snapshot = path.resolve().is_relative_to(
+                self._working_dir.resolve()
+            )
+        except OSError:
+            is_working_snapshot = False
+        if not is_working_snapshot or len(cameras) not in self._rig_profiles:
+            if len(cameras) == 5:
+                self._rig_profiles.pop(3, None)
+            self._rig_profiles[len(cameras)] = json.loads(json.dumps(raw))
+        if not is_working_snapshot:
+            self._plate_reset_cameras = json.loads(json.dumps(cameras))
         self._plate_numbers = None
         self._source_probes = None
+        self._source_fps_error = None
         self._source_overrides = {}
         self._tc_alignment = None
         self._tc_alignment_path = None
@@ -2746,21 +5536,50 @@ class MainWindow(QMainWindow):
         self.flow_preset.setCurrentText(str(flow.get("preset", "medium")))
         self.flow_max.setValue(float(flow.get("max_displacement_px", 32.0)))
         color = raw.setdefault("color", {})
+        video_settings = raw.get("video")
+        repaired_p3_pq = repair_legacy_p3_pq_target(
+            color,
+            video_settings if isinstance(video_settings, dict) else {},
+        )
+        if repaired_p3_pq:
+            self._append_log(
+                "Recovered legacy P3 target: Apple EDR → ST2084 P3-D65 PQ."
+            )
         mode = str(color.get("mode", "passthrough"))
+        self._loading_config = True
         self.color_mode.setCurrentIndex(max(0, self.color_mode.findData(mode)))
         self.ocio_config.setText(str(color.get("ocio_config") or ""))
+        self.ocio_config.setCursorPosition(0)
         camera_space = next((str(camera.get("colorspace")) for camera in cameras if camera.get("colorspace")), "")
-        self.input_space.setText(camera_space)
-        self.working_space.setText(str(color.get("working_space") or ""))
-        self.output_space.setText(str(color.get("output_space") or ""))
+        _request_ocio_combo_value(self.input_space, camera_space)
+        _request_ocio_combo_value(
+            self.working_space, str(color.get("working_space") or "")
+        )
+        _request_ocio_combo_value(
+            self.output_space, str(color.get("output_space") or "")
+        )
+        output_mode = str(color.get("output_mode") or "colorspace")
+        self.output_mode.setCurrentIndex(max(0, self.output_mode.findData(output_mode)))
+        if mode == "ocio":
+            self._reload_ocio_spaces(quiet=True)
+            self._reload_ocio_delivery(
+                display=str(color.get("display") or ""),
+                view=str(color.get("view") or ""),
+                quiet=True,
+            )
         self.integer_dither.setChecked(bool(color.get("integer_dither", True)))
+        self._update_color_match_cameras(cameras, color)
+        self._loading_config = False
         video = raw.setdefault("video", {"fps": 29.97})
         codec = str(video.get("output_codec", "prores-hq"))
         codec_index = self.output_codec.findData(codec)
         self.output_codec.setCurrentIndex(
             self.output_codec.findData("prores-hq") if codec_index < 0 else codec_index
         )
+        fps_mode = _frame_rate_mode(raw)
+        self.fps_mode.setCurrentIndex(max(0, self.fps_mode.findData(fps_mode)))
         self.fps.setValue(float(video.get("fps", 29.97)))
+        self.fps.setEnabled(fps_mode == FPS_MODE_CUSTOM)
         self._configured_frame_limit = int(video.get("frames") or 0)
         self.frame_limit.setValue(self._configured_frame_limit)
         self._reset_timing()
@@ -2786,16 +5605,12 @@ class MainWindow(QMainWindow):
         self._update_canvas_ratio()
         if self._loading_config or not self.config_data:
             return
-        self._stop_playback(clear=True)
-        self._cleanup_reference_dir(self._last_reference_dir)
-        self._last_reference_dir = None
-        self._last_reference_config_path = None
-        self._preview_ready = False
-        self.rig_align_button.setEnabled(False)
-        self.preview_note.setText(
-            "Canvas changed · create Preview to refresh the complete fitted canvas"
-        )
-        self._save_active_timeline()
+        self._schedule_live_preview("Canvas framing updated")
+
+    def _stitch_setting_changed(self, *_args) -> None:
+        if self._loading_config or not self.config_data:
+            return
+        self._schedule_live_preview("Stitch refinement updated")
 
     def fit_full_plates(self) -> None:
         try:
@@ -2823,6 +5638,39 @@ class MainWindow(QMainWindow):
             "Full plate boundaries fitted · create Preview to inspect the uncropped canvas",
             12000,
         )
+
+    def _ensure_ocio_controls_valid(self) -> None:
+        identifier = self.ocio_config.text().strip()
+        if not identifier:
+            raise ValueError("OCIO config is required")
+        if (
+            getattr(self, "_loaded_ocio_identifier", None) != identifier
+            or not getattr(self, "_loaded_ocio_spaces", ())
+        ):
+            if not self._reload_ocio_spaces(quiet=True):
+                raise ValueError("The selected OCIO config could not be loaded")
+        spaces = tuple(getattr(self, "_loaded_ocio_spaces", ()))
+        for label, combo in (
+            ("Input transform", self.input_space),
+            ("Working space", self.working_space),
+            ("Output transform", self.output_space),
+        ):
+            value = combo.currentText().strip()
+            if value not in spaces:
+                resolved = _populate_ocio_combo(combo, spaces, value)
+                if not resolved:
+                    raise ValueError(f"{label} is not available in the OCIO config")
+        if self.output_mode.currentData() == "display_view":
+            displays = getattr(self, "_delivery_views", {})
+            display = _delivery_display_value(self.output_display)
+            view = self.output_view.currentText().strip()
+            if display not in displays or view not in displays.get(display, ()):
+                if not self._reload_ocio_delivery(
+                    display=display,
+                    view=view,
+                    quiet=True,
+                ):
+                    raise ValueError("The selected OCIO output display/view is unavailable")
 
     def _collect_config(self) -> dict[str, object]:
         if not self.config_data:
@@ -2863,25 +5711,51 @@ class MainWindow(QMainWindow):
         if mode == "passthrough":
             raw["color"] = {
                 "mode": "passthrough",
+                "match_enabled": False,
                 "integer_dither": self.integer_dither.isChecked(),
                 "dither_seed": int(raw.get("color", {}).get("dither_seed", 7349)),
             }
             for camera in cameras:
                 camera.pop("colorspace", None)
         else:
-            required = [self.ocio_config.text(), self.input_space.text(), self.working_space.text(), self.output_space.text()]
+            self._ensure_ocio_controls_valid()
+            required = [
+                self.ocio_config.text(),
+                self.input_space.currentText(),
+                self.working_space.currentText(),
+            ]
+            output_mode = str(self.output_mode.currentData())
+            if output_mode == "display_view":
+                required.extend(
+                    [_delivery_display_value(self.output_display), self.output_view.currentText()]
+                )
+            else:
+                required.append(self.output_space.currentText())
             if not all(value.strip() for value in required):
-                raise ValueError("OCIO config and all three colorspace fields are required")
+                raise ValueError("OCIO config and the selected delivery fields are required")
             raw["color"] = {
                 "mode": "ocio",
                 "ocio_config": self.ocio_config.text().strip(),
-                "working_space": self.working_space.text().strip(),
-                "output_space": self.output_space.text().strip(),
+                "working_space": self.working_space.currentText().strip(),
+                "output_mode": output_mode,
+                "match_enabled": self.color_match_enabled.isChecked(),
+                "match_reference": self.color_match_reference.currentData(),
+                "match_strength": self.color_match_strength.value() / 100.0,
+                "preserve_luminance": True,
                 "integer_dither": self.integer_dither.isChecked(),
                 "dither_seed": int(raw.get("color", {}).get("dither_seed", 7349)),
             }
+            if output_mode == "display_view":
+                raw["color"].update(
+                    {
+                        "display": _delivery_display_value(self.output_display),
+                        "view": self.output_view.currentText().strip(),
+                    }
+                )
+            else:
+                raw["color"]["output_space"] = self.output_space.currentText().strip()
             for camera in cameras:
-                camera["colorspace"] = self.input_space.text().strip()
+                camera["colorspace"] = self.input_space.currentText().strip()
         video = raw.setdefault("video", {})
         codec = str(self.output_codec.currentData())
         if codec not in GUI_MASTER_BIT_DEPTHS:
@@ -2893,6 +5767,38 @@ class MainWindow(QMainWindow):
                 "output_codec": codec,
             }
         )
+        frame_rate_mode = str(self.fps_mode.currentData() or FPS_MODE_MATCH_SOURCE)
+        metadata = raw.setdefault("_vpstitch", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            raw["_vpstitch"] = metadata
+        metadata["fps_mode"] = frame_rate_mode
+        if self._source_fps_error:
+            raise ValueError(self._source_fps_error)
+        source_fps = _matching_source_frame_rate(self._source_probes or [])
+        if source_fps is not None:
+            metadata["source_fps"] = source_fps
+            if frame_rate_mode == FPS_MODE_MATCH_SOURCE:
+                video["fps"] = source_fps
+        if mode == "ocio":
+            for key in ("color_primaries", "color_trc", "colorspace", "color_range"):
+                video.pop(key, None)
+            if str(self.output_mode.currentData()) == "display_view":
+                video.update(
+                    _display_view_video_tags(
+                        _delivery_display_value(self.output_display),
+                        self.output_view.currentText().strip(),
+                    )
+                )
+            elif "rec.709" in self.output_space.currentText().casefold():
+                video.update(
+                    {
+                        "color_primaries": "bt709",
+                        "color_trc": "bt709",
+                        "colorspace": "bt709",
+                        "color_range": "tv",
+                    }
+                )
         return raw
 
     def _write_working_config(self) -> Path:
@@ -2928,27 +5834,328 @@ class MainWindow(QMainWindow):
             self.settings.setValue("lastConfig", str(destination))
             self._append_log(f"Saved rig profile: {destination}")
 
-    def _request_plate_set_name(self, sources: list[str]) -> str | None:
-        existing = self._timeline_for_sources(sources)
-        if existing is not None:
-            return existing.name
-        default_name = self._unique_plate_set_name("", sources)
-        numbers = [plate_number(path) for path in sources]
-        plate_label = f"P{numbers[0]:02d}–P{numbers[-1]:02d}"
-        name, accepted = QInputDialog.getText(
-            self,
-            "New Plate Set",
-            f"Plate Set name · {plate_label} · {len(sources)} camera plates",
-            text=default_name,
+    def import_media_paths(self, files: list[str]) -> list[MediaRecord]:
+        existing = {str(item.path) for item in self.project_store.media}
+        ordered = sorted(
+            files,
+            key=lambda path: (
+                plate_number(path) if plate_number(path) is not None else 99,
+                Path(path).name.lower(),
+            ),
         )
-        if not accepted:
-            return None
-        return name.strip() or default_name
+        bin_id = self._active_bin_id
+        if bin_id is None and self.project_store.bins:
+            bin_id = self.project_store.list_bins()[0].id
+        records: list[MediaRecord] = []
+        next_order = len(self.project_store.list_media(bin_id))
+        for path in ordered:
+            if str(Path(path)) in existing:
+                continue
+            item = MediaRecord.create(
+                path,
+                bin_id=bin_id,
+                order=next_order,
+            )
+            records.append(item)
+            existing.add(str(item.path))
+            next_order += 1
+        added = list(self.project_store.add_media_many(records)) if records else []
+        self._refresh_media_tree()
+        added_ids = {item.id for item in added}
+        iterator = QTreeWidgetItemIterator(self.media_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            if item.data(0, Qt.ItemDataRole.UserRole + 1) in added_ids:
+                item.setSelected(True)
+            iterator += 1
+        if added and self._auto_workflows_enabled:
+            self._queue_source_proxies(added)
+        return added
+
+    def _queue_source_proxies(self, records: list[MediaRecord]) -> None:
+        current_id = (
+            self._source_proxy_current[0]
+            if self._source_proxy_current is not None
+            else None
+        )
+        changed = False
+        for record in records:
+            try:
+                plan = plan_source_proxy(record.path, self._cache_dir)
+            except (FileNotFoundError, OSError, ValueError) as error:
+                self.project_store.update_media(
+                    record.id,
+                    source_cache_path=None,
+                    source_cache_status=MediaCacheStatus.FAILED,
+                    source_cache_error=str(error),
+                )
+                changed = True
+                continue
+            if source_proxy_ready(plan):
+                self.project_store.update_media(
+                    record.id,
+                    source_cache_path=plan.output,
+                    source_cache_status=MediaCacheStatus.READY,
+                    source_cache_error=None,
+                )
+                changed = True
+                continue
+            if record.id != current_id and record.id not in self._source_proxy_queue:
+                self.project_store.update_media(
+                    record.id,
+                    source_cache_path=plan.output,
+                    source_cache_status=MediaCacheStatus.PENDING,
+                    source_cache_error=None,
+                )
+                self._source_proxy_queue.append(record.id)
+                changed = True
+        if changed:
+            self._refresh_media_tree()
+        self._start_next_source_proxy()
+
+    def _cancel_source_proxy_items(self, media_ids: set[str] | None = None) -> None:
+        """Cancel queued/background source proxies without deleting reusable cache files."""
+        if media_ids is None:
+            self._source_proxy_queue.clear()
+        else:
+            self._source_proxy_queue = [
+                media_id
+                for media_id in self._source_proxy_queue
+                if media_id not in media_ids
+            ]
+        current = self._source_proxy_current
+        if current is None or (
+            media_ids is not None and current[0] not in media_ids
+        ):
+            return
+        self._source_proxy_current = None
+        self._source_proxy_attempts.clear()
+        self._source_proxy_backend = "unknown"
+        if self._source_proxy_process.state() != QProcess.ProcessState.NotRunning:
+            self._source_proxy_process.kill()
+            self._source_proxy_process.waitForFinished(3000)
+        current[1].temporary.unlink(missing_ok=True)
+        self._source_proxy_output.clear()
+
+    def _start_next_source_proxy(self) -> None:
+        if self._closing or self._source_proxy_current is not None:
+            return
+        if self._source_proxy_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        while self._source_proxy_queue:
+            media_id = self._source_proxy_queue.pop(0)
+            record = next(
+                (item for item in self.project_store.media if item.id == media_id),
+                None,
+            )
+            if record is None:
+                continue
+            try:
+                plan = plan_source_proxy(record.path, self._cache_dir)
+                if source_proxy_ready(plan):
+                    self.project_store.update_media(
+                        media_id,
+                        source_cache_path=plan.output,
+                        source_cache_status=MediaCacheStatus.READY,
+                        source_cache_error=None,
+                    )
+                    continue
+                attempts = list(source_proxy_commands(plan))
+            except (FileNotFoundError, OSError, ValueError) as error:
+                self.project_store.update_media(
+                    media_id,
+                    source_cache_status=MediaCacheStatus.FAILED,
+                    source_cache_error=str(error),
+                )
+                continue
+            self._source_proxy_current = (media_id, plan)
+            self._source_proxy_attempts = attempts
+            self.project_store.update_media(
+                media_id,
+                source_cache_path=plan.output,
+                source_cache_status=MediaCacheStatus.BUILDING,
+                source_cache_error=None,
+            )
+            self._refresh_media_tree()
+            if not self._start_source_proxy_attempt():
+                error = (
+                    self._source_proxy_process.errorString()
+                    or "no source proxy encoder could start"
+                )
+                self._source_proxy_current = None
+                self.project_store.update_media(
+                    media_id,
+                    source_cache_status=MediaCacheStatus.FAILED,
+                    source_cache_error=error,
+                )
+                self._refresh_media_tree()
+                continue
+            return
+        self._refresh_media_tree()
+
+    def _start_source_proxy_attempt(self) -> bool:
+        current = self._source_proxy_current
+        while current is not None and self._source_proxy_attempts:
+            command = self._source_proxy_attempts.pop(0)
+            self._source_proxy_backend = command.encoder
+            self._source_proxy_output.clear()
+            current[1].temporary.unlink(missing_ok=True)
+            self._append_log(
+                f"SOURCE PROXY [{command.encoder}]: "
+                f"{current[1].source.name} → {current[1].output.name}"
+            )
+            self._source_proxy_process.start(command.program, list(command.arguments))
+            if self._source_proxy_process.waitForStarted(3000):
+                return True
+            self._append_log(
+                f"SOURCE PROXY ENCODER UNAVAILABLE: {command.encoder}: "
+                f"{self._source_proxy_process.errorString()}"
+            )
+        return False
+
+    def _read_source_proxy_process(self) -> None:
+        chunk = bytes(self._source_proxy_process.readAllStandardOutput())
+        if not chunk:
+            return
+        self._source_proxy_output.extend(chunk)
+        if len(self._source_proxy_output) > 256 * 1024:
+            del self._source_proxy_output[: len(self._source_proxy_output) - 256 * 1024]
+        current = self._source_proxy_current
+        if current is None:
+            return
+        text = chunk.decode("utf-8", errors="replace")
+        frames = re.findall(r"(?m)^frame=(\d+)\s*$", text)
+        if frames:
+            self.statusBar().showMessage(
+                f"Caching {current[1].source.name} · frame {frames[-1]}",
+                1200,
+            )
+
+    def _source_proxy_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
+        current = self._source_proxy_current
+        if current is None:
+            return
+        media_id, plan = current
+        if self._closing:
+            self._source_proxy_current = None
+            plan.temporary.unlink(missing_ok=True)
+            return
+        if exit_code != 0 and self._source_proxy_attempts:
+            detail = self._source_proxy_output.decode(
+                "utf-8", errors="replace"
+            ).strip()
+            self._append_log(
+                f"SOURCE PROXY FALLBACK: {self._source_proxy_backend} failed: "
+                f"{detail[-500:] or f'exit {exit_code}'}"
+            )
+            if self._start_source_proxy_attempt():
+                return
+        self._source_proxy_current = None
+        try:
+            if exit_code != 0:
+                detail = self._source_proxy_output.decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                raise OSError(detail[-1200:] or f"FFmpeg exited with code {exit_code}")
+            output = finalize_source_proxy(plan, encoder=self._source_proxy_backend)
+            self.project_store.update_media(
+                media_id,
+                source_cache_path=output,
+                source_cache_status=MediaCacheStatus.READY,
+                source_cache_error=None,
+            )
+            self._append_log(f"SOURCE PROXY READY: {output}")
+            self.statusBar().showMessage(f"Source proxy ready · {plan.source.name}", 2500)
+        except (OSError, ProjectError) as error:
+            plan.temporary.unlink(missing_ok=True)
+            try:
+                self.project_store.update_media(
+                    media_id,
+                    source_cache_status=MediaCacheStatus.FAILED,
+                    source_cache_error=str(error),
+                )
+            except ProjectError:
+                pass
+            self._append_log(f"SOURCE PROXY FAILED: {plan.source.name}: {error}")
+        self._source_proxy_output.clear()
+        self._source_proxy_attempts.clear()
+        self._source_proxy_backend = "unknown"
+        self._refresh_media_tree()
+        QTimer.singleShot(0, self._start_next_source_proxy)
+
+    def _cached_playback_sources(self, sources: list[str]) -> list[str]:
+        records = {
+            str(Path(str(item.path))): item
+            for item in self.project_store.media_for_paths(sources)
+        }
+        cached: list[str] = []
+        for source in sources:
+            record = records.get(str(Path(source)))
+            cache_path = (
+                None
+                if record is None or record.source_cache_path is None
+                else Path(str(record.source_cache_path))
+            )
+            if (
+                record is None
+                or record.source_cache_status is not MediaCacheStatus.READY
+                or cache_path is None
+                or not cache_path.is_file()
+            ):
+                return sources
+            cached.append(str(cache_path))
+        return cached
+
+    def _cached_proxy_records(
+        self, sources: list[str]
+    ) -> list[MediaRecord] | None:
+        """Return media records when every source is its ready low-res cache."""
+        by_cache_path = {
+            str(Path(str(item.source_cache_path)).resolve()): item
+            for item in self.project_store.media
+            if item.source_cache_status is MediaCacheStatus.READY
+            and item.source_cache_path is not None
+        }
+        records: list[MediaRecord] = []
+        for source in sources:
+            record = by_cache_path.get(str(Path(source).resolve()))
+            if record is None:
+                return None
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _match_camera_geometry_to_proxy_dimensions(
+        raw: dict,
+        dimensions: list[tuple[int, int]],
+    ) -> None:
+        """Retarget camera intrinsics to native proxy frames without changing FOV."""
+        cameras = raw.get("cameras")
+        if not isinstance(cameras, list) or len(cameras) != len(dimensions):
+            raise ValueError("proxy dimensions do not match the rig camera count")
+        for camera, (width, height) in zip(cameras, dimensions, strict=True):
+            old_width = int(camera["width"])
+            old_height = int(camera["height"])
+            if min(old_width, old_height, width, height) < 1:
+                raise ValueError("proxy camera dimensions must be positive")
+            scale_x = width / old_width
+            scale_y = height / old_height
+            camera["width"] = int(width)
+            camera["height"] = int(height)
+            lens = camera["lens"]
+            lens["fx"] = float(lens["fx"]) * scale_x
+            lens["cx"] = float(lens["cx"]) * scale_x
+            lens["fy"] = float(lens["fy"]) * scale_y
+            lens["cy"] = float(lens["cy"]) * scale_y
+            if lens.get("circle_radius") is not None:
+                lens["circle_radius"] = float(lens["circle_radius"]) * (
+                    (scale_x + scale_y) * 0.5
+                )
 
     def choose_videos(self) -> None:
         if self._import_dialog is None:
             dialog = QFileDialog(self)
-            dialog.setWindowTitle("New Plate Set · Select 3 or 5 Camera Plates")
+            dialog.setWindowTitle("Import Media · Select Camera Clips")
             dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setNameFilter(VIDEO_FILTER)
@@ -2969,14 +6176,13 @@ class MainWindow(QMainWindow):
         if files:
             self.settings.setValue("lastImportDir", str(Path(files[0]).parent))
             try:
-                ordered, _numbers = order_camera_plates(files)
-                plate_set_name = self._request_plate_set_name(ordered)
-                if plate_set_name is None:
-                    return
-                self._set_video_sources(ordered, plate_set_name=plate_set_name)
-                self._analyze_imported_sources()
+                added = self.import_media_paths(files)
+                self.statusBar().showMessage(
+                    f"Imported {len(added)} media clips · right-click the selected clips to add them to a timeline",
+                    12000,
+                )
             except Exception as error:
-                self._error("New Plate Set", str(error))
+                self._error("Import Media", str(error))
 
     def clear_sources(self) -> None:
         self.source_table.set_paths([""] * self.source_table.camera_count())
@@ -2985,6 +6191,7 @@ class MainWindow(QMainWindow):
         )
         self._plate_numbers = None
         self._source_probes = None
+        self._source_fps_error = None
         self._source_overrides = {}
         self._reset_timing()
 
@@ -3002,12 +6209,18 @@ class MainWindow(QMainWindow):
             pass
 
     def _reset_timing(self) -> None:
+        self._live_preview_timer.stop()
+        self._live_preview_pending = False
+        self._auto_cache_requested = False
+        self._auto_cache_in_progress = False
+        self._pending_playback_request = False
         self._stop_playback(clear=True)
         self._cleanup_reference_dir(self._last_reference_dir)
         self._tc_alignment = None
         self._tc_alignment_path = None
         self._last_reference_dir = None
         self._last_reference_config_path = None
+        self._reference_frame_index = None
         self._preview_ready = False
         self._preview_in_progress = False
         self._pending_scrub_frame = None
@@ -3031,7 +6244,9 @@ class MainWindow(QMainWindow):
         self.timeline_duration.setText("0 frames")
         self.timing_status.setText("TC Align finds the shortest common range across every camera")
         self.rig_align_button.setEnabled(False)
-        self.preview_note.setText("Fitted preview · UHD 4K max · master render stays full resolution")
+        self.preview_note.setText(
+            "Quick Preview checks one frame · playback proxy prewarms after TC Align"
+        )
         self._update_source_status()
         self._timeline_updating = False
 
@@ -3062,16 +6277,12 @@ class MainWindow(QMainWindow):
             self._stop_playback(clear=True)
             self._set_timeline_range(lower, upper)
             self._save_active_timeline()
-            if self._auto_workflows_enabled:
-                QTimer.singleShot(350, self._warm_playback_cache)
 
     def _timeline_spin_changed(self) -> None:
         if not self._timeline_updating:
             self._stop_playback(clear=True)
             self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
             self._save_active_timeline()
-            if self._auto_workflows_enabled:
-                QTimer.singleShot(350, self._warm_playback_cache)
 
     def _update_playhead_time(self, frame: int) -> None:
         fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
@@ -3104,6 +6315,8 @@ class MainWindow(QMainWindow):
         self._set_playhead(frame)
         if self._seek_loaded_playback(frame):
             return
+        if self._request_live_proxy_frame(frame, "Timeline frame"):
+            return
         self._scrub_preview()
 
     def _handle_preview_command(self, command: str) -> None:
@@ -3116,50 +6329,141 @@ class MainWindow(QMainWindow):
         elif command == "stop":
             self.stop_playback()
         elif command == "forward":
-            self._reverse_timer.stop()
-            if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                self.toggle_playback()
+            self.play_forward()
         elif command == "step-back":
             self.step_playback(-1)
         elif command == "step-forward":
             self.step_playback(1)
 
+    def _handle_preview_shortcut(self, command: str) -> None:
+        if command == "fullscreen" or not self._playback_focus_uses_space():
+            self._handle_preview_command(command)
+
     def toggle_preview_fullscreen(self) -> None:
-        if self.preview_stack.currentWidget() is self.video_preview:
-            self.video_preview.setFullScreen(not self.video_preview.isFullScreen())
-            return
         if self._fullscreen_preview is not None:
             self._fullscreen_preview.close()
-            self._fullscreen_preview = None
             return
-        dialog = QDialog(self)
+        dialog = QDialog(
+            None,
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint,
+        )
         dialog.setWindowTitle("VP Stitch Preview")
         dialog.setStyleSheet("background:#05070a;")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
-        image = QLabel()
-        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pixmap = self.preview.viewport().grab()
-        image.setPixmap(pixmap)
-        image.setScaledContents(False)
-        layout.addWidget(image)
-        for key in ("P", "Escape"):
+        playback_ready = False
+        if self._playback_path is not None and self._playback_path.is_file():
+            try:
+                current_key, _ = self._playback_signature()
+                playback_ready = current_key == self._playback_key
+            except (OSError, ValueError):
+                pass
+        if playback_ready:
+            fullscreen_video = PlaybackVideoWidget()
+            fullscreen_video.setStyleSheet("background:#05070a;")
+            fullscreen_video.commandRequested.connect(self._handle_preview_command)
+            layout.addWidget(fullscreen_video)
+            self._fullscreen_video = fullscreen_video
+        else:
+            pixmap = self.preview.current_pixmap() or self.preview.viewport().grab()
+            self._fullscreen_live_label = FullscreenPreviewLabel(pixmap)
+            layout.addWidget(self._fullscreen_live_label)
+
+        def restore_preview_output(_result: int) -> None:
+            if self._fullscreen_video is not None:
+                if not self._closing:
+                    self.media_player.setVideoOutput(self.video_preview)
+                self._fullscreen_video = None
+            self._fullscreen_live_label = None
+            self._fullscreen_preview = None
+
+        escape_shortcut = QShortcut(QKeySequence("Escape"), dialog)
+        escape_shortcut.activated.connect(dialog.close)
+        for key, command in (
+            ("Space", "play-pause"),
+            ("J", "reverse"),
+            ("K", "stop"),
+            ("L", "forward"),
+            (Qt.Key.Key_Left, "step-back"),
+            (Qt.Key.Key_Right, "step-forward"),
+        ):
             shortcut = QShortcut(QKeySequence(key), dialog)
-            shortcut.activated.connect(dialog.close)
-        dialog.finished.connect(lambda _result: setattr(self, "_fullscreen_preview", None))
-        self._fullscreen_preview = dialog
-        dialog.showFullScreen()
-        image.setPixmap(
-            pixmap.scaled(
-                dialog.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+            shortcut.activated.connect(
+                lambda selected=command: self._handle_preview_command(selected)
             )
-        )
+        dialog.finished.connect(restore_preview_output)
+        self._fullscreen_preview = dialog
+        screen = self.preview.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            dialog.setGeometry(screen.geometry())
+        dialog.showFullScreen()
+        if screen is not None and dialog.windowHandle() is not None:
+            dialog.windowHandle().setScreen(screen)
+        if self._fullscreen_video is not None:
+            QTimer.singleShot(
+                0,
+                lambda: (
+                    self.media_player.setVideoOutput(self._fullscreen_video)
+                    if self._fullscreen_video is not None
+                    else None
+                ),
+            )
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def play_forward(self) -> None:
+        self._reverse_timer.stop()
+        if self._playback_path is not None and self._playback_path.is_file():
+            try:
+                current_key, _ = self._playback_signature()
+            except (OSError, ValueError):
+                current_key = None
+            if current_key == self._playback_key:
+                if (
+                    self.media_player.duration() > 0
+                    and self.media_player.position() >= self.media_player.duration() - 50
+                ):
+                    self.media_player.setPosition(0)
+                self.preview_stack.setCurrentWidget(self.video_preview)
+                self.media_player.play()
+                return
+        if self._request_live_proxy_frame(
+            self.timeline_playhead.value(),
+            "Live playback",
+            playing=True,
+            direction=1,
+        ):
+            self.playback_button.setText("Ⅱ  PAUSE")
+            return
+        self.toggle_playback()
 
     def play_reverse(self) -> None:
         if self._playback_path is None or not self._playback_path.is_file():
-            self.statusBar().showMessage("Playback proxy is not ready yet", 5000)
+            if self._request_live_proxy_frame(
+                self.timeline_playhead.value(),
+                "Live reverse playback",
+                playing=True,
+                direction=-1,
+            ):
+                self.playback_button.setText("◀  REVERSE")
+                return
+            self.statusBar().showMessage("Playback cache is not ready yet", 5000)
+            return
+        try:
+            current_key, _ = self._playback_signature()
+        except (OSError, ValueError):
+            current_key = None
+        if current_key != self._playback_key:
+            if self._request_live_proxy_frame(
+                self.timeline_playhead.value(),
+                "Live reverse playback",
+                playing=True,
+                direction=-1,
+            ):
+                self.playback_button.setText("◀  REVERSE")
+                return
+            self.statusBar().showMessage("Playback cache is stale", 5000)
             return
         self.media_player.pause()
         fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
@@ -3168,17 +6472,36 @@ class MainWindow(QMainWindow):
         self.preview_stack.setCurrentWidget(self.video_preview)
         self.playback_button.setText("◀  REVERSE")
 
+    def _reverse_tick(self) -> None:
+        if self._playback_path is None or not self._playback_path.is_file():
+            self._reverse_timer.stop()
+            return
+        if self.media_player.position() <= 0:
+            self._reverse_timer.stop()
+            self.media_player.pause()
+            return
+        self.step_playback(-1, continuous=True)
+
     def stop_playback(self) -> None:
+        self._stop_live_proxy_playback()
         self._reverse_timer.stop()
         self.media_player.pause()
         self.playback_button.setText("▶  PLAY")
 
-    def step_playback(self, direction: int) -> None:
-        self._reverse_timer.stop()
-        self.media_player.pause()
+    def step_playback(self, direction: int, *, continuous: bool = False) -> None:
+        if not continuous:
+            self._reverse_timer.stop()
+            self.media_player.pause()
         fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
         frame_ms = max(1, int(round(1000 / max(1.0, fps))))
         if self._playback_path is not None and self._playback_path.is_file():
+            try:
+                current_key, _ = self._playback_signature()
+            except (OSError, ValueError):
+                current_key = None
+        else:
+            current_key = None
+        if current_key == self._playback_key and self._playback_path is not None:
             self.media_player.setPosition(
                 max(0, min(self.media_player.duration(), self.media_player.position() + direction * frame_ms))
             )
@@ -3188,6 +6511,8 @@ class MainWindow(QMainWindow):
             lower, upper = self.timeline_bar.values()
             frame = max(lower, min(upper - 1, self.timeline_playhead.value() + direction))
             self._set_playhead(frame)
+            if self._request_live_proxy_frame(frame, "Timeline frame"):
+                return
             self._scrub_preview()
 
     def _playback_focus_uses_space(self) -> bool:
@@ -3206,8 +6531,13 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _toggle_playback_shortcut(self) -> None:
+        if not self._playback_focus_uses_space():
+            self.toggle_playback()
+
     def _playback_signature(self) -> tuple[str, list[str]]:
         sources = self._validate_sources()
+        playback_sources = self._cached_playback_sources(sources)
         config = self._collect_config()
         lower = self.timeline_in.value() if self._tc_alignment else 0
         upper = (
@@ -3219,16 +6549,247 @@ class MainWindow(QMainWindow):
         for source in sources:
             stat = Path(source).stat()
             fingerprints.append((source, stat.st_size, stat.st_mtime_ns))
+        playback_fingerprints = []
+        for source in playback_sources:
+            stat = Path(source).stat()
+            playback_fingerprints.append((source, stat.st_size, stat.st_mtime_ns))
         payload = {
             "config": config,
+            "viewer_monitor": str(self.viewer_monitor.currentData() or "sdr-rec709"),
             "sources": fingerprints,
+            "playback_sources": playback_fingerprints,
             "alignment": self._tc_alignment,
             "range": [lower, upper],
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()[:20], sources
+        return hashlib.sha256(encoded).hexdigest()[:20], playback_sources
+
+    def _create_live_playback_session(
+        self,
+        playback_key: str,
+        playback_sources: list[str],
+    ) -> LivePlaybackSession:
+        if not self._tc_alignment:
+            raise ValueError("TC alignment is not available")
+        full_config = self._write_working_config()
+        directory = self._working_dir / "live-playback"
+        directory.mkdir(parents=True, exist_ok=True)
+        preview_config = directory / f"{playback_key}.json"
+        width, height = preview_dimensions(
+            self.canvas_width.value(),
+            self.canvas_height.value(),
+            max_width=960,
+            max_height=540,
+        )
+        self._write_preview_config(
+            full_config,
+            preview_config,
+            width,
+            height,
+            scale_cameras=True,
+            viewer_transform=True,
+        )
+        config = parse_config(preview_config)
+        alignment_path = self._playback_alignment_plan(
+            playback_sources,
+            f"live-{playback_key}",
+        )
+        payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or config.video is None:
+            raise ValueError("live playback config is invalid")
+        plan = AlignedFramePlan.from_payload(
+            payload,
+            playback_sources,
+            config.cameras,
+            config.video.fps,
+        )
+        return LivePlaybackSession(
+            playback_sources,
+            config,
+            plan,
+            max_width=960,
+            max_height=540,
+        )
+
+    def _request_live_proxy_frame(
+        self,
+        frame: int,
+        message: str,
+        *,
+        playing: bool = False,
+        direction: int = 1,
+    ) -> bool:
+        if self._closing or not self._tc_alignment:
+            return False
+        try:
+            playback_key, playback_sources = self._playback_signature()
+        except Exception:
+            return False
+        lower, upper = self.timeline_bar.values()
+        frame = max(lower, min(int(frame), upper - 1))
+        self._live_playback_revision += 1
+        revision = self._live_playback_revision
+        self._live_playing = playing
+        self._live_direction = -1 if direction < 0 else 1
+        if self._live_playback_future is not None:
+            self._live_playback_pending = (
+                frame,
+                message,
+                playing,
+                self._live_direction,
+            )
+            return True
+        old_session: LivePlaybackSession | None = None
+        try:
+            if (
+                self._live_playback_session is None
+                or self._live_playback_key != playback_key
+            ):
+                candidate = self._create_live_playback_session(
+                    playback_key,
+                    playback_sources,
+                )
+                current_session = self._live_playback_session
+                if current_session is not None and current_session.can_reconfigure(
+                    candidate.sources,
+                    candidate.config,
+                    candidate.plan,
+                ):
+                    current_session.reconfigure(candidate.config)
+                    candidate.close()
+                    self._live_playback_session = current_session
+                else:
+                    old_session = current_session
+                    self._live_playback_session = candidate
+                self._live_playback_key = playback_key
+            session = self._live_playback_session
+            assert session is not None
+        except Exception as error:
+            self._append_log(f"LIVE PLAYBACK: {error}")
+            return False
+        self._live_close_pending = False
+        started = time.monotonic()
+
+        def render_live_frame() -> object:
+            if old_session is not None:
+                old_session.close()
+            bundle, image = session.render_frame(frame)
+            return bundle.timeline_frame, image, message, time.monotonic() - started
+
+        future = self._live_playback_executor.submit(render_live_frame)
+        self._live_playback_future = future
+        activity = (
+            "applying settings to memory frame"
+            if session.has_cached_frame(frame)
+            else "decoding frame in background"
+        )
+        self.preview_note.setText(f"{message} · {activity} {frame}…")
+
+        def complete(result: Future[object]) -> None:
+            try:
+                payload = result.result()
+                error = ""
+            except Exception as caught:
+                payload = None
+                error = str(caught)
+            if self._closing:
+                session.close()
+                return
+            try:
+                self._live_playback_signals.finished.emit(revision, payload, error)
+            except RuntimeError:
+                pass
+
+        future.add_done_callback(complete)
+        return True
+
+    def _live_proxy_frame_finished(
+        self,
+        revision: int,
+        payload: object,
+        error: str,
+    ) -> None:
+        self._live_playback_future = None
+        current = revision == self._live_playback_revision and not self._closing
+        if current and not error and isinstance(payload, tuple) and len(payload) == 4:
+            frame, image, message, elapsed = payload
+            if isinstance(image, np.ndarray):
+                self.preview.set_array(image)
+                self.preview_stack.setCurrentWidget(self.preview)
+                self._set_playhead(int(frame))
+                self._preview_ready = True
+                pixmap = self.preview.current_pixmap()
+                if pixmap is not None and self._fullscreen_live_label is not None:
+                    self._fullscreen_live_label.set_source(pixmap)
+                backend = (
+                    "GPU/OpenCL"
+                    if self._live_playback_session is not None
+                    and self._live_playback_session.renderer.hardware_accelerated
+                    else "CPU fallback"
+                )
+                self.preview_note.setText(
+                    f"{message} · LIVE SOURCE PROXY · {backend}"
+                )
+                if self._live_playing:
+                    lower, upper = self.timeline_bar.values()
+                    next_frame = int(frame) + self._live_direction
+                    if lower <= next_frame < upper:
+                        fps = float(self._tc_alignment["fps"])
+                        delay = max(
+                            0,
+                            int(round(1000.0 / max(fps, 1.0) - float(elapsed) * 1000)),
+                        )
+                        QTimer.singleShot(
+                            delay,
+                            lambda: self._request_live_proxy_frame(
+                                next_frame,
+                                "Live playback",
+                                playing=True,
+                                direction=self._live_direction,
+                            ),
+                        )
+                    else:
+                        self._live_playing = False
+                        self.playback_button.setText("▶  PLAY")
+        elif current and error:
+            self._live_playing = False
+            self.playback_button.setText("▶  PLAY")
+            self.preview_note.setText(f"Live playback unavailable · {error}")
+            self._append_log(f"LIVE PLAYBACK: {error}")
+
+        pending = self._live_playback_pending
+        self._live_playback_pending = None
+        if pending is not None and not self._closing:
+            self._request_live_proxy_frame(
+                pending[0],
+                pending[1],
+                playing=pending[2],
+                direction=pending[3],
+            )
+        elif self._live_close_pending:
+            self._close_live_playback_session()
+
+    def _close_live_playback_session(self) -> None:
+        session, self._live_playback_session = self._live_playback_session, None
+        self._live_playback_key = None
+        self._live_close_pending = False
+        if session is not None:
+            try:
+                self._live_playback_executor.submit(session.close)
+            except RuntimeError:
+                session.close()
+
+    def _stop_live_proxy_playback(self, *, close_session: bool = False) -> None:
+        self._live_playing = False
+        self._live_playback_pending = None
+        self._live_playback_revision += 1
+        if close_session:
+            if self._live_playback_future is None:
+                self._close_live_playback_session()
+            else:
+                self._live_close_pending = True
 
     def _seek_loaded_playback(self, frame: int) -> bool:
         if self._playback_path is None or not self._playback_path.is_file():
@@ -3264,21 +6825,45 @@ class MainWindow(QMainWindow):
             self._append_log(f"PLAYBACK ERROR: {message}")
             self.preview_note.setText("Playback failed · rebuild the proxy or open Jobs")
 
-    def _stop_playback(self, *, clear: bool = False) -> None:
+    def _stop_playback(
+        self,
+        *,
+        clear: bool = False,
+        preserve_image: bool = False,
+    ) -> None:
         if not hasattr(self, "media_player"):
             return
+        preserved_frame = (
+            self.timeline_playhead.value()
+            if hasattr(self, "timeline_playhead") and self._tc_alignment
+            else None
+        )
+        self._stop_live_proxy_playback(close_session=clear)
         self._reverse_timer.stop()
-        self.media_player.stop()
-        self.preview_stack.setCurrentWidget(self.preview)
+        can_block = hasattr(self.media_player, "blockSignals")
+        if can_block:
+            self.media_player.blockSignals(True)
+        if preserve_image:
+            self.media_player.pause()
+        else:
+            self.media_player.stop()
+            self.preview_stack.setCurrentWidget(self.preview)
         if clear:
-            self.media_player.setSource(QUrl())
+            if not preserve_image:
+                self.media_player.setSource(QUrl())
             self._playback_path = None
             self._playback_key = None
+        if can_block:
+            self.media_player.blockSignals(False)
+        if preserved_frame is not None:
+            self._set_playhead(preserved_frame)
 
     def toggle_playback(self) -> None:
-        if self._playback_focus_uses_space():
-            return
         self._reverse_timer.stop()
+        if self._live_playing:
+            self._stop_live_proxy_playback()
+            self.playback_button.setText("▶  PLAY")
+            return
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
             return
@@ -3287,16 +6872,36 @@ class MainWindow(QMainWindow):
             and self.media_player.position() >= self.media_player.duration() - 50
         ):
             self.media_player.setPosition(0)
-        if self.process is not None:
-            message = (
-                "Playback cache is already warming in the background"
-                if self._auto_cache_in_progress
-                else "Finish the current task before playback"
-            )
-            self.statusBar().showMessage(message, 6000)
+        if self._playback_path is not None and self._playback_path.is_file():
+            try:
+                current_key, _ = self._playback_signature()
+            except (OSError, ValueError):
+                current_key = None
+            if current_key == self._playback_key:
+                self.preview_stack.setCurrentWidget(self.video_preview)
+                self.media_player.play()
+                return
+        if self._request_live_proxy_frame(
+            self.timeline_playhead.value(),
+            "Live playback",
+            playing=True,
+            direction=1,
+        ):
+            self.playback_button.setText("Ⅱ  PAUSE")
             return
         if not self._tc_alignment:
             self._error("Playback", "Run TC ALIGN before building synchronized playback")
+            return
+        if self.process is not None:
+            if self._auto_cache_in_progress:
+                self._playback_autostart = True
+                message = "Playback proxy is building · it will play when ready"
+            else:
+                self._pending_playback_request = True
+                self._auto_cache_requested = True
+                message = "Playback queued · it will start after the current frame finishes"
+            self.preview_note.setText(message)
+            self.statusBar().showMessage(message, 8000)
             return
         try:
             playback_key, sources = self._playback_signature()
@@ -3384,7 +6989,15 @@ class MainWindow(QMainWindow):
         self._tc_alignment = payload
         self.source_table.set_timing(inputs)
         self._timeline_maximum = self._effective_common_frames(payload)
-        self.fps.setValue(float(payload["fps"]))
+        source_fps = _canonical_frame_rate(float(payload["fps"]))
+        metadata = self.config_data.setdefault("_vpstitch", {})
+        if isinstance(metadata, dict):
+            metadata["source_fps"] = source_fps
+        if self.fps_mode.currentData() == FPS_MODE_MATCH_SOURCE:
+            self.fps.setValue(source_fps)
+            video = self.config_data.setdefault("video", {})
+            if isinstance(video, dict):
+                video["fps"] = source_fps
         self.timeline_in.setRange(0, self._timeline_maximum - 1)
         self.timeline_out.setRange(1, self._timeline_maximum)
         self.timeline_in.setEnabled(True)
@@ -3425,8 +7038,10 @@ class MainWindow(QMainWindow):
                     15000,
                 )
                 self._save_active_timeline()
-                if self._auto_workflows_enabled:
-                    QTimer.singleShot(0, self._warm_playback_cache)
+                self.preview_note.setText(
+                    "TC aligned · prewarming playback proxy in the background…"
+                )
+                self._request_playback_warmup()
             except Exception as error:
                 self._error("TC align", str(error))
 
@@ -3447,25 +7062,612 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open OCIO config", str(self.project_root), "OCIO config (*.ocio);;All files (*.*)")
         if path:
             self.ocio_config.setText(path)
+            self._reload_ocio_spaces()
+
+    def _reload_ocio_spaces(self, *_args, quiet: bool = False) -> bool:
+        identifier = self.ocio_config.text().strip()
+        if not identifier:
+            self.ocio_space_status.setText("OCIO config is required")
+            return False
+        current = (
+            str(self.input_space.property("ocioRequested") or self.input_space.currentText()).strip(),
+            str(self.working_space.property("ocioRequested") or self.working_space.currentText()).strip(),
+            str(self.output_space.property("ocioRequested") or self.output_space.currentText()).strip(),
+        )
+        try:
+            spaces = ocio_space_names(identifier)
+            if not spaces:
+                raise ValueError("config contains no named color spaces")
+        except Exception as error:
+            self.ocio_space_status.setText(f"Could not read OCIO config · {error}")
+            if not quiet:
+                self.statusBar().showMessage(
+                    "OCIO color-space scan failed · check the config path",
+                    10000,
+                )
+            return False
+        recoveries: list[tuple[str, str]] = []
+        for combo, value in zip(
+            (self.input_space, self.working_space, self.output_space),
+            current,
+            strict=True,
+        ):
+            resolved = _populate_ocio_combo(combo, spaces, value)
+            if value and resolved != value:
+                recoveries.append((value, resolved))
+        self._loaded_ocio_identifier = identifier
+        self._loaded_ocio_spaces = spaces
+        if recoveries:
+            old, new = recoveries[-1]
+            self.ocio_space_status.setText(
+                f"{len(spaces)} OCIO spaces · corrected “{old}” → “{new}”"
+            )
+            notice = tuple(recoveries)
+            if notice != getattr(self, "_last_ocio_recovery_notice", None):
+                self._append_log(
+                    "OCIO selection recovered: "
+                    + "; ".join(f"{old} → {new}" for old, new in recoveries)
+                )
+                self._last_ocio_recovery_notice = notice
+        else:
+            self.ocio_space_status.setText(f"{len(spaces)} OCIO spaces loaded")
+        for combo in (self.input_space, self.working_space, self.output_space):
+            combo.setToolTip(f"{len(spaces)} spaces loaded from {identifier}")
+        self._reload_ocio_delivery(quiet=quiet)
+        return True
+
+    def _reload_ocio_delivery(
+        self,
+        *,
+        display: str | None = None,
+        view: str | None = None,
+        quiet: bool = True,
+    ) -> bool:
+        identifier = self.ocio_config.text().strip()
+        if not identifier:
+            return False
+        selected_display = display or _delivery_display_value(self.output_display)
+        selected_view = view or self.output_view.currentText().strip()
+        try:
+            displays = ocio_display_views(identifier)
+            if not displays:
+                raise ValueError("config contains no display views")
+        except Exception as error:
+            self.delivery_status.setText(f"Could not read delivery views · {error}")
+            if not quiet:
+                self.statusBar().showMessage(
+                    "OCIO display/view scan failed · check the config", 10000
+                )
+            return False
+        self._delivery_views = displays
+        self._loaded_ocio_delivery_identifier = identifier
+        _populate_delivery_display_combo(
+            self.output_display, tuple(displays), selected_display
+        )
+        chosen = _delivery_display_value(self.output_display)
+        _populate_combo(self.output_view, displays.get(chosen, ()), selected_view)
+        self._update_delivery_controls()
+        return True
+
+    def _delivery_display_changed(self, *_args) -> None:
+        displays = getattr(self, "_delivery_views", {})
+        if not displays:
+            return
+        selected = _delivery_display_value(self.output_display)
+        _populate_combo(self.output_view, displays.get(selected, ()), "")
+        self._update_delivery_controls()
+
+    def _update_delivery_controls(self, *_args) -> None:
+        ocio_enabled = self.color_mode.currentData() == "ocio"
+        display_view = self.output_mode.currentData() == "display_view"
+        self.output_space.setVisible(not display_view)
+        self.output_space_label.setVisible(not display_view)
+        self.output_display.setVisible(display_view)
+        self.output_display_label.setVisible(display_view)
+        self.output_view.setVisible(display_view)
+        self.output_view_label.setVisible(display_view)
+        for widget in (
+            self.output_mode,
+            self.output_space,
+            self.output_display,
+            self.output_view,
+            self.viewer_monitor,
+        ):
+            widget.setEnabled(ocio_enabled)
+        if not ocio_enabled:
+            self.delivery_status.setText("OCIO mode is required for managed delivery")
+        elif display_view:
+            display = _delivery_display_value(self.output_display)
+            view = self.output_view.currentText().strip()
+            tags = _display_view_video_tags(display, view)
+            if tags.get("color_trc") in {"smpte2084", "arib-std-b67"}:
+                self.delivery_status.setText(
+                    "Managed HDR transform is applied after stitching."
+                )
+            elif display == "Display P3 HDR - Display":
+                self.delivery_status.setText(
+                    "Apple EDR target · this is not ST2084/PQ delivery."
+                )
+            else:
+                self.delivery_status.setText(
+                    "Managed SDR display transform is applied after stitching."
+                )
+        else:
+            self.delivery_status.setText(
+                "Scene/log encoding is applied after stitching."
+            )
+
+    def _viewer_monitor_changed(self, *_args) -> None:
+        if not hasattr(self, "viewer_monitor"):
+            return
+        key = str(self.viewer_monitor.currentData() or "sdr-rec709")
+        self.settings.setValue("viewer/monitor", key)
+        self.settings.sync()
+        if key == "delivery":
+            self.viewer_status.setText(
+                "Raw delivery target · HDR/log will look incorrect on this Rec.709 screen."
+            )
+        else:
+            self.viewer_status.setText(
+                "Managed Rec.709 viewer · delivery and Render Queue stay unchanged."
+            )
+        if self._loading_config or not self.config_data:
+            return
+        self._schedule_live_preview("Viewer monitor updated", immediate=True)
+
+    def _apply_viewer_transform(
+        self, raw: dict[str, object]
+    ) -> dict[str, object]:
+        """Apply the local monitor transform to a preview-only config copy."""
+        preview = json.loads(json.dumps(raw))
+        key = str(self.viewer_monitor.currentData() or "sdr-rec709")
+        color = preview.get("color")
+        if (
+            key == "delivery"
+            or not isinstance(color, dict)
+            or color.get("mode") != "ocio"
+        ):
+            return preview
+        _label, display, view = VIEWER_MONITOR_TRANSFORMS.get(
+            key, VIEWER_MONITOR_TRANSFORMS["sdr-rec709"]
+        )
+        displays = ocio_display_views(str(color.get("ocio_config") or ""))
+        if display not in displays or view not in displays.get(display, ()):
+            raise ValueError(
+                f"Viewer transform is unavailable in the OCIO config: {display} / {view}"
+            )
+        color["output_mode"] = "display_view"
+        color["display"] = display
+        color["view"] = view
+        color.pop("output_space", None)
+        video = preview.setdefault("video", {})
+        if isinstance(video, dict):
+            video.update(
+                {
+                    "color_primaries": "bt709",
+                    "color_trc": "bt709",
+                    "colorspace": "bt709",
+                    "color_range": "tv",
+                }
+            )
+        return preview
+
+    def _update_color_match_cameras(
+        self,
+        cameras: list[dict[str, object]],
+        color: dict[str, object],
+    ) -> None:
+        selected = str(color.get("match_reference") or "")
+        self.color_match_reference.blockSignals(True)
+        self.color_match_reference.clear()
+        plate_numbers = self._plate_numbers or list(
+            PLATE_NUMBERS_BY_COUNT.get(len(cameras), tuple(range(1, len(cameras) + 1)))
+        )
+        for index, camera in enumerate(cameras):
+            name = str(camera.get("name") or f"cam{index}")
+            plate = plate_numbers[index] if index < len(plate_numbers) else index + 1
+            self.color_match_reference.addItem(f"P{plate:02d} · {name}", name)
+        current = self.color_match_reference.findData(selected)
+        self.color_match_reference.setCurrentIndex(max(0, current))
+        self.color_match_reference.blockSignals(False)
+        enabled = bool(color.get("match_enabled", False))
+        self.color_match_enabled.blockSignals(True)
+        self.color_match_enabled.setChecked(enabled)
+        self.color_match_enabled.blockSignals(False)
+        self.color_match_strength.blockSignals(True)
+        self.color_match_strength.setValue(
+            int(round(float(color.get("match_strength", 1.0)) * 100.0))
+        )
+        self.color_match_strength.blockSignals(False)
+        confidences = {
+            str(camera.get("name") or f"cam{index}"): float(
+                camera.get("color_match_confidence") or 0.0
+            )
+            for index, camera in enumerate(cameras)
+        }
+        if enabled and selected:
+            selected_index = self.color_match_reference.findData(selected)
+            reference_label = (
+                self.color_match_reference.itemText(selected_index).split(" · ", 1)[0]
+                if selected_index >= 0
+                else selected
+            )
+            matched = sum(value > 0.0 for value in confidences.values())
+            measured = [
+                value
+                for name, value in confidences.items()
+                if name != selected and value > 0.0
+            ]
+            average = (
+                sum(measured) / len(measured)
+                if measured
+                else 0.0
+            )
+            self.color_match_status.setText(
+                f"{reference_label} reference · {matched}/{len(cameras)} connected · {average:.0%} confidence"
+            )
+        else:
+            self.color_match_status.setText("Create a Quick Preview, then match")
+
+    def _color_match_reference_changed(self, *_args) -> None:
+        if self._loading_config:
+            return
+        self.color_match_enabled.blockSignals(True)
+        self.color_match_enabled.setChecked(False)
+        self.color_match_enabled.blockSignals(False)
+        self.color_match_status.setText("Reference changed · run MATCH")
+        self._color_match_setting_changed()
+
+    def _color_match_setting_changed(self, *_args) -> None:
+        if self._loading_config or not self.config_data:
+            return
+        self._schedule_live_preview("Camera match updated")
+
+    def reset_color_match(self) -> None:
+        cameras = self.config_data.get("cameras")
+        if not isinstance(cameras, list):
+            return
+        for camera in cameras:
+            if isinstance(camera, dict):
+                camera["color_gain"] = [1.0, 1.0, 1.0]
+                camera.pop("color_match_confidence", None)
+        self.color_match_enabled.blockSignals(True)
+        self.color_match_enabled.setChecked(False)
+        self.color_match_enabled.blockSignals(False)
+        self.color_match_status.setText("Camera match reset")
+        self._stop_playback(clear=True)
+        self._save_active_timeline()
+        self._restitch_color_reference("Camera match reset")
+
+    def match_cameras(self) -> None:
+        if self.color_mode.currentData() != "ocio":
+            self._error("Camera Match", "Camera matching requires OCIO mode")
+            return
+        if self._last_reference_dir is None or self._last_reference_config_path is None:
+            self._error("Camera Match", "Create a Quick Preview first")
+            return
+        try:
+            raw = json.loads(
+                self._last_reference_config_path.read_text(encoding="utf-8")
+            )
+            images = [
+                str(self._last_reference_dir / f"{camera['name']}.png")
+                for camera in raw["cameras"]
+            ]
+            if any(not Path(path).is_file() for path in images):
+                raise ValueError("Reference images are missing; create Quick Preview again")
+            reference = str(self.color_match_reference.currentData() or "")
+            if not reference:
+                raise ValueError("Choose a reference camera")
+        except Exception as error:
+            self._error("Camera Match", str(error))
+            return
+        report = self._last_reference_dir / "color-match.json"
+        self.color_match_status.setText("Analyzing scene-linear overlaps …")
+
+        def apply_match() -> None:
+            try:
+                payload = json.loads(report.read_text(encoding="utf-8"))
+                solved = {
+                    str(item["name"]): item
+                    for item in payload.get("cameras", [])
+                    if isinstance(item, dict)
+                }
+                cameras = self.config_data.get("cameras")
+                if not isinstance(cameras, list) or len(solved) != len(cameras):
+                    raise ValueError("Color-match report does not match this rig")
+                connected = 0
+                confidences: list[float] = []
+                for camera in cameras:
+                    if not isinstance(camera, dict):
+                        continue
+                    item = solved[str(camera.get("name"))]
+                    gain = [float(value) for value in item["gain"]]
+                    if len(gain) != 3:
+                        raise ValueError("Color-match gain must contain RGB values")
+                    confidence = float(item.get("confidence", 0.0))
+                    camera["color_gain"] = gain
+                    camera["color_match_confidence"] = confidence
+                    if bool(item.get("connected", False)):
+                        connected += 1
+                        if str(camera.get("name")) != reference:
+                            confidences.append(confidence)
+                self.color_match_enabled.blockSignals(True)
+                self.color_match_enabled.setChecked(True)
+                self.color_match_enabled.blockSignals(False)
+                average = sum(confidences) / len(confidences) if confidences else 0.0
+                reference_label = self.color_match_reference.currentText().split(
+                    " · ", 1
+                )[0]
+                self.color_match_status.setText(
+                    f"{reference_label} reference · {connected}/{len(cameras)} connected · {average:.0%} confidence"
+                )
+                self._stop_playback(clear=True)
+                self._save_active_timeline()
+                self._restitch_color_reference("Camera match applied")
+            except Exception as error:
+                self._error("Camera Match", str(error))
+
+        def match_failed() -> None:
+            self.color_match_status.setText("Camera match failed · see Task Log")
+
+        self._run_cli(
+            "MATCH CAMERA COLOR",
+            [
+                "match-color",
+                "--config",
+                str(self._last_reference_config_path),
+                "--reference-camera",
+                reference,
+                "--output",
+                str(report),
+                *images,
+            ],
+            apply_match,
+            match_failed,
+        )
+
+    def _restitch_color_reference(self, message: str) -> None:
+        self._schedule_live_preview(message, immediate=True)
+
+    def _schedule_live_preview(
+        self,
+        message: str,
+        *,
+        immediate: bool = False,
+    ) -> None:
+        """Debounce inspector changes and update the in-memory draft frame."""
+        if self._loading_config or self._closing or not self.config_data:
+            return
+        if (
+            self.process is not None
+            and self._process_task_name == "BUILD PLAYBACK PROXY"
+        ):
+            self._playback_cache_cancelled_for_interaction = True
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
+            self._playback_autostart = False
+            self.process.kill()
+        # The current proxy remains on disk while the inspector is moving. Its
+        # signature is marked stale so playback cannot silently show old stitch
+        # values, but no media is re-decoded merely to update a still preview.
+        self._stop_playback(preserve_image=True)
+        self._playback_key = None
+        self._live_preview_revision += 1
+        self._live_preview_message = message
+        self._live_preview_pending = True
+        if self._last_reference_dir is None or self._last_reference_config_path is None:
+            self.preview_note.setText(f"{message} · create Quick Preview once")
+        else:
+            self.preview_note.setText(f"{message} · updating draft…")
+        self._live_preview_timer.start(0 if immediate else 40)
+
+    def _sync_cached_preview_config(self) -> tuple[list[str], Path]:
+        reference = self._last_reference_dir
+        preview_config = self._last_reference_config_path
+        if reference is None or preview_config is None or not preview_config.is_file():
+            raise ValueError("Create Quick Preview once to enable live updates")
+
+        full = self._collect_config()
+        preview_raw = json.loads(preview_config.read_text(encoding="utf-8"))
+        full_output = full["output"]
+        preview_output = preview_raw["output"]
+        width, height = preview_dimensions(
+            int(full_output["width"]),
+            int(full_output["height"]),
+            max_width=2048,
+            max_height=1152,
+        )
+
+        full_cameras = {
+            str(camera["name"]): camera for camera in full["cameras"]
+        }
+        preview_cameras = preview_raw["cameras"]
+        if set(full_cameras) != {
+            str(camera["name"]) for camera in preview_cameras
+        }:
+            raise ValueError("Cached preview does not match the active camera set")
+
+        camera_scale = min(
+            min(
+                float(camera["width"])
+                / max(1.0, float(full_cameras[str(camera["name"])]["width"])),
+                float(camera["height"])
+                / max(1.0, float(full_cameras[str(camera["name"])]["height"])),
+            )
+            for camera in preview_cameras
+        )
+        for camera in preview_cameras:
+            scaled_width = camera["width"]
+            scaled_height = camera["height"]
+            scaled_lens = camera["lens"]
+            source = json.loads(json.dumps(full_cameras[str(camera["name"])]))
+            source_lens = source.get("lens")
+            if isinstance(scaled_lens, dict) and isinstance(source_lens, dict):
+                scaled_lens["distortion"] = json.loads(
+                    json.dumps(source_lens.get("distortion", [0.0] * 4))
+                )
+            camera.clear()
+            camera.update(source)
+            camera["width"] = scaled_width
+            camera["height"] = scaled_height
+            camera["lens"] = scaled_lens
+
+        preview_output.update(json.loads(json.dumps(full_output)))
+        preview_output["width"] = width
+        preview_output["height"] = height
+        preview_output["tile_width"] = min(
+            int(preview_output.get("tile_width", 1024)), width
+        )
+        preview_output["tile_height"] = min(
+            int(preview_output.get("tile_height", 512)), height
+        )
+        viewer_full = self._apply_viewer_transform(full)
+        preview_raw["color"] = json.loads(json.dumps(viewer_full["color"]))
+        if isinstance(viewer_full.get("video"), dict):
+            preview_raw["video"] = json.loads(json.dumps(viewer_full["video"]))
+        if "flow" in full:
+            preview_raw["flow"] = json.loads(json.dumps(full["flow"]))
+            flow = preview_raw["flow"]
+            if isinstance(flow, dict) and flow.get("max_displacement_px") is not None:
+                flow["max_displacement_px"] = max(
+                    1.0,
+                    float(flow["max_displacement_px"]) * camera_scale,
+                )
+
+        preview_config.write_text(
+            json.dumps(preview_raw, indent=2), encoding="utf-8"
+        )
+        images = [
+            str(reference / f"{camera['name']}.png")
+            for camera in preview_cameras
+        ]
+        if any(not Path(path).is_file() for path in images):
+            raise ValueError("Cached reference images are missing; create Quick Preview again")
+        return images, reference / "stitched-preview.png"
+
+    def _run_live_preview(self) -> None:
+        if not self._live_preview_pending or self._closing:
+            return
+        if self.process is not None:
+            return
+        self._live_preview_pending = False
+        revision = self._live_preview_revision
+        message = self._live_preview_message
+        self._save_active_timeline()
+        current_frame = self.timeline_playhead.value() if self._tc_alignment else 0
+        if self._tc_alignment and self._request_live_proxy_frame(
+            current_frame,
+            message,
+        ):
+            return
+        if self._tc_alignment and self._reference_frame_index != current_frame:
+            self.preview_note.setText(
+                f"{message} · loading synchronized frame {current_frame}…"
+            )
+            self.create_preview(preserve_view=True)
+            return
+        if self._last_reference_dir is None or self._last_reference_config_path is None:
+            self.preview_note.setText(f"{message} · create Quick Preview once")
+            return
+        try:
+            images, _ = self._sync_cached_preview_config()
+            preview_config = self._last_reference_config_path
+            assert preview_config is not None
+            config = parse_config(preview_config)
+        except Exception as error:
+            self.preview_note.setText(f"Live preview unavailable · {error}")
+            return
+        self._interactive_request = (revision, config, images, message)
+        self._start_interactive_preview()
+
+    def _start_interactive_preview(self) -> None:
+        if self._closing or self._interactive_request is None:
+            return
+        if self._interactive_future is not None and not self._interactive_future.done():
+            return
+        revision, config, images, message = self._interactive_request
+        self._interactive_request = None
+        future = self._interactive_executor.submit(
+            self._interactive_renderer.render,
+            config,
+            images,
+        )
+        self._interactive_future = future
+
+        def complete(result: Future[np.ndarray]) -> None:
+            try:
+                image = result.result()
+                error = ""
+            except Exception as caught:
+                image = None
+                error = str(caught)
+            try:
+                self._interactive_signals.finished.emit(
+                    revision,
+                    (image, message),
+                    error,
+                )
+            except RuntimeError:
+                pass
+
+        future.add_done_callback(complete)
+
+    def _interactive_preview_finished(
+        self,
+        revision: int,
+        payload: object,
+        error: str,
+    ) -> None:
+        self._interactive_future = None
+        image, message = payload if isinstance(payload, tuple) else (None, "Preview")
+        if not self._closing and revision == self._live_preview_revision:
+            if error or not isinstance(image, np.ndarray):
+                self.preview_note.setText(
+                    f"Live preview unavailable · {error or 'invalid image'}"
+                )
+            else:
+                self.preview.set_array(image)
+                self.preview_stack.setCurrentWidget(self.preview)
+                self._preview_ready = True
+                self.rig_align_button.setEnabled(True)
+                self._update_color_controls()
+                backend = (
+                    "GPU/OpenCL"
+                    if self._interactive_renderer.hardware_accelerated
+                    else "CPU fallback"
+                )
+                self.preview_note.setText(
+                    f"{message} · INTERACTIVE PREVIEW · {backend}"
+                )
+                self.statusBar().showMessage(
+                    f"Interactive preview updated · {backend} · render remains full quality",
+                    1800,
+                )
+        if self._interactive_request is not None:
+            self._start_interactive_preview()
 
     def apply_aces_preset(self) -> None:
         self.color_mode.setCurrentIndex(self.color_mode.findData("ocio"))
         self.ocio_config.setText(BUILTIN_ACES_STUDIO)
-        self.input_space.setText("Camera Rec.709")
-        self.working_space.setText("ACEScg")
-        self.output_space.setText("Gamma 2.4 Encoded Rec.709")
+        _request_ocio_combo_value(self.input_space, "Camera Rec.709")
+        _request_ocio_combo_value(self.working_space, "ACEScg")
+        _request_ocio_combo_value(
+            self.output_space, "Gamma 2.4 Encoded Rec.709"
+        )
+        self.output_mode.setCurrentIndex(self.output_mode.findData("colorspace"))
+        self._reload_ocio_spaces(quiet=True)
         self._update_color_controls()
         self._append_log("Applied bundled ACES 2.0 Studio preset: Camera Rec.709 → ACEScg → Gamma 2.4 Rec.709")
 
     def choose_output(self) -> None:
-        codec = str(self.output_codec.currentData())
-        if codec.endswith("sequence"):
-            path = QFileDialog.getExistingDirectory(self, "Select empty output directory", str(self._output_root))
-        else:
-            suffix = ".mov" if codec.startswith("prores") else ".mp4" if codec == "h264-mp4-10" else ".mkv"
-            path, _ = QFileDialog.getSaveFileName(self, "Select output", str(self._output_root / f"stitched{suffix}"), "All files (*.*)")
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select render folder",
+            self.output_directory.text() or str(self._output_root),
+        )
         if path:
-            self.output_path.setText(path)
+            self.output_directory.setText(path)
             self._last_auto_output = None
 
     def _validate_sources(self) -> list[str]:
@@ -3476,6 +7678,47 @@ class MainWindow(QMainWindow):
         if missing:
             raise ValueError("Missing video: " + missing[0])
         return paths
+
+    def _source_frame_rate(self, sources: list[str]) -> float:
+        probes = self._source_probes
+        cached_paths = [str(probe.get("path") or "") for probe in probes or []]
+        if not probes or cached_paths != sources or any(probe.get("fps") is None for probe in probes):
+            probes = [probe_video(source).to_dict() for source in sources]
+        fps = _matching_source_frame_rate(probes)
+        if fps is None:
+            raise ValueError("Could not detect plate frame rate")
+        return fps
+
+    def _lock_render_frame_rate(
+        self, config: dict[str, object], sources: list[str]
+    ) -> float:
+        source_fps = self._source_frame_rate(sources)
+        metadata = config.setdefault("_vpstitch", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            config["_vpstitch"] = metadata
+        mode = _frame_rate_mode(config)
+        metadata.update(
+            {
+                "fps_mode": mode,
+                "source_fps": source_fps,
+                "timeline_id": self._active_timeline_id,
+                "timeline_name": (
+                    self._active_timeline_record().name
+                    if self._active_timeline_record() is not None
+                    else None
+                ),
+            }
+        )
+        video = config.setdefault("video", {})
+        if not isinstance(video, dict):
+            raise ValueError("Render config video settings are invalid")
+        if mode == FPS_MODE_MATCH_SOURCE:
+            video["fps"] = source_fps
+        else:
+            output_fps = _canonical_frame_rate(float(video.get("fps") or 0.0))
+            video["fps"] = output_fps
+        return float(video["fps"])
 
     def check_inputs(self) -> None:
         self._analyze_imported_sources()
@@ -3523,6 +7766,24 @@ class MainWindow(QMainWindow):
         self._source_probes = probes
         self.source_table.set_probe_data(probes, self._source_overrides)
         self._update_source_status()
+        try:
+            source_fps = _matching_source_frame_rate(probes)
+            self._source_fps_error = None
+        except ValueError as error:
+            self._source_fps_error = str(error)
+            self.preview_note.setText(f"FPS MISMATCH · {error}")
+            self._save_active_timeline()
+            return
+        if source_fps is not None and self.fps_mode.currentData() == FPS_MODE_MATCH_SOURCE:
+            self.fps.setValue(source_fps)
+            video = self.config_data.setdefault("video", {})
+            if isinstance(video, dict):
+                video["fps"] = source_fps
+            metadata = self.config_data.setdefault("_vpstitch", {})
+            if isinstance(metadata, dict):
+                metadata.update(
+                    {"fps_mode": FPS_MODE_MATCH_SOURCE, "source_fps": source_fps}
+                )
         minimum = min(int(probe["bit_depth"]) for probe in probes)
         if minimum < 10:
             self.preview_note.setText(
@@ -3537,6 +7798,7 @@ class MainWindow(QMainWindow):
             self._auto_workflows_enabled
             and self._active_timeline_id
             and self._tc_alignment is None
+            and self._source_fps_error is None
             and self.process is None
         ):
             self.preview_note.setText("Source analyzed · automatic TC align starting…")
@@ -3571,23 +7833,35 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
+        decode_interpretation_changed = any(
+            override.get("input_video_range") != values.get("input_video_range")
+            for override in overrides
+        )
         for path in selected_paths:
             self._source_overrides[path] = dict(values)
         if self._source_probes:
             self.source_table.set_probe_data(
                 self._source_probes, self._source_overrides
             )
-        self._cleanup_reference_dir(self._last_reference_dir)
-        self._last_reference_dir = None
-        self._last_reference_config_path = None
-        self._preview_ready = False
-        self._preview_in_progress = False
-        self._pending_scrub_frame = None
-        self.rig_align_button.setEnabled(False)
         self._update_source_status()
-        self.preview_note.setText(
-            "Input interpretation updated · create preview to refresh stitched image"
-        )
+        if decode_interpretation_changed:
+            self._cleanup_reference_dir(self._last_reference_dir)
+            self._last_reference_dir = None
+            self._last_reference_config_path = None
+            self._reference_frame_index = None
+            self._preview_ready = False
+            self._preview_in_progress = False
+            self._pending_scrub_frame = None
+            self.rig_align_button.setEnabled(False)
+            self.preview_note.setText(
+                "Input video range updated · create preview to decode the frame again"
+            )
+            self._save_active_timeline()
+        else:
+            self._schedule_live_preview(
+                "Plate input color space updated",
+                immediate=True,
+            )
         self.statusBar().showMessage(
             f"Input settings applied to {len(selected_paths)} clip(s)", 8000
         )
@@ -3600,8 +7874,11 @@ class MainWindow(QMainWindow):
         height: int,
         *,
         scale_cameras: bool = True,
+        viewer_transform: bool = False,
     ) -> float:
         raw = json.loads(source.read_text(encoding="utf-8"))
+        if viewer_transform:
+            raw = self._apply_viewer_transform(raw)
         output = raw["output"]
         camera_scales = [
             min(3840 / int(camera["width"]), 2160 / int(camera["height"]))
@@ -3642,6 +7919,8 @@ class MainWindow(QMainWindow):
         *,
         autoplay: bool = True,
     ) -> None:
+        render_sources = list(sources)
+        using_source_proxies = False
         try:
             full_config = self._write_working_config()
             config_dir = self._working_dir / "playback"
@@ -3650,8 +7929,8 @@ class MainWindow(QMainWindow):
             width, height = preview_dimensions(
                 self.canvas_width.value(),
                 self.canvas_height.value(),
-                max_width=1280,
-                max_height=720,
+                max_width=960,
+                max_height=540,
             )
             decode_scale = self._write_preview_config(
                 full_config,
@@ -3659,8 +7938,27 @@ class MainWindow(QMainWindow):
                 width,
                 height,
                 scale_cameras=False,
+                viewer_transform=True,
             )
             raw = json.loads(playback_config.read_text(encoding="utf-8"))
+            proxy_records = self._cached_proxy_records(render_sources)
+            if proxy_records is not None:
+                try:
+                    proxy_probes = [probe_video(source) for source in render_sources]
+                    proxy_dimensions = [
+                        (probe.width, probe.height) for probe in proxy_probes
+                    ]
+                    self._match_camera_geometry_to_proxy_dimensions(
+                        raw, proxy_dimensions
+                    )
+                    decode_scale = 1.0
+                    using_source_proxies = True
+                except (OSError, ValueError) as error:
+                    # A stale or unreadable low-res cache must not break playback.
+                    # Fall back to the authoritative originals and keep the normal
+                    # decode scale/configuration written above.
+                    render_sources = [str(record.path) for record in proxy_records]
+                    self._append_log(f"SOURCE PROXY READ FALLBACK: {error}")
             lower, upper = self.timeline_bar.values()
             raw.setdefault("video", {})["frames"] = upper - lower
             raw["video"]["output_codec"] = "h264-proxy"
@@ -3685,13 +7983,23 @@ class MainWindow(QMainWindow):
             f"{decode_scale:.9f}",
         ]
         if self._tc_alignment_path:
-            arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
-        arguments.extend(sources)
+            try:
+                alignment_path = self._playback_alignment_plan(
+                    render_sources,
+                    playback_key,
+                )
+            except (OSError, ValueError) as error:
+                self._error("Playback alignment", str(error))
+                return
+            arguments.extend(["--alignment-plan", str(alignment_path)])
+        arguments.extend(render_sources)
         self.preview_note.setText(
-            f"Background cache {width}×{height} · playback will be instant when ready"
+            f"Building playback proxy {width}×{height}"
+            + (" from source cache" if using_source_proxies else " from originals")
+            + " · geometry is reused for every frame"
         )
         self._playback_autostart = autoplay
-        self._auto_cache_in_progress = not autoplay
+        self._auto_cache_in_progress = True
 
         def playback_failed() -> None:
             self._playback_autostart = False
@@ -3700,6 +8008,20 @@ class MainWindow(QMainWindow):
                 playback_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            if self._playback_cache_cancelled_for_interaction:
+                self._playback_cache_cancelled_for_interaction = False
+                self.preview_note.setText(
+                    "Playback cache paused · Inspector preview stays interactive"
+                )
+                if self._active_timeline_id:
+                    try:
+                        self.project_store.update_timeline(
+                            self._active_timeline_id,
+                            playback_cache_status=PlaybackCacheStatus.PENDING,
+                        )
+                    except ProjectError:
+                        pass
+                return
             self.preview_note.setText("Playback proxy failed · open Jobs for details")
             if self._active_timeline_id:
                 try:
@@ -3712,6 +8034,14 @@ class MainWindow(QMainWindow):
 
         def playback_ready() -> None:
             self._auto_cache_in_progress = False
+            try:
+                current_key, _ = self._playback_signature()
+            except Exception:
+                current_key = None
+            if current_key != playback_key:
+                playback_path.unlink(missing_ok=True)
+                self._request_playback_warmup(autoplay=self._playback_autostart)
+                return
             self._load_playback(
                 playback_path,
                 playback_key,
@@ -3726,25 +8056,71 @@ class MainWindow(QMainWindow):
             playback_failed,
         )
 
+    def _playback_alignment_plan(
+        self,
+        playback_sources: list[str],
+        playback_key: str,
+    ) -> Path:
+        if self._tc_alignment_path is None:
+            raise ValueError("TC alignment is not available")
+        payload = json.loads(self._tc_alignment_path.read_text(encoding="utf-8"))
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, list) or len(inputs) != len(playback_sources):
+            raise ValueError("TC alignment input count does not match playback sources")
+        for item, source in zip(inputs, playback_sources, strict=True):
+            if not isinstance(item, dict):
+                raise ValueError("TC alignment input entry is invalid")
+            item["path"] = str(Path(source).resolve())
+        probes = payload.get("probes")
+        if isinstance(probes, list) and len(probes) == len(playback_sources):
+            for item, source in zip(probes, playback_sources, strict=True):
+                if isinstance(item, dict):
+                    item["path"] = str(Path(source).resolve())
+        directory = self._working_dir / "playback"
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"{playback_key}-alignment.json"
+        destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return destination
+
+    def _request_playback_warmup(self, *, autoplay: bool = False) -> None:
+        """Coalesce a low-resolution proxy build after interactive work finishes."""
+        if self._closing or not self._tc_alignment:
+            return
+        self._auto_cache_requested = True
+        if autoplay:
+            self._pending_playback_request = True
+        if self.process is None and not self._live_preview_pending:
+            QTimer.singleShot(0, self._warm_playback_cache)
+
     def _warm_playback_cache(self) -> None:
+        if self._closing:
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
+            return
         if not self._tc_alignment or self._loading_timeline:
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
             return
         if self.process is not None:
             self._auto_cache_requested = True
             return
+        autoplay = self._pending_playback_request
         try:
             playback_key, sources = self._playback_signature()
         except Exception as error:
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
             self._append_log(f"AUTO CACHE: {error}")
             return
         playback_dir = self._cache_dir / "playback"
         playback_dir.mkdir(parents=True, exist_ok=True)
         playback_path = playback_dir / f"{playback_key}.mp4"
+        self._auto_cache_requested = False
+        self._pending_playback_request = False
         if playback_path.is_file() and playback_path.stat().st_size > 0:
-            self._load_playback(playback_path, playback_key, autoplay=False)
+            self._load_playback(playback_path, playback_key, autoplay=autoplay)
             self._save_active_timeline()
             return
-        self._auto_cache_requested = False
         if self._active_timeline_id:
             try:
                 self.project_store.update_timeline(
@@ -3755,7 +8131,7 @@ class MainWindow(QMainWindow):
                 pass
         self._refresh_media_tree()
         self._build_playback(
-            playback_path, playback_key, sources, autoplay=False
+            playback_path, playback_key, sources, autoplay=autoplay
         )
 
     def _load_playback(
@@ -3776,8 +8152,9 @@ class MainWindow(QMainWindow):
         if autoplay:
             self.media_player.play()
 
-    def create_preview(self) -> None:
-        self._stop_playback()
+    def create_preview(self, *, preserve_view: bool = False) -> None:
+        requested_frame = self.timeline_playhead.value() if self._tc_alignment else 0
+        self._stop_playback(preserve_image=preserve_view)
         try:
             config = self._write_working_config()
             sources = self._validate_sources()
@@ -3793,7 +8170,10 @@ class MainWindow(QMainWindow):
         try:
             reference.mkdir(parents=True, exist_ok=False)
             width, height = preview_dimensions(
-                self.canvas_width.value(), self.canvas_height.value()
+                self.canvas_width.value(),
+                self.canvas_height.value(),
+                max_width=2048,
+                max_height=1152,
             )
             preview_config = reference / "preview-config.json"
             preview_scale = self._write_preview_config(
@@ -3801,21 +8181,24 @@ class MainWindow(QMainWindow):
                 preview_config,
                 width,
                 height,
+                viewer_transform=True,
             )
         except Exception as error:
             self._cleanup_reference_dir(reference)
             self._error("Preview setup", str(error))
             return
         previous_reference = self._last_reference_dir
+        previous_reference_frame = self._reference_frame_index
         self._preview_in_progress = True
-        self.preview.show_message("EXTRACTING SYNCHRONIZED REFERENCE FRAMES …")
-        timeline_start = self.timeline_playhead.value() if self._tc_alignment else 0
+        self.preview.show_message("LOADING ONE SYNCHRONIZED FRAME …")
+        timeline_start = requested_frame
         reference_time = 0.0
 
         def preview_failed() -> None:
             self._preview_in_progress = False
             self._pending_scrub_frame = None
             self._cleanup_reference_dir(reference)
+            self._reference_frame_index = previous_reference_frame
             previous_preview = (
                 previous_reference / "stitched-preview.png"
                 if previous_reference is not None
@@ -3839,13 +8222,16 @@ class MainWindow(QMainWindow):
             def load_preview() -> None:
                 try:
                     self.preview.set_array(read_image(preview_path))
+                    self.preview_stack.setCurrentWidget(self.preview)
                     self._last_reference_dir = reference
                     self._last_reference_config_path = preview_config
+                    self._reference_frame_index = timeline_start
                     self._preview_ready = True
                     self._cleanup_reference_dir(previous_reference)
                     self.rig_align_button.setEnabled(True)
+                    self._update_color_controls()
                     self.preview_note.setText(
-                        "Release the playhead to refresh this full-canvas 4K preview"
+                        "Quick Preview · one 2K frame · Auto Stitch can refine this alignment"
                     )
                     self.statusBar().showMessage(
                         f"Preview ready: {width}×{height} · full canvas",
@@ -3853,13 +8239,12 @@ class MainWindow(QMainWindow):
                     )
                     self._finish_preview_frame(timeline_start)
                     self._save_active_timeline()
-                    if self._auto_workflows_enabled:
-                        QTimer.singleShot(0, self._warm_playback_cache)
+                    self._request_playback_warmup()
                 except Exception as error:
                     preview_failed()
                     self._error("Preview load", str(error))
 
-            self.preview.show_message("STITCHING 16-BIT PREVIEW …")
+            self.preview.show_message("STITCHING QUICK 2K PREVIEW …")
             self._run_cli(
                 "STITCH PREVIEW",
                 [
@@ -3891,7 +8276,12 @@ class MainWindow(QMainWindow):
         if self._tc_alignment_path:
             arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
         arguments.extend(sources)
-        self._run_cli("EXTRACT REFERENCES", arguments, stitch_reference, preview_failed)
+        self._run_cli(
+            "EXTRACT REFERENCES",
+            arguments,
+            stitch_reference,
+            preview_failed,
+        )
 
     def auto_align(self) -> None:
         if self._last_reference_dir is None or self._last_reference_config_path is None:
@@ -3899,8 +8289,16 @@ class MainWindow(QMainWindow):
             return
         try:
             config = self._write_working_config()
-            calibration_config = self._last_reference_config_path
-            raw = json.loads(calibration_config.read_text(encoding="utf-8"))
+            preview_config = self._last_reference_config_path
+            raw = json.loads(preview_config.read_text(encoding="utf-8"))
+            profile = self._rig_profiles.get(len(raw["cameras"]))
+            if not isinstance(profile, dict):
+                raise ValueError("The original rig profile is unavailable")
+            calibration_raw = prepare_auto_stitch_config(raw, profile)
+            calibration_config = self._working_dir / "auto-stitch-input.json"
+            calibration_config.write_text(
+                json.dumps(calibration_raw, indent=2), encoding="utf-8"
+            )
             images = [
                 str(self._last_reference_dir / f"{camera['name']}.png")
                 for camera in raw["cameras"]
@@ -3915,14 +8313,24 @@ class MainWindow(QMainWindow):
         report = self._working_dir / "alignment-report.json"
 
         def load_alignment() -> None:
-            full_raw = json.loads(config.read_text(encoding="utf-8"))
-            solved_raw = json.loads(calibration_output.read_text(encoding="utf-8"))
-            solved = {camera["name"]: camera for camera in solved_raw["cameras"]}
-            for camera in full_raw["cameras"]:
-                rotation = solved[camera["name"]]
-                for key in ("yaw_deg", "pitch_deg", "roll_deg"):
-                    camera[key] = rotation[key]
-            output.write_text(json.dumps(full_raw, indent=2), encoding="utf-8")
+            try:
+                full_raw = json.loads(config.read_text(encoding="utf-8"))
+                solved_raw = json.loads(
+                    calibration_output.read_text(encoding="utf-8")
+                )
+                report_raw = json.loads(report.read_text(encoding="utf-8"))
+                aligned, validation = apply_auto_stitch_solution(
+                    full_raw,
+                    solved_raw,
+                    profile,
+                    report_raw,
+                )
+                report_raw["validation"] = validation
+                report.write_text(json.dumps(report_raw, indent=2), encoding="utf-8")
+                output.write_text(json.dumps(aligned, indent=2), encoding="utf-8")
+            except Exception as error:
+                self._error("Auto Stitch", str(error))
+                return
             current_paths = self.source_table.paths()
             plate_numbers = self._plate_numbers
             source_probes = self._source_probes
@@ -3931,6 +8339,9 @@ class MainWindow(QMainWindow):
             tc_alignment_path = self._tc_alignment_path
             timeline_range = self.timeline_bar.values()
             self.load_config(output)
+            loaded_cameras = self.config_data.get("cameras")
+            if isinstance(loaded_cameras, list):
+                self._plate_reset_cameras = json.loads(json.dumps(loaded_cameras))
             self.source_table.set_paths(current_paths)
             self._plate_numbers = plate_numbers
             self._source_probes = source_probes
@@ -3945,8 +8356,21 @@ class MainWindow(QMainWindow):
                     timeline_range[0],
                     timeline_range[1],
                 )
-            self.statusBar().showMessage("Rig alignment applied · refreshing preview…", 15000)
-            self.preview_note.setText("Rig aligned · refreshing corrected panorama preview…")
+            review_count = sum(
+                pair["status"] == "review" for pair in validation["pairs"]
+            )
+            seam_status = (
+                f"{review_count} seam(s) need review"
+                if review_count
+                else "all adjacent seams passed"
+            )
+            self.statusBar().showMessage(
+                f"Auto Stitch applied · manual fine tune reset · {seam_status}",
+                15000,
+            )
+            self.preview_note.setText(
+                f"Auto Stitch complete · {seam_status} · refreshing preview…"
+            )
             self.create_preview()
 
         self._run_cli(
@@ -3997,6 +8421,22 @@ class MainWindow(QMainWindow):
             None,
         )
 
+    def _queue_table_menu(self, position) -> None:  # type: ignore[no-untyped-def]
+        item = self.queue_table.itemAt(position)
+        if item is not None:
+            self.queue_table.setCurrentCell(item.row(), 0)
+        job = self._selected_queue_job()
+        menu = QMenu(self)
+        load = menu.addAction("Load Timeline", self.load_selected_queue_job)
+        render = menu.addAction("Render Selected", self.render_selected_queue_job)
+        menu.addSeparator()
+        remove = menu.addAction("Remove from Queue", self.remove_selected_queue_job)
+        enabled = job is not None
+        load.setEnabled(enabled)
+        render.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
+        remove.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
+        menu.exec(self.queue_table.viewport().mapToGlobal(position))
+
     def _refresh_queue_table(self) -> None:
         if not hasattr(self, "queue_table"):
             return
@@ -4007,6 +8447,9 @@ class MainWindow(QMainWindow):
         selected_row = -1
         for row, job in enumerate(jobs):
             output = job.config_snapshot.get("output", {})
+            video = job.config_snapshot.get("video", {})
+            metadata = job.config_snapshot.get("_vpstitch", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
             width = int(output.get("width", 0))
             height = int(output.get("height", 0))
             frame_range = (
@@ -4016,15 +8459,42 @@ class MainWindow(QMainWindow):
             )
             values = (
                 job.name,
-                frame_range,
-                f"{width}×{height}",
-                str(job.output_path),
+                _format_frame_rate(video.get("fps")),
+                QUEUE_CODEC_LABELS.get(
+                    str(video.get("output_codec", "")),
+                    str(video.get("output_codec", "Unknown")),
+                ),
+                job.output_path.name,
                 job.status.value.upper(),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, job.id)
+                    item.setToolTip(
+                        f"{job.name}\nRange {frame_range}\nCanvas {width}×{height}"
+                        f"\nFPS {_format_frame_rate(video.get('fps'))}"
+                        f" · {str(metadata.get('fps_mode') or FPS_MODE_MATCH_SOURCE)}"
+                        f"\nSettings lock {job.snapshot_digest}"
+                    )
+                elif column == 1:
+                    source_fps = metadata.get("source_fps")
+                    item.setToolTip(
+                        f"Output {_format_frame_rate(video.get('fps'))} fps"
+                        + (
+                            f"\nPlate {_format_frame_rate(source_fps)} fps"
+                            if source_fps is not None
+                            else ""
+                        )
+                    )
+                elif column == 2:
+                    codec = str(video.get("output_codec", ""))
+                    bit_depth = GUI_MASTER_BIT_DEPTHS.get(codec)
+                    item.setToolTip(
+                        f"{codec} · {bit_depth}-bit" if bit_depth else codec
+                    )
+                elif column == 3:
+                    item.setToolTip(str(job.output_path))
                 if column == 4:
                     colors = {
                         RenderStatus.QUEUED: "#c8c3df",
@@ -4048,13 +8518,17 @@ class MainWindow(QMainWindow):
         )
 
     def _timeline_name(self, sources: list[str]) -> str:
-        parent = Path(sources[0]).parent.name.strip()
-        stem = re.sub(
-            r"(?i)^P0?(?:1|6)[._ -]*",
-            "",
-            Path(sources[0]).stem,
-        ).strip(" ._-")
-        base = stem or parent or "Timeline"
+        active = self._active_timeline_record()
+        if active is not None:
+            base = active.name
+        else:
+            parent = Path(sources[0]).parent.name.strip()
+            stem = re.sub(
+                r"(?i)^P0?(?:1|6)[._ -]*",
+                "",
+                Path(sources[0]).stem,
+            ).strip(" ._-")
+            base = stem or parent or "Timeline"
         existing = {job.name for job in self.render_queue.jobs}
         if base not in existing:
             return base
@@ -4066,10 +8540,14 @@ class MainWindow(QMainWindow):
     def add_current_to_queue(self) -> None:
         try:
             sources = self._validate_sources()
-            output = self.output_path.text().strip()
-            if not output:
-                raise ValueError("Choose a render destination before adding the timeline")
+            output = self._request_render_destination(
+                title="Add Timeline to Render Queue",
+                action_label="ADD TO QUEUE",
+            )
+            if output is None:
+                return
             config = self._collect_config()
+            self._lock_render_frame_rate(config, sources)
             lower = self.timeline_in.value() if self._tc_alignment else 0
             upper = (
                 self.timeline_out.value()
@@ -4092,11 +8570,11 @@ class MainWindow(QMainWindow):
                 out_frame=upper,
                 output_path=output,
             )
+            output_key = self._output_collision_key(output)
             duplicates = [
                 queued
                 for queued in self.render_queue.jobs
-                if str(queued.output_path) == output
-                and queued.status is not RenderStatus.FAILED
+                if self._output_collision_key(str(queued.output_path)) == output_key
             ]
             if duplicates:
                 raise ValueError("Another queued timeline already uses this output path")
@@ -4112,6 +8590,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Added timeline to render queue: {job.name}", 8000
         )
+
+    def add_selected_timeline_to_queue(self) -> None:
+        kind, timeline_id = self._selected_timeline_item()
+        if kind != "timeline" or not timeline_id:
+            timeline_id = self._active_timeline_id
+        if not timeline_id:
+            self._error("Render queue", "Create or select a timeline first")
+            return
+        if timeline_id != self._active_timeline_id:
+            self.load_project_timeline(timeline_id)
+        if self._active_timeline_id == timeline_id:
+            self.add_current_to_queue()
+        return
 
     def remove_selected_queue_job(self) -> None:
         job = self._selected_queue_job()
@@ -4140,8 +8631,11 @@ class MainWindow(QMainWindow):
                 json.dumps(job.config_snapshot, indent=2), encoding="utf-8"
             )
             self.load_config(config_path)
+            loaded_cameras = self.config_data.get("cameras")
+            if isinstance(loaded_cameras, list):
+                self._plate_reset_cameras = json.loads(json.dumps(loaded_cameras))
             sources = [str(path) for path in job.source_paths]
-            self._set_video_sources(sources)
+            self._set_video_sources(sources, preserve_order=True)
             alignment = job.tc_alignment_snapshot
             if alignment is not None:
                 alignment_path = job_dir / "timecode-alignment.json"
@@ -4159,7 +8653,7 @@ class MainWindow(QMainWindow):
                     self._apply_source_probe_payload(
                         {"inputs": probes, "issues": []}
                     )
-            self.output_path.setText(str(job.output_path))
+            self._set_output_destination(str(job.output_path))
             self._last_auto_output = None
         except Exception as error:
             self._error("Load timeline", str(error))
@@ -4176,6 +8670,10 @@ class MainWindow(QMainWindow):
             config.setdefault("video", {})["frames"] = job.out_frame - job.in_frame
         config_path = job_dir / "config.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        if json.loads(config_path.read_text(encoding="utf-8")) != config:
+            raise ValueError(
+                f"Render settings lock verification failed: {job.snapshot_digest}"
+            )
         alignment_path = None
         if job.tc_alignment_snapshot is not None:
             alignment_path = job_dir / "timecode-alignment.json"
@@ -4187,11 +8685,10 @@ class MainWindow(QMainWindow):
     def _start_queue_job(self, job: RenderJob) -> None:
         try:
             output = Path(job.output_path)
-            if output.exists():
-                if output.is_dir() and not any(output.iterdir()):
-                    pass
-                else:
-                    raise ValueError(f"Output already exists: {output}")
+            codec = str(job.config_snapshot.get("video", {}).get("output_codec", ""))
+            self._prepare_output_destination(output, codec)
+            staging = self._render_staging_path(output, codec, job.id)
+            self._discard_render_staging(staging)
             for source in job.source_paths:
                 if not Path(source).is_file():
                     raise ValueError(f"Source is missing: {source}")
@@ -4206,6 +8703,9 @@ class MainWindow(QMainWindow):
             return
 
         self._queue_current_id = job.id
+        self._append_log(
+            f"Queue settings locked: {job.snapshot_digest} · {job.name}"
+        )
         self.render_queue.update(
             job.id, status=RenderStatus.RENDERING, error=None
         )
@@ -4216,7 +8716,7 @@ class MainWindow(QMainWindow):
             "--config",
             str(config_path),
             "--output",
-            str(job.output_path),
+            str(staging),
             "--map-cache",
             str(self._cache_dir),
             "--start-frame",
@@ -4227,6 +8727,7 @@ class MainWindow(QMainWindow):
         arguments.extend(sources)
 
         def completed() -> None:
+            self._commit_render_staging(staging, output)
             self.render_queue.update(
                 job.id, status=RenderStatus.DONE, error=None
             )
@@ -4236,6 +8737,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self._run_next_queue_job)
 
         def failed() -> None:
+            self._discard_render_staging(staging)
             current = next(
                 (queued for queued in self.render_queue.jobs if queued.id == job.id),
                 None,
@@ -4299,16 +8801,25 @@ class MainWindow(QMainWindow):
 
     def render(self) -> None:
         try:
-            config = self._write_working_config()
             sources = self._validate_sources()
-            output = self.output_path.text().strip()
-            if not output:
-                raise ValueError("Choose a render destination")
+            output = self._request_render_destination(
+                title="Render Current Timeline",
+                action_label="RENDER NOW",
+            )
+            if output is None:
+                return
             codec = str(self.output_codec.currentData())
             if codec not in GUI_MASTER_BIT_DEPTHS:
                 raise ValueError("Choose a 10-bit or 12-bit master codec")
-            if codec.endswith("sequence") and Path(output).exists() and any(Path(output).iterdir()):
-                raise ValueError("Sequence output directory must be empty")
+            output_path = Path(output)
+            self._prepare_output_destination(output_path, codec)
+            staging = self._render_staging_path(
+                output_path,
+                codec,
+                f"current-{time.time_ns()}",
+            )
+            self._discard_render_staging(staging)
+            config = self._write_working_config()
         except Exception as error:
             self._error("Render", str(error))
             return
@@ -4341,7 +8852,7 @@ class MainWindow(QMainWindow):
             "--config",
             str(config),
             "--output",
-            output,
+            str(staging),
             "--map-cache",
             str(self._cache_dir),
             "--start-frame",
@@ -4350,14 +8861,19 @@ class MainWindow(QMainWindow):
         if self._tc_alignment_path:
             arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
         arguments.extend(sources)
-        self._run_cli(
-            "FINAL RENDER",
-            arguments,
-            lambda: self._show_message(
+        def render_complete() -> None:
+            self._commit_render_staging(staging, output_path)
+            self._show_message(
                 QMessageBox.Icon.Information,
                 "Render complete",
                 f"Output written to:\n{output}",
-            ),
+            )
+
+        self._run_cli(
+            "FINAL RENDER",
+            arguments,
+            render_complete,
+            lambda: self._discard_render_staging(staging),
         )
 
     def _run_cli(
@@ -4366,7 +8882,16 @@ class MainWindow(QMainWindow):
         arguments: list[str],
         success: Callable[[], None] | None = None,
         failure: Callable[[], None] | None = None,
+        *,
+        interactive: bool = False,
     ) -> None:
+        interactive = interactive or task in {
+            "TC ALIGN",
+            "ANALYZE INPUTS",
+            "BUILD PLAYBACK PROXY",
+            "STITCH PREVIEW",
+            "EXTRACT REFERENCES",
+        }
         if self._closing:
             return
         if self.process is not None:
@@ -4374,6 +8899,8 @@ class MainWindow(QMainWindow):
             return
         self._process_success = success
         self._process_failure = failure
+        self._process_interactive = interactive
+        self._process_task_name = task
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(self._working_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -4390,31 +8917,70 @@ class MainWindow(QMainWindow):
             helper_name = "vpstitch-cli.exe" if os.name == "nt" else "vpstitch-cli"
             cli_program = Path(sys.executable).with_name(helper_name)
             if not cli_program.is_file():
+                process = self.process
                 self.process = None
+                self._process_success = None
                 self._process_failure = None
+                self._process_interactive = False
+                self._process_task_name = ""
                 self._set_busy_ui(False)
                 self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
+                process.deleteLater()
                 if failure:
                     failure()
                 return
             self.process.start(str(cli_program), arguments)
         else:
             self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
+        if not self.process.waitForStarted(3000):
+            error = self.process.errorString() or "process did not start"
+            process = self.process
+            self.process = None
+            self._process_success = None
+            self._process_failure = None
+            self._process_interactive = False
+            self._process_task_name = ""
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.task_label.setText("FAILED")
+            self.cancel_button.setVisible(False)
+            self._set_busy_ui(False)
+            self._append_log(f"✕ {task} could not start: {error}")
+            process.deleteLater()
+            if failure:
+                failure()
+            self.statusBar().showMessage("Task could not start · see Task Log", 10000)
 
     def _set_busy_ui(self, busy: bool) -> None:
+        sources_ready = all(self.source_table.paths())
+        inspector_live = busy and self._process_interactive
         self.import_button.setEnabled(not busy)
+        self.new_timeline_button.setEnabled(not busy)
+        self.media_tree.setEnabled(not busy)
+        self.timeline_tree.setEnabled(not busy)
         self.clear_button.setEnabled(not busy)
         self.source_table.setEnabled(not busy)
-        self.settings_tabs.setEnabled(not busy)
-        self.tc_align_button.setEnabled(not busy)
-        self.preview_button.setEnabled(not busy)
-        self.playback_button.setEnabled(not busy)
-        self.add_queue_button.setEnabled(not busy)
-        self.render_button.setEnabled(not busy)
+        self.settings_tabs.setEnabled(not busy or inspector_live)
+        self.tc_align_button.setEnabled(not busy and sources_ready)
+        self.preview_button.setEnabled(not busy and sources_ready)
+        self.playback_button.setEnabled(not busy or inspector_live)
+        self.add_queue_button.setEnabled(not busy and sources_ready)
+        self.render_button.setEnabled(not busy and sources_ready)
         self.rig_align_button.setEnabled(not busy and self._preview_ready)
-        self.timeline_in.setEnabled(not busy and self._tc_alignment is not None)
-        self.timeline_out.setEnabled(not busy and self._tc_alignment is not None)
-        self.reset_timeline_button.setEnabled(not busy and self._tc_alignment is not None)
+        self.color_match_button.setEnabled(
+            not busy
+            and self._preview_ready
+            and self.color_mode.currentData() == "ocio"
+        )
+        self.timeline_in.setEnabled(
+            (not busy or inspector_live) and self._tc_alignment is not None
+        )
+        self.timeline_out.setEnabled(
+            (not busy or inspector_live) and self._tc_alignment is not None
+        )
+        self.reset_timeline_button.setEnabled(
+            (not busy or inspector_live) and self._tc_alignment is not None
+        )
 
     def _read_process(self) -> None:
         process = self.sender()
@@ -4438,7 +9004,8 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, total)
             self.progress.setValue(done)
         if frame_value is not None:
-            self.task_label.setText(f"FRAME {frame_value}")
+            prefix = "CACHE" if self._process_task_name == "BUILD PLAYBACK PROXY" else "FRAME"
+            self.task_label.setText(f"{prefix} {frame_value}")
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
         sender = self.sender()
@@ -4447,10 +9014,16 @@ class MainWindow(QMainWindow):
         callback = self._process_success
         failure = self._process_failure
         process = self.process
-        task = self.task_label.text()
+        task = self._process_task_name or self.task_label.text()
+        cancelled_for_interaction = bool(
+            task == "BUILD PLAYBACK PROXY"
+            and self._playback_cache_cancelled_for_interaction
+        )
         self.process = None
         self._process_success = None
         self._process_failure = None
+        self._process_interactive = False
+        self._process_task_name = ""
         try:
             process.readyReadStandardOutput.disconnect(self._read_process)
             process.finished.disconnect(self._process_finished)
@@ -4460,9 +9033,10 @@ class MainWindow(QMainWindow):
             process.deleteLater()
             return
         self.progress.setRange(0, 100)
+        successful_or_cancelled = exit_code == 0 or cancelled_for_interaction
         self.progress.setValue(100 if exit_code == 0 else 0)
-        self.task_label.setText("IDLE" if exit_code == 0 else "FAILED")
-        self.status_pill.setText("READY" if exit_code == 0 else "FAILED")
+        self.task_label.setText("IDLE" if successful_or_cancelled else "FAILED")
+        self.status_pill.setText("READY" if successful_or_cancelled else "FAILED")
         self.cancel_button.setVisible(False)
         self._set_busy_ui(False)
         if process is not None:
@@ -4470,13 +9044,42 @@ class MainWindow(QMainWindow):
         if exit_code == 0:
             self._append_log(f"✓ {task} complete")
             if callback:
-                callback()
+                try:
+                    callback()
+                except Exception as error:
+                    self.progress.setValue(0)
+                    self.task_label.setText("FAILED")
+                    self.status_pill.setText("FAILED")
+                    self._append_log(f"✕ {task} finalize failed: {error}")
+                    self.statusBar().showMessage(
+                        "Render finalization failed · original destination was not replaced",
+                        12000,
+                    )
+                    if failure:
+                        try:
+                            failure()
+                        except Exception as failure_error:
+                            self._append_log(
+                                f"✕ {task} cleanup failed: {failure_error}"
+                            )
+        elif cancelled_for_interaction:
+            self._append_log("↷ PLAYBACK CACHE paused for Inspector adjustment")
+            if failure:
+                try:
+                    failure()
+                except Exception as error:
+                    self._append_log(f"✕ playback cache cleanup failed: {error}")
         else:
             self._append_log(f"✕ {task} failed with exit code {exit_code}")
             self.statusBar().showMessage("Task failed — see Task Log", 10000)
             if failure:
-                failure()
-        if self._auto_cache_requested and self.process is None:
+                try:
+                    failure()
+                except Exception as error:
+                    self._append_log(f"✕ {task} cleanup failed: {error}")
+        if self._live_preview_pending and self.process is None:
+            QTimer.singleShot(0, self._run_live_preview)
+        elif self._auto_cache_requested and self.process is None:
             QTimer.singleShot(0, self._warm_playback_cache)
 
     def cancel_task(self) -> None:
@@ -4510,10 +9113,41 @@ class MainWindow(QMainWindow):
         scrollbar = self.log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _color_basis_changed(self, *_args) -> None:
+        if self._loading_config or not self.config_data:
+            return
+        cameras = self.config_data.get("cameras")
+        if isinstance(cameras, list):
+            for camera in cameras:
+                if isinstance(camera, dict):
+                    camera["color_gain"] = [1.0, 1.0, 1.0]
+                    camera.pop("color_match_confidence", None)
+        self.color_match_enabled.blockSignals(True)
+        self.color_match_enabled.setChecked(False)
+        self.color_match_enabled.blockSignals(False)
+        self.color_match_status.setText("Input/working space changed · run MATCH again")
+        self._color_pipeline_setting_changed()
+
+    def _color_pipeline_setting_changed(self, *_args) -> None:
+        if self._loading_config or not self.config_data:
+            return
+        self._schedule_live_preview("Color pipeline updated")
+
     def _update_color_controls(self) -> None:
         enabled = self.color_mode.currentData() == "ocio"
-        for widget in (self.ocio_config, self.input_space, self.working_space, self.output_space):
+        for widget in (
+            self.ocio_config,
+            self.ocio_reload_button,
+            self.input_space,
+            self.working_space,
+            self.color_match_enabled,
+            self.color_match_reference,
+            self.color_match_strength,
+            self.color_match_reset_button,
+        ):
             widget.setEnabled(enabled)
+        self.color_match_button.setEnabled(enabled and self._preview_ready)
+        self._update_delivery_controls()
 
     def _update_output_hint(self) -> None:
         codec = str(self.output_codec.currentData())
@@ -4567,18 +9201,18 @@ class MainWindow(QMainWindow):
             self.load_config(Path(configs[0]))
         if videos:
             try:
-                ordered, _numbers = order_camera_plates(videos)
-                plate_set_name = self._request_plate_set_name(ordered)
-                if plate_set_name is None:
-                    event.ignore()
-                    return
-                self._set_video_sources(ordered, plate_set_name=plate_set_name)
-                self._analyze_imported_sources()
+                added = self.import_media_paths(videos)
+                self.statusBar().showMessage(
+                    f"Imported {len(added)} media clips · add a complete set to a timeline",
+                    10000,
+                )
             except Exception as error:
-                self._error("New Plate Set", str(error))
+                self._error("Import Media", str(error))
         event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._fullscreen_preview is not None:
+            self._fullscreen_preview.close()
         if self.process is not None:
             answer = self._show_message(
                 QMessageBox.Icon.Question,
@@ -4604,6 +9238,10 @@ class MainWindow(QMainWindow):
                 self._queue_current_id = None
             self.media_player.stop()
             self._reverse_timer.stop()
+            self._live_preview_timer.stop()
+            self._live_preview_pending = False
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
             process = self.process
@@ -4623,9 +9261,35 @@ class MainWindow(QMainWindow):
             self._queue_running = False
             self.media_player.stop()
             self._reverse_timer.stop()
+            self._live_preview_timer.stop()
+            self._live_preview_pending = False
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
             self._log_flush_timer.stop()
             self._pending_log_lines.clear()
-        self._save_active_timeline()
+        self._cancel_source_proxy_items()
+        self._autosave_timer.stop()
+        self._interactive_request = None
+        self._stop_live_proxy_playback(close_session=True)
+        # If a worker is blocked reading an FFmpeg proxy frame, actively close
+        # its decoder before waiting. ThreadPoolExecutor workers are non-daemon;
+        # leaving one behind can make the window disappear while the process
+        # remains alive indefinitely.
+        live_session, self._live_playback_session = (
+            self._live_playback_session,
+            None,
+        )
+        self._live_playback_key = None
+        self._live_close_pending = False
+        if live_session is not None:
+            live_session.close()
+        if self._live_playback_future is not None:
+            self._live_playback_future.cancel()
+        self._live_playback_executor.shutdown(wait=True, cancel_futures=True)
+        self._live_playback_future = None
+        self._interactive_executor.shutdown(wait=False, cancel_futures=True)
+        self._autosave_project_snapshot(force=True)
+        self._save_workspace_layout()
         event.accept()
 
 

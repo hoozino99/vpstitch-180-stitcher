@@ -2,15 +2,51 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+import io
 import json
+import subprocess
 
 import numpy as np
 import OpenEXR
 import pytest
 
+import vpstitch.ffmpegio as ffmpegio
 from vpstitch.config import Camera, Color, Lens, Video
 from vpstitch.ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
 from vpstitch.imageio import ExrSequenceEncoder, read_image, write_png
+
+
+class _ClosableStream:
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _HungDecoderProcess:
+    def __init__(self) -> None:
+        self.stdout = _ClosableStream()
+        self.stderr = _ClosableStream()
+        self.terminate_count = 0
+        self.kill_count = 0
+        self.wait_count = 0
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminate_count += 1
+
+    def kill(self) -> None:
+        self.kill_count += 1
+
+    def wait(self, timeout: float) -> int:
+        self.wait_count += 1
+        if self.wait_count == 1:
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+        return -9
 
 
 def _camera(width: int, height: int) -> Camera:
@@ -213,3 +249,123 @@ def test_decoder_applies_explicit_video_range_interpretation(tmp_path: Path) -> 
     full_decoder.close()
     assert auto is not None and full is not None
     assert abs(int(np.median(auto)) - int(np.median(full))) > 500
+
+
+def test_decoder_close_kills_hung_ffmpeg_and_is_idempotent() -> None:
+    process = _HungDecoderProcess()
+    decoder = VideoDecoder.__new__(VideoDecoder)
+    decoder.process = process
+    decoder._closed = False
+
+    decoder.close()
+    decoder.close()
+
+    assert process.terminate_count == 1
+    assert process.kill_count == 1
+    assert process.wait_count == 2
+    assert process.stdout.close_count == 1
+    assert process.stderr.close_count == 1
+
+
+def test_decoder_caps_ffmpeg_threads_before_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[list[str]] = []
+    process = _HungDecoderProcess()
+
+    def fake_popen(command: list[str], **_kwargs: object) -> _HungDecoderProcess:
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(ffmpegio, "ffmpeg_executable", lambda: "ffmpeg")
+    monkeypatch.setattr(ffmpegio.subprocess, "Popen", fake_popen)
+
+    decoder = VideoDecoder("plate.mov", _camera(64, 32), 24)
+
+    assert len(commands) == 1
+    command = commands[0]
+    thread_index = command.index("-threads")
+    assert command[thread_index + 1] == "2"
+    assert thread_index < command.index("-i")
+    filter_thread_index = command.index("-filter_threads")
+    assert command[filter_thread_index + 1] == "1"
+    assert filter_thread_index < command.index("-i")
+    decoder.close()
+
+
+def test_decoder_rejects_non_positive_thread_count() -> None:
+    with pytest.raises(ValueError, match="decoder_threads"):
+        VideoDecoder("plate.mov", _camera(64, 32), 24, decoder_threads=0)
+
+
+def test_decoder_uses_rgb24_for_known_8bit_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    process = _HungDecoderProcess()
+
+    def fake_popen(command: list[str], **_kwargs: object) -> _HungDecoderProcess:
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(ffmpegio, "ffmpeg_executable", lambda: "ffmpeg")
+    monkeypatch.setattr(ffmpegio.subprocess, "Popen", fake_popen)
+
+    decoder = VideoDecoder(
+        "plate.mov",
+        _camera(64, 32),
+        24,
+        source_bit_depth=8,
+    )
+
+    command = commands[0]
+    pixel_format_index = command.index("-pix_fmt")
+    assert command[pixel_format_index + 1] == "rgb24"
+    assert decoder.frame_bytes == 64 * 32 * 3
+    assert decoder._expanded_buffer is not None
+    decoder.close()
+
+
+def test_decoder_expands_rgb24_into_reusable_uint16_buffer() -> None:
+    decoder = VideoDecoder.__new__(VideoDecoder)
+    decoder.width = 2
+    decoder.height = 1
+    decoder.frame_bytes = 6
+    decoder._buffer = bytearray(6)
+    decoder._decode_low_bit_depth = True
+    decoder._expanded_buffer = np.empty((1, 2, 3), dtype=np.uint16)
+    decoder.process = SimpleNamespace(
+        stdout=io.BytesIO(bytes([0, 1, 2, 127, 128, 255]))
+    )
+
+    frame = decoder.read(copy=False)
+
+    assert frame is decoder._expanded_buffer
+    np.testing.assert_array_equal(
+        frame,
+        np.array([[[0, 257, 514], [32639, 32896, 65535]]], dtype=np.uint16),
+    )
+
+
+def test_encoder_caps_ffmpeg_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[list[str]] = []
+    process = SimpleNamespace(stdin=_ClosableStream(), stderr=io.BytesIO(), wait=lambda: 0)
+
+    def fake_popen(command: list[str], **_kwargs: object) -> object:
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(ffmpegio, "ffmpeg_executable", lambda: "ffmpeg")
+    monkeypatch.setattr(ffmpegio.subprocess, "Popen", fake_popen)
+
+    encoder = VideoEncoder(
+        "output.mov",
+        64,
+        32,
+        Video(fps=24, frames=1, output_codec="prores-hq"),
+    )
+
+    command = commands[0]
+    assert command[command.index("-filter_threads") + 1] == "1"
+    assert command[command.index("-threads") + 1] == "2"
+    assert command.index("-filter_threads") < command.index("-i")
+    assert command.index("-threads") > command.index("-i")
+    encoder.close()

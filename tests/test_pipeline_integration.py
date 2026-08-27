@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +13,10 @@ from vpstitch.color import (
     ColorPipeline,
     bundled_aces_studio_path,
 )
-from vpstitch.config import Camera, Color, Lens, Output, RigConfig
+from vpstitch.config import Camera, Color, Lens, Output, RigConfig, load_config
 from vpstitch.geometry import camera_to_world
 from vpstitch.pipeline import Stitcher
+from vpstitch.renderqueue import RenderJob
 
 
 def _rig() -> RigConfig:
@@ -163,3 +166,75 @@ def test_bundled_aces_studio_config_uri() -> None:
     assert result.dtype == np.float32
     assert result.shape == source.shape
     assert np.all(np.isfinite(result))
+
+
+def test_locked_queue_snapshot_drives_full_render_pixels_after_later_changes(
+    tmp_path: Path,
+) -> None:
+    ocio_path = tmp_path / "raw.ocio"
+    ocio_path.write_text(ocio.Config.CreateRaw().serialize(), encoding="utf-8")
+    rig = _rig()
+    queued_config = {
+        "cameras": [
+            {
+                **asdict(camera),
+                "colorspace": "raw",
+                "color_gain": [1.5, 1.0, 0.5],
+            }
+            for camera in rig.cameras
+        ],
+        "output": asdict(rig.output),
+        "color": {
+            "mode": "ocio",
+            "ocio_config": str(ocio_path),
+            "working_space": "raw",
+            "output_space": "raw",
+            "match_enabled": True,
+            "match_strength": 1.0,
+            "integer_dither": False,
+        },
+    }
+    job = RenderJob.create(
+        name="pixel locked",
+        source_paths=[f"P{number:02d}.mov" for number in range(1, 6)],
+        config_snapshot=queued_config,
+        output_path="pixel-locked.mov",
+    )
+
+    for camera in queued_config["cameras"]:
+        camera["yaw_deg"] += 3.0
+        camera["color_gain"] = [0.5, 1.0, 1.5]
+    queued_config["output"]["width"] = 512
+    queued_config["color"]["match_strength"] = 0.25
+
+    locked_path = tmp_path / "locked.json"
+    changed_path = tmp_path / "changed.json"
+    locked_path.write_text(json.dumps(job.config_snapshot), encoding="utf-8")
+    changed_path.write_text(json.dumps(queued_config), encoding="utf-8")
+    locked_rig = load_config(locked_path)
+    changed_rig = load_config(changed_path)
+    sources = [
+        np.full(
+            (camera.height, camera.width, 3),
+            [13_107, 19_661, 26_214],
+            dtype=np.uint16,
+        )
+        for camera in locked_rig.cameras
+    ]
+    locked_output = np.zeros(
+        (locked_rig.output.height, locked_rig.output.width, 3), dtype=np.uint16
+    )
+    changed_output = np.zeros(
+        (changed_rig.output.height, changed_rig.output.width, 3), dtype=np.uint16
+    )
+
+    Stitcher(locked_rig).stitch_arrays(sources, locked_output)
+    Stitcher(changed_rig).stitch_arrays(sources, changed_output)
+
+    assert locked_rig.output.width == 1_024
+    assert changed_rig.output.width == 512
+    locked_rgb = locked_output.mean(axis=(0, 1))
+    changed_rgb = changed_output.mean(axis=(0, 1))
+    assert locked_rgb[0] > locked_rgb[2]
+    assert changed_rgb[2] > changed_rgb[0]
+    assert not np.allclose(locked_rgb, changed_rgb, rtol=0.05, atol=1.0)

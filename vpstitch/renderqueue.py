@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
@@ -200,6 +201,29 @@ class RenderJob:
             "error": self.error,
         }
 
+    @property
+    def snapshot_digest(self) -> str:
+        """Short deterministic identity for the locked render inputs/settings."""
+        payload = {
+            "source_paths": [_path_to_json(path) for path in self.source_paths],
+            "config_snapshot": _json_value(
+                self.config_snapshot, field="config_snapshot"
+            ),
+            "tc_alignment_snapshot": _json_value(
+                self.tc_alignment_snapshot, field="tc_alignment_snapshot"
+            ),
+            "in_frame": self.in_frame,
+            "out_frame": self.out_frame,
+            "output_path": _path_to_json(self.output_path),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:12]
+
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> RenderJob:
         try:
@@ -249,12 +273,12 @@ class RenderQueueStore:
     ) -> None:
         self.path = Path(path)
         self.autosave = autosave
-        self._jobs = list(jobs)
+        self._jobs = [replace(job) for job in jobs]
         self._validate_unique_ids()
 
     @property
     def jobs(self) -> tuple[RenderJob, ...]:
-        return tuple(self._jobs)
+        return tuple(replace(job) for job in self._jobs)
 
     def _validate_unique_ids(self) -> None:
         ids = [job.id for job in self._jobs]
@@ -343,14 +367,15 @@ class RenderQueueStore:
     def add(self, job: RenderJob) -> RenderJob:
         if any(existing.id == job.id for existing in self._jobs):
             raise RenderQueueError(f"duplicate render job id: {job.id}")
-        self._jobs.append(job)
+        stored = replace(job)
+        self._jobs.append(stored)
         self._persist()
-        return job
+        return replace(stored)
 
     def remove(self, job_id: str) -> RenderJob:
         removed = self._jobs.pop(self._index(job_id))
         self._persist()
-        return removed
+        return replace(removed)
 
     def update(self, job_id: str, **changes: Any) -> RenderJob:
         if "id" in changes and changes["id"] != job_id:
@@ -361,7 +386,7 @@ class RenderQueueStore:
         updated = replace(self._jobs[index], **changes)
         self._jobs[index] = updated
         self._persist()
-        return updated
+        return replace(updated)
 
     def reorder(self, job_id: str, new_index: int) -> RenderJob:
         if isinstance(new_index, bool) or not isinstance(new_index, int):
@@ -373,10 +398,11 @@ class RenderQueueStore:
         job = self._jobs.pop(old_index)
         self._jobs.insert(bounded_index, job)
         self._persist()
-        return job
+        return replace(job)
 
     def next_queued(self) -> RenderJob | None:
-        return next(
+        job = next(
             (job for job in self._jobs if job.status is RenderStatus.QUEUED),
             None,
         )
+        return None if job is None else replace(job)

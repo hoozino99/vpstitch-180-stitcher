@@ -12,9 +12,13 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 
-STORE_VERSION = 1
+STORE_VERSION = 2
 _WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
-_PLATE_NUMBER = re.compile(r"(?:^|[^A-Z0-9])P(0[1-8])(?=[^0-9]|$)", re.IGNORECASE)
+_EXPLICIT_PLATE_NUMBER = re.compile(
+    r"(?:^|[^a-z0-9])(?:p(?:late)?|cam(?:era)?)[ ._-]*0?([1-8])(?=$|[^0-9])",
+    re.IGNORECASE,
+)
+_BARE_PLATE_NUMBER = re.compile(r"(?:^|[^0-9])0([1-8])(?=$|[^0-9])")
 _T = TypeVar("_T")
 
 
@@ -29,6 +33,14 @@ class ProjectError(ValueError):
 
 
 class PlaybackCacheStatus(str, Enum):
+    EMPTY = "empty"
+    PENDING = "pending"
+    BUILDING = "building"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class MediaCacheStatus(str, Enum):
     EMPTY = "empty"
     PENDING = "pending"
     BUILDING = "building"
@@ -109,8 +121,13 @@ def _path_from_json(value: Any) -> PurePath:
 
 
 def _plate_number(path: PurePath) -> int | None:
-    match = _PLATE_NUMBER.search(path.name)
-    return None if match is None else int(match.group(1))
+    components = [path.stem, *(parent.name for parent in path.parents[:3])]
+    for pattern in (_EXPLICIT_PLATE_NUMBER, _BARE_PLATE_NUMBER):
+        for component in components:
+            match = pattern.search(component)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,14 +207,121 @@ class Bin:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaRecord:
+    """One source clip stored in the project Media Pool."""
+
+    id: str
+    path: PurePath
+    bin_id: str | None = None
+    order: int = 0
+    created_at: str = ""
+    source_cache_path: PurePath | None = None
+    source_cache_status: MediaCacheStatus = MediaCacheStatus.EMPTY
+    source_cache_error: str | None = None
+
+    def __post_init__(self) -> None:
+        media_id = str(self.id).strip()
+        if not media_id:
+            raise ProjectError("media id cannot be empty")
+        if self.bin_id is not None and not str(self.bin_id).strip():
+            raise ProjectError("bin_id cannot be empty")
+        if isinstance(self.order, bool) or not isinstance(self.order, int) or self.order < 0:
+            raise ProjectError("media order must be a non-negative integer")
+        object.__setattr__(self, "id", media_id)
+        object.__setattr__(self, "path", _coerce_path(self.path))
+        object.__setattr__(
+            self, "bin_id", None if self.bin_id is None else str(self.bin_id).strip()
+        )
+        object.__setattr__(
+            self,
+            "source_cache_path",
+            None
+            if self.source_cache_path is None
+            else _coerce_path(self.source_cache_path),
+        )
+        object.__setattr__(
+            self,
+            "source_cache_status",
+            MediaCacheStatus(self.source_cache_status),
+        )
+        object.__setattr__(
+            self,
+            "source_cache_error",
+            None
+            if self.source_cache_error is None
+            else str(self.source_cache_error).strip() or None,
+        )
+        object.__setattr__(self, "created_at", _validate_timestamp(self.created_at or _now(), "created_at"))
+
+    @classmethod
+    def create(
+        cls,
+        path: str | PurePath,
+        *,
+        bin_id: str | None = None,
+        order: int = 0,
+        media_id: str | None = None,
+    ) -> MediaRecord:
+        return cls(
+            id=media_id or uuid.uuid4().hex,
+            path=_coerce_path(path),
+            bin_id=bin_id,
+            order=order,
+            created_at=_now(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "path": _path_to_json(self.path),
+            "bin_id": self.bin_id,
+            "order": self.order,
+            "created_at": self.created_at,
+            "source_cache_path": (
+                None
+                if self.source_cache_path is None
+                else _path_to_json(self.source_cache_path)
+            ),
+            "source_cache_status": self.source_cache_status.value,
+            "source_cache_error": self.source_cache_error,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> MediaRecord:
+        required = {"id", "path", "bin_id", "order", "created_at"}
+        optional = {
+            "source_cache_path",
+            "source_cache_status",
+            "source_cache_error",
+        }
+        allowed = required | optional
+        _require_keys(payload, allowed, field="media")
+        missing = required - set(payload)
+        if missing:
+            raise ProjectError(f"media is missing fields: {', '.join(sorted(missing))}")
+        values = dict(payload)
+        values["path"] = _path_from_json(payload["path"])
+        cache_path = payload.get("source_cache_path")
+        values["source_cache_path"] = (
+            None if cache_path is None else _path_from_json(cache_path)
+        )
+        values["source_cache_status"] = MediaCacheStatus(
+            payload.get("source_cache_status", MediaCacheStatus.EMPTY.value)
+        )
+        values["source_cache_error"] = payload.get("source_cache_error")
+        return cls(**values)
+
+
+@dataclass(frozen=True, slots=True)
 class TimelineRecord:
-    """One imported plate set and its independent stitch/playback state."""
+    """One named stitch timeline and its independent state."""
 
     id: str
     name: str
     bin_id: str | None
     source_paths: tuple[PurePath, ...]
     config_snapshot: dict[str, Any]
+    inherits_project_settings: bool = True
     tc_alignment_snapshot: dict[str, Any] | None = None
     in_frame: int = 0
     out_frame: int | None = None
@@ -216,9 +340,12 @@ class TimelineRecord:
         if self.bin_id is not None and not str(self.bin_id).strip():
             raise ProjectError("bin_id cannot be empty")
         sources = tuple(_coerce_path(path) for path in self.source_paths)
-        observed = tuple(_plate_number(path) for path in sources)
-        if observed not in ((1, 2, 3, 4, 5), (6, 7, 8)):
-            raise ProjectError("source_paths must be ordered P01-P05 or P06-P08")
+        if len(sources) not in (0, 3, 5):
+            raise ProjectError("source_paths must be empty or contain 3 or 5 camera slots")
+        if len(set(sources)) != len(sources):
+            raise ProjectError("source_paths cannot assign one clip to multiple camera slots")
+        if not isinstance(self.inherits_project_settings, bool):
+            raise ProjectError("inherits_project_settings must be a boolean")
         if isinstance(self.in_frame, bool) or not isinstance(self.in_frame, int) or self.in_frame < 0:
             raise ProjectError("in_frame must be a non-negative integer")
         if self.out_frame is not None:
@@ -265,6 +392,7 @@ class TimelineRecord:
         name: str,
         source_paths: Iterable[str | PurePath],
         config_snapshot: Mapping[str, Any],
+        inherits_project_settings: bool = True,
         bin_id: str | None = None,
         tc_alignment_snapshot: Mapping[str, Any] | None = None,
         in_frame: int = 0,
@@ -282,6 +410,7 @@ class TimelineRecord:
             bin_id=bin_id,
             source_paths=tuple(source_paths),
             config_snapshot=dict(config_snapshot),
+            inherits_project_settings=inherits_project_settings,
             tc_alignment_snapshot=None if tc_alignment_snapshot is None else dict(tc_alignment_snapshot),
             in_frame=in_frame,
             out_frame=out_frame,
@@ -300,6 +429,7 @@ class TimelineRecord:
             "bin_id": self.bin_id,
             "source_paths": [_path_to_json(path) for path in self.source_paths],
             "config_snapshot": _json_value(self.config_snapshot, field="config_snapshot"),
+            "inherits_project_settings": self.inherits_project_settings,
             "tc_alignment_snapshot": _json_value(
                 self.tc_alignment_snapshot, field="tc_alignment_snapshot"
             ),
@@ -318,14 +448,20 @@ class TimelineRecord:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> TimelineRecord:
+    def from_dict(
+        cls, payload: Mapping[str, Any], *, legacy: bool = False
+    ) -> TimelineRecord:
         allowed = {
             "id", "name", "bin_id", "source_paths", "config_snapshot",
+            "inherits_project_settings",
             "tc_alignment_snapshot", "in_frame", "out_frame", "playback_cache_path",
             "playback_cache_status", "stitch_status", "order", "created_at", "updated_at",
         }
         _require_keys(payload, allowed, field="timeline")
+        missing_inheritance = "inherits_project_settings" not in payload
         missing = allowed - set(payload)
+        if legacy and missing_inheritance:
+            missing.remove("inherits_project_settings")
         if missing:
             raise ProjectError(f"timeline is missing fields: {', '.join(sorted(missing))}")
         sources = payload["source_paths"]
@@ -340,6 +476,9 @@ class TimelineRecord:
         values = dict(payload)
         values["source_paths"] = tuple(_path_from_json(path) for path in sources)
         values["config_snapshot"] = dict(config)
+        values["inherits_project_settings"] = (
+            False if legacy and missing_inheritance else payload["inherits_project_settings"]
+        )
         values["tc_alignment_snapshot"] = None if alignment is None else dict(alignment)
         values["playback_cache_path"] = (
             None if payload["playback_cache_path"] is None else _path_from_json(payload["playback_cache_path"])
@@ -355,6 +494,7 @@ class ProjectStore:
         path: str | PurePath,
         settings: ProjectSettings,
         bins: Iterable[Bin] = (),
+        media: Iterable[MediaRecord] = (),
         timelines: Iterable[TimelineRecord] = (),
         *,
         autosave: bool = True,
@@ -363,6 +503,7 @@ class ProjectStore:
         self.settings = settings
         self.autosave = autosave
         self._bins = list(bins)
+        self._media = list(media)
         self._timelines = list(timelines)
         self._validate()
 
@@ -392,13 +533,23 @@ class ProjectStore:
     def timelines(self) -> tuple[TimelineRecord, ...]:
         return tuple(self._timelines)
 
+    @property
+    def media(self) -> tuple[MediaRecord, ...]:
+        return tuple(self._media)
+
     def _validate(self) -> None:
         bin_ids = [item.id for item in self._bins]
+        media_ids = [item.id for item in self._media]
         timeline_ids = [item.id for item in self._timelines]
         if len(bin_ids) != len(set(bin_ids)):
             raise ProjectError("project contains duplicate bin ids")
         if len(timeline_ids) != len(set(timeline_ids)):
             raise ProjectError("project contains duplicate timeline ids")
+        if len(media_ids) != len(set(media_ids)):
+            raise ProjectError("project contains duplicate media ids")
+        media_paths = [str(item.path) for item in self._media]
+        if len(media_paths) != len(set(media_paths)):
+            raise ProjectError("project contains duplicate media paths")
         known_bins = set(bin_ids)
         for item in self._bins:
             if item.parent_id is not None and item.parent_id not in known_bins:
@@ -407,6 +558,9 @@ class ProjectStore:
         for timeline in self._timelines:
             if timeline.bin_id is not None and timeline.bin_id not in known_bins:
                 raise ProjectError(f"unknown timeline bin: {timeline.bin_id}")
+        for item in self._media:
+            if item.bin_id is not None and item.bin_id not in known_bins:
+                raise ProjectError(f"unknown media bin: {item.bin_id}")
         self._validate_sibling_orders()
 
     def _validate_sibling_orders(self) -> None:
@@ -418,6 +572,10 @@ class ProjectStore:
             orders = [item.order for item in self._timelines if item.bin_id == bin_id]
             if len(orders) != len(set(orders)):
                 raise ProjectError("sibling timelines contain duplicate order values")
+        for bin_id in {item.bin_id for item in self._media}:
+            orders = [item.order for item in self._media if item.bin_id == bin_id]
+            if len(orders) != len(set(orders)):
+                raise ProjectError("sibling media contain duplicate order values")
 
     def _assert_no_bin_cycle(self, bin_id: str, *, items: list[Bin] | None = None) -> None:
         by_id = {item.id: item for item in (self._bins if items is None else items)}
@@ -432,6 +590,7 @@ class ProjectStore:
     def _mutate(self, operation: Callable[[], _T]) -> _T:
         old_settings = self.settings
         old_bins = list(self._bins)
+        old_media = list(self._media)
         old_timelines = list(self._timelines)
         try:
             result = operation()
@@ -442,6 +601,7 @@ class ProjectStore:
         except Exception:
             self.settings = old_settings
             self._bins = old_bins
+            self._media = old_media
             self._timelines = old_timelines
             raise
 
@@ -488,12 +648,15 @@ class ProjectStore:
             index = self._bin_index(bin_id)
             removed = self._bins[index]
             descendants = self._descendant_ids(bin_id)
-            occupied = any(item.bin_id in descendants for item in self._timelines)
+            occupied = any(item.bin_id in descendants for item in self._timelines) or any(
+                item.bin_id in descendants for item in self._media
+            )
             if (len(descendants) > 1 or occupied) and not recursive:
                 raise ProjectError("bin is not empty; use recursive=True")
             self._bins = [item for item in self._bins if item.id not in descendants]
             if recursive:
                 self._timelines = [item for item in self._timelines if item.bin_id not in descendants]
+                self._media = [item for item in self._media if item.bin_id not in descendants]
             self._normalize_bin_orders(removed.parent_id)
             return removed
         return self._mutate(change)
@@ -526,6 +689,94 @@ class ProjectStore:
 
     def list_timelines(self, bin_id: str | None = None) -> tuple[TimelineRecord, ...]:
         return tuple(sorted((item for item in self._timelines if item.bin_id == bin_id), key=lambda item: item.order))
+
+    def list_media(self, bin_id: str | None = None) -> tuple[MediaRecord, ...]:
+        return tuple(
+            sorted(
+                (item for item in self._media if item.bin_id == bin_id),
+                key=lambda item: item.order,
+            )
+        )
+
+    def add_media(self, item: MediaRecord) -> MediaRecord:
+        return self.add_media_many((item,))[0]
+
+    def add_media_many(self, items: Iterable[MediaRecord]) -> tuple[MediaRecord, ...]:
+        requested = tuple(items)
+
+        def change() -> tuple[MediaRecord, ...]:
+            ids = {existing.id for existing in self._media}
+            paths = {str(existing.path) for existing in self._media}
+            bin_ids = {existing.id for existing in self._bins}
+            added: list[MediaRecord] = []
+            for item in requested:
+                if item.id in ids:
+                    raise ProjectError(f"duplicate media id: {item.id}")
+                if str(item.path) in paths:
+                    raise ProjectError(f"media already exists: {item.path}")
+                if item.bin_id is not None and item.bin_id not in bin_ids:
+                    raise ProjectError(f"unknown media bin: {item.bin_id}")
+                siblings = self.list_media(item.bin_id)
+                index = min(item.order, len(siblings))
+                self._media = [
+                    replace(existing, order=existing.order + 1)
+                    if existing.bin_id == item.bin_id and existing.order >= index
+                    else existing
+                    for existing in self._media
+                ]
+                record = replace(item, order=index)
+                self._media.append(record)
+                added.append(record)
+                ids.add(record.id)
+                paths.add(str(record.path))
+            return tuple(added)
+
+        return self._mutate(change)
+
+    def update_media(self, media_id: str, **changes: Any) -> MediaRecord:
+        allowed = {
+            "path",
+            "bin_id",
+            "order",
+            "source_cache_path",
+            "source_cache_status",
+            "source_cache_error",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ProjectError(
+                f"unsupported media fields: {', '.join(sorted(unknown))}"
+            )
+
+        def change() -> MediaRecord:
+            index = self._media_index(media_id)
+            current = self._media[index]
+            updated = replace(current, **changes)
+            if any(
+                other.id != media_id and str(other.path) == str(updated.path)
+                for other in self._media
+            ):
+                raise ProjectError(f"media already exists: {updated.path}")
+            if updated.bin_id is not None and not any(
+                item.id == updated.bin_id for item in self._bins
+            ):
+                raise ProjectError(f"unknown media bin: {updated.bin_id}")
+            self._media[index] = updated
+            return updated
+
+        return self._mutate(change)
+
+    def media_for_paths(self, paths: Iterable[str | PurePath]) -> tuple[MediaRecord, ...]:
+        wanted = {str(_coerce_path(path)) for path in paths}
+        return tuple(item for item in self._media if str(item.path) in wanted)
+
+    def remove_media(self, media_id: str) -> MediaRecord:
+        def change() -> MediaRecord:
+            index = self._media_index(media_id)
+            removed = self._media.pop(index)
+            self._normalize_media_orders(removed.bin_id)
+            return removed
+        return self._mutate(change)
 
     def add_timeline(self, item: TimelineRecord) -> TimelineRecord:
         def change() -> TimelineRecord:
@@ -602,6 +853,12 @@ class ProjectStore:
                 return index
         raise ProjectError(f"unknown timeline: {timeline_id}")
 
+    def _media_index(self, media_id: str) -> int:
+        for index, item in enumerate(self._media):
+            if item.id == media_id:
+                return index
+        raise ProjectError(f"unknown media: {media_id}")
+
     def _descendant_ids(self, bin_id: str) -> set[str]:
         result = {bin_id}
         changed = True
@@ -627,23 +884,34 @@ class ProjectStore:
         replacements = {item.id: replace(item, order=index) for index, item in enumerate(ordered)}
         self._timelines = [replacements.get(item.id, item) for item in self._timelines]
 
+    def _normalize_media_orders(self, bin_id: str | None) -> None:
+        ordered = sorted(
+            (item for item in self._media if item.bin_id == bin_id),
+            key=lambda item: item.order,
+        )
+        replacements = {
+            item.id: replace(item, order=index) for index, item in enumerate(ordered)
+        }
+        self._media = [replacements.get(item.id, item) for item in self._media]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": STORE_VERSION,
             "settings": self.settings.to_dict(),
             "bins": [item.to_dict() for item in self._bins],
+            "media": [item.to_dict() for item in self._media],
             "timelines": [item.to_dict() for item in self._timelines],
         }
 
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _save_to(self, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as handle:
@@ -652,10 +920,10 @@ class ProjectStore:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
+            os.replace(temporary, destination)
             temporary = None
             try:
-                directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                directory_fd = os.open(destination.parent, os.O_RDONLY)
                 try:
                     os.fsync(directory_fd)
                 finally:
@@ -663,13 +931,22 @@ class ProjectStore:
             except OSError:
                 pass
         except (OSError, TypeError, ValueError) as exc:
-            raise ProjectError(f"cannot save project {self.path}: {exc}") from exc
+            raise ProjectError(f"cannot save project {destination}: {exc}") from exc
         finally:
             if temporary is not None:
                 try:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
+
+    def save(self) -> None:
+        self._save_to(self.path)
+
+    def save_copy(self, destination: str | PurePath) -> Path:
+        """Write an atomic recovery copy without changing the active project path."""
+        target = Path(destination)
+        self._save_to(target)
+        return target
 
     @classmethod
     def load(cls, path: str | PurePath, *, autosave: bool = True) -> ProjectStore:
@@ -680,22 +957,47 @@ class ProjectStore:
             raise ProjectError(f"cannot load project {store_path}: {exc}") from exc
         if not isinstance(payload, Mapping):
             raise ProjectError("project root must be an object")
-        _require_keys(payload, {"version", "settings", "bins", "timelines"}, field="project")
-        if payload.get("version") != STORE_VERSION:
+        version = payload.get("version")
+        if version not in {1, STORE_VERSION}:
             raise ProjectError(f"unsupported project version: {payload.get('version')!r}")
-        if set(payload) != {"version", "settings", "bins", "timelines"}:
+        allowed = {"version", "settings", "bins", "timelines"}
+        if version == STORE_VERSION:
+            allowed.add("media")
+        _require_keys(payload, allowed, field="project")
+        if set(payload) != allowed:
             raise ProjectError("project is missing required fields")
         settings = payload["settings"]
         bins = payload["bins"]
+        media = payload.get("media", [])
         timelines = payload["timelines"]
-        if not isinstance(settings, Mapping) or not isinstance(bins, list) or not isinstance(timelines, list):
-            raise ProjectError("project settings must be an object; bins and timelines must be lists")
-        if not all(isinstance(item, Mapping) for item in bins + timelines):
-            raise ProjectError("project bins and timelines must contain objects")
+        if not isinstance(settings, Mapping) or not isinstance(bins, list) or not isinstance(media, list) or not isinstance(timelines, list):
+            raise ProjectError("project settings must be an object; bins, media and timelines must be lists")
+        if not all(isinstance(item, Mapping) for item in bins + media + timelines):
+            raise ProjectError("project bins, media and timelines must contain objects")
+        loaded_timelines = [
+            TimelineRecord.from_dict(item, legacy=version == 1) for item in timelines
+        ]
+        loaded_media = [MediaRecord.from_dict(item) for item in media]
+        if version == 1:
+            known_paths: set[str] = set()
+            next_order: dict[str | None, int] = {}
+            for timeline in loaded_timelines:
+                for path in timeline.source_paths:
+                    key = str(path)
+                    if key in known_paths:
+                        continue
+                    bin_id = timeline.bin_id
+                    order = next_order.get(bin_id, 0)
+                    loaded_media.append(
+                        MediaRecord.create(path, bin_id=bin_id, order=order)
+                    )
+                    next_order[bin_id] = order + 1
+                    known_paths.add(key)
         return cls(
             store_path,
             ProjectSettings.from_dict(settings),
             [Bin.from_dict(item) for item in bins],
-            [TimelineRecord.from_dict(item) for item in timelines],
+            loaded_media,
+            loaded_timelines,
             autosave=autosave,
         )

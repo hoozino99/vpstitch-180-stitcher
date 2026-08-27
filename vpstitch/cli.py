@@ -5,6 +5,7 @@ import sys
 import tempfile
 import json
 import re
+from dataclasses import asdict
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .config import (
     load_config,
 )
 from .ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
-from .imageio import ExrSequenceEncoder, write_png
+from .imageio import ExrSequenceEncoder, read_image, write_png
 from .pipeline import Stitcher
 from .mapcache import MapCache
 from .canvas import analyze_canvas, write_coverage_mask
@@ -26,8 +27,13 @@ from .diagnostics import assess_inputs, interpret_input_probes, resolve_passthro
 from .calibration import CalibrationError, calibrate_checkerboard
 from .rigcalibration import calibrate_rig_rotation, write_calibrated_config
 from .resources import estimate_resources
+from .renderflow import FrameBundleReader, should_prefetch_decode
 from .color import load_ocio_config
+from .color import ColorPipeline
+from .colormatch import ACESCG_LUMA_WEIGHTS, solve_color_match
+from .geometry import Tile, camera_map, remap_camera
 from .timecode import align_by_timecode
+from .liveplayback import AlignedFramePlan
 
 
 def _progress(done: int, total: int) -> None:
@@ -85,70 +91,29 @@ def _add_canvas_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _load_alignment_plan(
-    path: str | None,
-    inputs: list[str],
-    fps: float,
-) -> tuple[list[int], list[int], int] | None:
-    if not path:
-        return None
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        plan_inputs = payload["inputs"]
-        common_frames = int(payload["common_frames"])
-        plan_fps = float(payload["fps"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-        raise ConfigError(f"invalid alignment plan {path}: {error}") from error
-    if not isinstance(plan_inputs, list) or len(plan_inputs) != len(inputs):
-        raise ConfigError("alignment plan input count does not match render inputs")
-    if abs(plan_fps - fps) > 0.001:
-        raise ConfigError("alignment plan fps does not match the render config")
-    skips: list[int] = []
-    counts: list[int] = []
-    for source, item in zip(inputs, plan_inputs, strict=True):
-        if not isinstance(item, dict):
-            raise ConfigError("alignment plan input entry is invalid")
-        try:
-            planned_path = Path(str(item["path"])).resolve()
-            skip = int(item["skip_frames"])
-            count = int(item["frame_count"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ConfigError(f"invalid alignment plan input: {error}") from error
-        if planned_path != Path(source).resolve():
-            raise ConfigError(
-                f"alignment plan source mismatch: expected {planned_path}, got {source}"
-            )
-        if skip < 0 or count < 1 or skip >= count:
-            raise ConfigError(f"invalid alignment range for {source}")
-        skips.append(skip)
-        counts.append(count)
-    if common_frames < 1:
-        raise ConfigError("alignment plan has no common frames")
-    return skips, counts, common_frames
-
-
 def _planned_decoder_starts(
     config: RigConfig,
     inputs: list[str],
     alignment_path: str | None,
 ) -> tuple[list[int] | None, int | None]:
     assert config.video is not None
-    plan = _load_alignment_plan(alignment_path, inputs, config.video.fps)
-    if plan is None:
+    if not alignment_path:
         return None, None
-    plan_skips, frame_counts, _ = plan
-    starts = [
-        skip + camera.frame_offset
-        for skip, camera in zip(plan_skips, config.cameras, strict=True)
-    ]
-    normalization = -min(0, min(starts))
-    starts = [start + normalization for start in starts]
-    available = min(
-        count - start for count, start in zip(frame_counts, starts, strict=True)
-    )
-    if available < 1:
-        raise ConfigError("manual camera offsets leave no common aligned range")
-    return starts, available
+    try:
+        payload = json.loads(Path(alignment_path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("alignment payload must be an object")
+        plan = AlignedFramePlan.from_payload(
+            payload,
+            inputs,
+            config.cameras,
+            config.video.fps,
+        )
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ConfigError(
+            f"invalid alignment plan {alignment_path}: {error}"
+        ) from error
+    return list(plan.starts), plan.common_frames
 
 
 def _stitch_frame(args: argparse.Namespace) -> None:
@@ -233,55 +198,63 @@ def _stitch_video(args: argparse.Namespace) -> None:
 
     cache = MapCache(config, args.map_cache).open(progress=_progress)
     stitcher = Stitcher(config, map_cache=cache)
-    decoders = []
-    for index, (path, camera, probe) in enumerate(
-        zip(args.inputs, config.cameras, probes, strict=True)
-    ):
-        if planned_starts is None:
-            decoder_camera = camera
-            decoder_start = args.start_frame
-        else:
-            decoder_camera = replace(camera, frame_offset=0)
-            decoder_start = planned_starts[index] + args.start_frame
-        decoders.append(
-            VideoDecoder(
-                path,
-                decoder_camera,
-                config.video.fps,
-                start_frame=decoder_start,
-                source_fps=probe.fps,
-                exact_frame_seek=True,
-                output_size=(camera.width, camera.height)
-                if decode_scale < 1.0
-                else None,
+    decoders: list[VideoDecoder] = []
+    encoder: ExrSequenceEncoder | DpxSequenceEncoder | VideoEncoder | None = None
+    destination: np.memmap | None = None
+    temporary_context: tempfile.TemporaryDirectory[str] | None = None
+    frame_reader: FrameBundleReader | None = None
+    frame_index = 0
+    cleanup_error: Exception | None = None
+    try:
+        for index, (path, camera, probe) in enumerate(
+            zip(args.inputs, config.cameras, probes, strict=True)
+        ):
+            if planned_starts is None:
+                decoder_camera = camera
+                decoder_start = args.start_frame
+            else:
+                decoder_camera = replace(camera, frame_offset=0)
+                decoder_start = planned_starts[index] + args.start_frame
+            decoders.append(
+                VideoDecoder(
+                    path,
+                    decoder_camera,
+                    config.video.fps,
+                    start_frame=decoder_start,
+                    source_fps=probe.fps,
+                    exact_frame_seek=True,
+                    source_bit_depth=probe.bit_depth,
+                    output_size=(camera.width, camera.height)
+                    if decode_scale < 1.0
+                    else None,
+                )
             )
-        )
-    if config.video.output_codec == "exr-half-sequence":
-        encoder = ExrSequenceEncoder(
-            args.output,
-            config.output.width,
-            config.output.height,
-            config.video,
-            config.color,
-        )
-    elif config.video.output_codec == "dpx12-sequence":
-        encoder = DpxSequenceEncoder(
-            args.output,
-            config.output.width,
-            config.output.height,
-            config.video,
-            config.color,
-        )
-    else:
-        encoder = VideoEncoder(
-            args.output,
-            config.output.width,
-            config.output.height,
-            config.video,
-        )
-    frame_shape = (config.output.height, config.output.width, 3)
-    with tempfile.TemporaryDirectory(prefix="vpstitch-") as temporary:
-        frame_path = Path(temporary) / "frame.rgb48"
+        if config.video.output_codec == "exr-half-sequence":
+            encoder = ExrSequenceEncoder(
+                args.output,
+                config.output.width,
+                config.output.height,
+                config.video,
+                config.color,
+            )
+        elif config.video.output_codec == "dpx12-sequence":
+            encoder = DpxSequenceEncoder(
+                args.output,
+                config.output.width,
+                config.output.height,
+                config.video,
+                config.color,
+            )
+        else:
+            encoder = VideoEncoder(
+                args.output,
+                config.output.width,
+                config.output.height,
+                config.video,
+            )
+        frame_shape = (config.output.height, config.output.width, 3)
+        temporary_context = tempfile.TemporaryDirectory(prefix="vpstitch-")
+        frame_path = Path(temporary_context.name) / "frame.rgb48"
         destination_dtype = (
             np.float16
             if config.video.output_codec == "exr-half-sequence"
@@ -290,47 +263,89 @@ def _stitch_video(args: argparse.Namespace) -> None:
         destination = np.memmap(
             frame_path, dtype=destination_dtype, mode="w+", shape=frame_shape
         )
-        frame_index = 0
-        try:
-            while config.video.frames is None or frame_index < config.video.frames:
-                # Each decoder owns a persistent frame buffer. The stitcher
-                # consumes all five before the next read, so avoid allocating
-                # and copying another 16-bit full frame per camera here.
-                sources = [decoder.read(copy=False) for decoder in decoders]
-                if any(source is None for source in sources):
-                    if (
-                        config.video.frames is not None
-                        and frame_index < config.video.frames
-                    ):
-                        ended = [
-                            config.cameras[index].name
-                            for index, source in enumerate(sources)
-                            if source is None
-                        ]
-                        raise OSError(
-                            "input ended before the requested frame count: "
-                            + ", ".join(ended)
-                        )
-                    break
-                print(f"frame {frame_index}")
-                stitcher.stitch_arrays(
-                    sources,  # type: ignore[arg-type]
-                    destination,
-                    frame_index=frame_index,
-                    progress=_progress,
+        prefetch = should_prefetch_decode(config)
+        frame_reader = FrameBundleReader(decoders, prefetch=prefetch)
+        print(
+            "decode scheduling: "
+            + ("one-frame bounded prefetch" if prefetch else "zero-copy sequential")
+        )
+        while config.video.frames is None or frame_index < config.video.frames:
+            prefetch_next = (
+                config.video.frames is None
+                or frame_index + 1 < config.video.frames
+            )
+            sources = frame_reader.read(prefetch_next=prefetch_next)
+            if any(source is None for source in sources):
+                if config.video.frames is not None and frame_index < config.video.frames:
+                    ended = [
+                        config.cameras[index].name
+                        for index, source in enumerate(sources)
+                        if source is None
+                    ]
+                    raise OSError(
+                        "input ended before the requested frame count: "
+                        + ", ".join(ended)
+                    )
+                break
+            print(f"frame {frame_index}")
+            stitcher.stitch_arrays(
+                sources,  # type: ignore[arg-type]
+                destination,
+                frame_index=frame_index,
+                progress=_progress,
+            )
+            if frame_index == 0:
+                print(
+                    f"remap backend: {stitcher.backend_decision.backend} · "
+                    f"{stitcher.backend_decision.reason}"
                 )
-                encoder.write(destination)
-                frame_index += 1
-        finally:
-            for decoder in decoders:
+            encoder.write(destination)
+            frame_index += 1
+    finally:
+        preserving_error = sys.exc_info()[0] is not None
+        # Close decoder pipes before joining a possible prefetch read. This
+        # guarantees an FFmpeg stall cannot leave the background reader waiting
+        # forever during cancellation or exception cleanup.
+        for decoder in decoders:
+            try:
                 decoder.close()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if frame_reader is not None:
+            try:
+                frame_reader.close()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if encoder is not None:
             try:
                 encoder.close()
-            finally:
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        try:
+            cache.close()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if destination is not None:
+            try:
                 destination.flush()
                 mapping = getattr(destination, "_mmap", None)
                 if mapping is not None:
                     mapping.close()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if temporary_context is not None:
+            try:
+                temporary_context.cleanup()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and not preserving_error:
+            raise cleanup_error
     print(f"encoded {frame_index} frames -> {args.output}")
 
 
@@ -378,6 +393,7 @@ def _extract_reference(args: argparse.Namespace) -> None:
                 start_frame=decoder_start,
                 source_fps=probe.fps,
                 exact_frame_seek=True,
+                source_bit_depth=probe.bit_depth,
                 output_size=(
                     max(1, int(round(camera.width * args.scale))),
                     max(1, int(round(camera.height * args.scale))),
@@ -450,12 +466,6 @@ def _align_timecode(args: argparse.Namespace) -> None:
             raise ConfigError(
                 f"Config expects {len(config.cameras)} cameras, got {len(probes)}."
             )
-        if config.video is not None and any(
-            abs(probe.fps - config.video.fps) > 0.001 for probe in probes
-        ):
-            raise ConfigError(
-                f"input fps does not match configured {config.video.fps:g} fps"
-            )
     alignment = align_by_timecode(probes)
     payload = {
         **alignment.to_dict(),
@@ -520,6 +530,79 @@ def _list_ocio_spaces(args: argparse.Namespace) -> None:
         }
     except Exception as error:
         raise ValueError(f"unable to inspect OCIO config {args.ocio_config}: {error}") from error
+    print(json.dumps(payload, indent=2))
+
+
+def _match_color(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if config.color.mode != "ocio":
+        raise ConfigError("camera color matching requires OCIO mode")
+    if len(args.images) != len(config.cameras):
+        raise ConfigError(f"expected {len(config.cameras)} reference images")
+    names = [camera.name for camera in config.cameras]
+    if args.reference_camera not in names:
+        raise ConfigError(
+            "reference camera must be one of: " + ", ".join(names)
+        )
+    reference_index = names.index(args.reference_camera)
+    pipeline = ColorPipeline(
+        replace(config.color, match_enabled=False),
+        [camera.colorspace for camera in config.cameras],
+        [camera.color_gain for camera in config.cameras],
+    )
+    tile = Tile(0, 0, config.output.width, config.output.height)
+    warped: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    for index, (camera, image_path) in enumerate(
+        zip(config.cameras, args.images, strict=True)
+    ):
+        image = read_image(image_path)
+        if image.shape[:2] != (camera.height, camera.width):
+            raise ConfigError(
+                f"{camera.name} reference expects {camera.width}x{camera.height}, "
+                f"got {image.shape[1]}x{image.shape[0]}"
+            )
+        working = pipeline.input_to_working(index, image, apply_match=False)
+        map_x, map_y, valid, _ = camera_map(camera, tile, config.output)
+        warped.append(remap_camera(working, map_x, map_y))
+        masks.append(valid.astype(np.float32))
+    result = solve_color_match(
+        warped,
+        masks,
+        reference_index,
+        strength=1.0,
+        gain_limits=(args.minimum_gain, args.maximum_gain),
+        luma_weights=(
+            ACESCG_LUMA_WEIGHTS
+            if config.color.working_space.casefold() == "acescg"
+            else (0.2126, 0.7152, 0.0722)
+        ),
+        min_overlap_pixels=args.minimum_overlap,
+    )
+    payload = {
+        "reference_camera": args.reference_camera,
+        "working_space": config.color.working_space,
+        "cameras": [
+            {
+                "name": camera.name,
+                "gain": [float(value) for value in result.gains[index]],
+                "confidence": float(result.confidence[index]),
+                "connected": bool(result.diagnostics.connected[index]),
+            }
+            for index, camera in enumerate(config.cameras)
+        ],
+        "overlaps": [asdict(item) for item in result.diagnostics.overlaps],
+        "rejected_overlaps": [list(item) for item in result.diagnostics.rejected_overlaps],
+    }
+    destination = Path(args.output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=destination.parent, delete=False
+    ) as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+        temporary = Path(handle.name)
+    temporary.replace(destination)
     print(json.dumps(payload, indent=2))
 
 
@@ -679,6 +762,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ocio_spaces.add_argument("--ocio-config", required=True)
     ocio_spaces.set_defaults(function=_list_ocio_spaces)
+
+    color_match = subparsers.add_parser(
+        "match-color",
+        help="match camera white point from aligned scene-linear overlaps",
+    )
+    color_match.add_argument("--config", required=True)
+    color_match.add_argument("--reference-camera", required=True)
+    color_match.add_argument("--output", required=True)
+    color_match.add_argument("--minimum-gain", type=float, default=0.85)
+    color_match.add_argument("--maximum-gain", type=float, default=1.18)
+    color_match.add_argument("--minimum-overlap", type=int, default=256)
+    color_match.add_argument("images", nargs="+")
+    color_match.set_defaults(function=_match_color)
     return parser
 
 

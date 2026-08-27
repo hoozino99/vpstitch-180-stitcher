@@ -140,3 +140,40 @@ def test_seam_weights_are_smooth_and_nonnegative() -> None:
     assert all(np.all(weight >= 0) for weight in weights)
     center = 500
     assert weights[2][0, center] > 0.99
+
+
+def test_camera_scale_and_crop_change_projection_validity() -> None:
+    output = Output(
+        width=640,
+        height=480,
+        horizontal_fov_deg=90,
+        vertical_fov_deg=73.739795,
+        tile_width=640,
+        tile_height=480,
+    )
+    base = _camera("base", 0)
+    adjusted = Camera(
+        **{
+            **base.__dict__,
+            "scale": 1.2,
+            "crop_left": 0.45,
+        }
+    )
+    base_x, _, base_valid, _ = camera_map(base, Tile(0, 0, 640, 480), output)
+    adjusted_x, _, adjusted_valid, _ = camera_map(
+        adjusted, Tile(0, 0, 640, 480), output
+    )
+    assert adjusted_x[239, 400] > base_x[239, 400]
+    assert np.count_nonzero(adjusted_valid) < np.count_nonzero(base_valid)
+
+
+def test_per_camera_feather_overrides_global_width() -> None:
+    cameras = (
+        _camera("left", -20),
+        Camera(**{**_camera("right", 20).__dict__, "feather_left_deg": 1.0}),
+    )
+    longitude = np.deg2rad(np.linspace(-10, 10, 1001))[None, :]
+    valid = [np.ones_like(longitude, dtype=bool) for _ in cameras]
+    weights = seam_weights(cameras, longitude, valid, feather_deg=8.0)
+    assert weights[1][0, 450] < 0.01
+    assert weights[1][0, 550] > 0.99

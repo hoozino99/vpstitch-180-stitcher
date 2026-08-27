@@ -44,8 +44,18 @@ def load_ocio_config(identifier: str):
 class ColorPipeline:
     """Applies optional OCIO transforms without introducing 8-bit buffers."""
 
-    def __init__(self, settings: Color, camera_spaces: list[str | None]):
+    def __init__(
+        self,
+        settings: Color,
+        camera_spaces: list[str | None],
+        camera_gains: list[tuple[float, float, float]] | None = None,
+    ):
         self.settings = settings
+        self._camera_gains = camera_gains or [
+            (1.0, 1.0, 1.0) for _ in camera_spaces
+        ]
+        if len(self._camera_gains) != len(camera_spaces):
+            raise ValueError("camera gain count must match camera color-space count")
         self._input_processors: list[object | None] = [None] * len(camera_spaces)
         self._output_processor: object | None = None
         if settings.mode == "ocio":
@@ -59,9 +69,19 @@ class ColorPipeline:
                     ).getDefaultCPUProcessor()
                     for space in camera_spaces
                 ]
-                self._output_processor = config.getProcessor(
-                    str(settings.working_space), str(settings.output_space)
-                ).getDefaultCPUProcessor()
+                if settings.output_mode == "display_view":
+                    transform = ocio.DisplayViewTransform(
+                        src=str(settings.working_space),
+                        display=str(settings.display),
+                        view=str(settings.view),
+                    )
+                    self._output_processor = config.getProcessor(
+                        transform
+                    ).getDefaultCPUProcessor()
+                else:
+                    self._output_processor = config.getProcessor(
+                        str(settings.working_space), str(settings.output_space)
+                    ).getDefaultCPUProcessor()
             except Exception as error:
                 raise ValueError(
                     f"OCIO setup failed for {settings.ocio_config}: {error}"
@@ -89,8 +109,22 @@ class ColorPipeline:
         processor.apply(descriptor)
         return contiguous
 
-    def input_to_working(self, camera_index: int, image: np.ndarray) -> np.ndarray:
-        return self._apply(self._input_processors[camera_index], self.to_float(image))
+    def input_to_working(
+        self,
+        camera_index: int,
+        image: np.ndarray,
+        *,
+        apply_match: bool = True,
+    ) -> np.ndarray:
+        working = self._apply(
+            self._input_processors[camera_index], self.to_float(image)
+        )
+        if not apply_match or not self.settings.match_enabled:
+            return working
+        gain = np.asarray(self._camera_gains[camera_index], dtype=np.float32)
+        strength = float(self.settings.match_strength)
+        effective = np.exp(np.log(np.clip(gain, 1e-6, None)) * strength)
+        return np.asarray(working, dtype=np.float32) * effective.reshape(1, 1, 3)
 
     def working_to_output(self, image: np.ndarray) -> np.ndarray:
         return self._apply(self._output_processor, image)

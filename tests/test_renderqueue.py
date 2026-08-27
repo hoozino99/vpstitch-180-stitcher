@@ -51,6 +51,54 @@ def test_job_round_trip_keeps_snapshots_ranges_and_paths(tmp_path: Path) -> None
     assert json.loads(queue_path.read_text(encoding="utf-8"))["version"] == 1
 
 
+def test_job_snapshot_is_detached_from_later_nested_config_changes() -> None:
+    config = {
+        "cameras": [
+            {
+                "name": "cam0",
+                "yaw_deg": -42.5,
+                "crop_left": 0.03,
+                "color_gain": [1.02, 1.0, 0.98],
+            }
+        ],
+        "output": {"width": 20_000, "height": 5_504},
+        "color": {"match_strength": 0.8},
+    }
+    job = RenderJob.create(
+        name="locked",
+        source_paths=["P01.mov"],
+        config_snapshot=config,
+        output_path="locked.mov",
+    )
+
+    config["cameras"][0]["yaw_deg"] = 75.0
+    config["cameras"][0]["color_gain"][0] = 0.5
+    config["output"]["width"] = 1_920
+    config["color"]["match_strength"] = 0.1
+
+    assert job.config_snapshot["cameras"][0]["yaw_deg"] == -42.5
+    assert job.config_snapshot["cameras"][0]["color_gain"] == [1.02, 1.0, 0.98]
+    assert job.config_snapshot["output"]["width"] == 20_000
+    assert job.config_snapshot["color"]["match_strength"] == 0.8
+
+
+def test_store_does_not_expose_mutable_internal_job_snapshots(tmp_path: Path) -> None:
+    store = RenderQueueStore(tmp_path / "queue.json")
+    original = make_job("isolated")
+    returned = store.add(original)
+    digest = returned.snapshot_digest
+
+    original.config_snapshot["output"]["width"] = 1
+    returned.config_snapshot["output"]["width"] = 2
+    exposed = store.jobs[0]
+    exposed.config_snapshot["output"]["width"] = 3
+
+    locked = store.jobs[0]
+    assert locked.config_snapshot["output"]["width"] == 20_000
+    assert locked.snapshot_digest == digest
+    assert RenderQueueStore.load(store.path).jobs[0].snapshot_digest == digest
+
+
 def test_store_add_update_remove_reorder_and_next_queued(tmp_path: Path) -> None:
     queue_path = tmp_path / "queue.json"
     store = RenderQueueStore(queue_path)

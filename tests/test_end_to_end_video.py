@@ -3,14 +3,79 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import cv2
+import pytest
 
+import vpstitch.cli as cli
 from vpstitch.cli import main
-from vpstitch.config import Camera, Lens, Video
+from vpstitch.config import Camera, Color, Lens, Output, RigConfig, Video
 from vpstitch.ffmpegio import VideoDecoder, VideoEncoder, probe_video
 from vpstitch.geometry import camera_to_world
+
+
+class _TrackedResource:
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _TrackedMapCache(_TrackedResource):
+    instances: list["_TrackedMapCache"] = []
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        super().__init__()
+        self.instances.append(self)
+
+    def open(self, **_kwargs: object) -> "_TrackedMapCache":
+        return self
+
+
+def _patch_render_initialization(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    cameras = tuple(_source_camera(index, 64, 32) for index in range(3))
+    config = RigConfig(
+        cameras=cameras,
+        output=Output(width=96, height=32),
+        color=Color(),
+        video=Video(fps=24, frames=1, output_codec="ffv1-16"),
+    )
+    monkeypatch.setattr(cli, "_apply_canvas_overrides", lambda _config, _args: config)
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        cli,
+        "probe_video",
+        lambda _path: SimpleNamespace(fps=24.0, bit_depth=8),
+    )
+    monkeypatch.setattr(cli, "interpret_input_probes", lambda probes, _config: probes)
+    monkeypatch.setattr(
+        cli,
+        "assess_inputs",
+        lambda *_args, **_kwargs: SimpleNamespace(issues=[]),
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_passthrough_video",
+        lambda video, _probes: video,
+    )
+    monkeypatch.setattr(cli, "_planned_decoder_starts", lambda *_args: (None, None))
+    _TrackedMapCache.instances.clear()
+    monkeypatch.setattr(cli, "MapCache", _TrackedMapCache)
+    monkeypatch.setattr(cli, "Stitcher", lambda *_args, **_kwargs: object())
+    return SimpleNamespace(
+        config="rig.json",
+        frames=None,
+        inputs=["p01.mov", "p02.mov", "p03.mov"],
+        allow_low_bit_depth=True,
+        alignment_plan=None,
+        start_frame=0,
+        decode_scale=1.0,
+        map_cache="maps",
+        output="stitched.mkv",
+    )
 
 
 def _source_camera(index: int, width: int, height: int) -> Camera:
@@ -228,3 +293,77 @@ def test_extract_reference_scales_before_writing_preview_frame(
     assert reference.dtype == np.uint16
     manifest = json.loads((output / "reference_manifest.json").read_text())
     assert manifest["reference_scale"] == 0.5
+
+
+def test_render_closes_started_decoders_when_later_decoder_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _patch_render_initialization(monkeypatch)
+    decoders: list[_TrackedResource] = []
+
+    def decoder_factory(*_args: object, **_kwargs: object) -> _TrackedResource:
+        if len(decoders) == 2:
+            raise OSError("third decoder failed")
+        decoder = _TrackedResource()
+        decoders.append(decoder)
+        return decoder
+
+    monkeypatch.setattr(cli, "VideoDecoder", decoder_factory)
+
+    with pytest.raises(OSError, match="third decoder"):
+        cli._stitch_video(args)
+
+    assert [decoder.close_count for decoder in decoders] == [1, 1]
+    assert _TrackedMapCache.instances[0].close_count == 1
+
+
+def test_render_closes_decoders_and_cache_when_encoder_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _patch_render_initialization(monkeypatch)
+    decoders: list[_TrackedResource] = []
+
+    def decoder_factory(*_args: object, **_kwargs: object) -> _TrackedResource:
+        decoder = _TrackedResource()
+        decoders.append(decoder)
+        return decoder
+
+    monkeypatch.setattr(cli, "VideoDecoder", decoder_factory)
+
+    def fail_encoder(*_args: object, **_kwargs: object) -> _TrackedResource:
+        raise OSError("encoder failed")
+
+    monkeypatch.setattr(cli, "VideoEncoder", fail_encoder)
+
+    with pytest.raises(OSError, match="encoder failed"):
+        cli._stitch_video(args)
+
+    assert [decoder.close_count for decoder in decoders] == [1, 1, 1]
+    assert _TrackedMapCache.instances[0].close_count == 1
+
+
+def test_render_closes_every_resource_when_destination_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _patch_render_initialization(monkeypatch)
+    decoders: list[_TrackedResource] = []
+    encoder = _TrackedResource()
+
+    def decoder_factory(*_args: object, **_kwargs: object) -> _TrackedResource:
+        decoder = _TrackedResource()
+        decoders.append(decoder)
+        return decoder
+
+    def fail_memmap(*_args: object, **_kwargs: object) -> np.memmap:
+        raise OSError("memmap failed")
+
+    monkeypatch.setattr(cli, "VideoDecoder", decoder_factory)
+    monkeypatch.setattr(cli, "VideoEncoder", lambda *_args, **_kwargs: encoder)
+    monkeypatch.setattr(cli.np, "memmap", fail_memmap)
+
+    with pytest.raises(OSError, match="memmap failed"):
+        cli._stitch_video(args)
+
+    assert [decoder.close_count for decoder in decoders] == [1, 1, 1]
+    assert encoder.close_count == 1
+    assert _TrackedMapCache.instances[0].close_count == 1

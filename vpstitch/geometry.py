@@ -165,8 +165,8 @@ def camera_map(
             + p1 * (radius2 + 2.0 * normalized_y**2)
             + 2.0 * p2 * normalized_x * normalized_y
         )
-        map_x = lens.fx * distorted_x + lens.cx
-        map_y = lens.fy * distorted_y + lens.cy
+        map_x = lens.fx * camera.scale * distorted_x + lens.cx
+        map_y = lens.fy * camera.scale * distorted_y + lens.cy
         valid = z > 0.0
     else:
         rho = np.sqrt(x * x + y * y)
@@ -181,12 +181,16 @@ def camera_map(
             + k4 * theta2**4
         )
         scale = np.divide(theta_d, rho, out=np.ones_like(theta_d), where=rho > 1e-9)
-        map_x = lens.fx * x * scale + lens.cx
-        map_y = lens.fy * y * scale + lens.cy
+        map_x = lens.fx * camera.scale * x * scale + lens.cx
+        map_y = lens.fy * camera.scale * y * scale + lens.cy
         valid = theta < np.pi
 
     valid &= (map_x >= 0.0) & (map_x <= camera.width - 1.001)
     valid &= (map_y >= 0.0) & (map_y <= camera.height - 1.001)
+    valid &= map_x >= camera.crop_left * camera.width
+    valid &= map_x <= (1.0 - camera.crop_right) * camera.width - 1.001
+    valid &= map_y >= camera.crop_top * camera.height
+    valid &= map_y <= (1.0 - camera.crop_bottom) * camera.height - 1.001
     if lens.circle_radius is not None:
         valid &= (
             (map_x - lens.cx) ** 2 + (map_y - lens.cy) ** 2
@@ -220,18 +224,41 @@ def seam_weights(
     order = np.argsort([camera.yaw_deg for camera in cameras])
     yaws = np.deg2rad(np.array([cameras[i].yaw_deg for i in order], dtype=np.float64))
     boundaries = (yaws[:-1] + yaws[1:]) * 0.5
-    feather = max(np.deg2rad(feather_deg), 1e-7)
     weights_ordered: list[np.ndarray] = []
 
     for rank, camera_index in enumerate(order):
         weight = np.ones_like(longitude, dtype=np.float32)
         if rank > 0:
             left = boundaries[rank - 1]
-            t = np.clip((longitude - (left - feather)) / (2.0 * feather), 0.0, 1.0)
+            left_feather = max(
+                np.deg2rad(
+                    cameras[camera_index].feather_left_deg
+                    if cameras[camera_index].feather_left_deg is not None
+                    else feather_deg
+                ),
+                1e-7,
+            )
+            t = np.clip(
+                (longitude - (left - left_feather)) / (2.0 * left_feather),
+                0.0,
+                1.0,
+            )
             weight *= (t * t * (3.0 - 2.0 * t)).astype(np.float32)
         if rank < len(order) - 1:
             right = boundaries[rank]
-            t = np.clip(((right + feather) - longitude) / (2.0 * feather), 0.0, 1.0)
+            right_feather = max(
+                np.deg2rad(
+                    cameras[camera_index].feather_right_deg
+                    if cameras[camera_index].feather_right_deg is not None
+                    else feather_deg
+                ),
+                1e-7,
+            )
+            t = np.clip(
+                ((right + right_feather) - longitude) / (2.0 * right_feather),
+                0.0,
+                1.0,
+            )
             weight *= (t * t * (3.0 - 2.0 * t)).astype(np.float32)
         weight *= valid_masks[camera_index].astype(np.float32)
         weights_ordered.append(weight)

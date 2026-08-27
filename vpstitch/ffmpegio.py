@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
@@ -14,6 +15,45 @@ import imageio_ffmpeg
 import numpy as np
 
 from .config import Camera, Color, Video
+
+
+class _BoundedPipeReader:
+    """Drain a subprocess pipe continuously while retaining only recent text."""
+
+    def __init__(self, stream, *, max_bytes: int = 256 * 1024) -> None:  # type: ignore[no-untyped-def]
+        self._stream = stream
+        self._max_bytes = max(4096, int(max_bytes))
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._drain,
+            name="vpstitch-ffmpeg-stderr",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(8192)
+                if not chunk:
+                    return
+                with self._lock:
+                    self._buffer.extend(chunk)
+                    overflow = len(self._buffer) - self._max_bytes
+                    if overflow > 0:
+                        del self._buffer[:overflow]
+        except (AttributeError, OSError, ValueError):
+            return
+
+    def text(self) -> str:
+        with self._lock:
+            payload = bytes(self._buffer)
+        return payload.decode("utf-8", errors="replace")
+
+    def finish(self, timeout: float = 3.0) -> str:
+        self._thread.join(timeout=timeout)
+        return self.text()
 
 
 def ffmpeg_executable() -> str:
@@ -428,13 +468,26 @@ class VideoDecoder:
         source_fps: float | None = None,
         exact_frame_seek: bool = False,
         output_size: tuple[int, int] | None = None,
+        decoder_threads: int = 2,
+        source_bit_depth: int | None = None,
     ):
         self.camera = camera
         self.width, self.height = output_size or (camera.width, camera.height)
         if self.width < 1 or self.height < 1:
             raise ValueError("decoder output size must be positive")
-        self.frame_bytes = self.width * self.height * 3 * 2
+        if decoder_threads < 1:
+            raise ValueError("decoder_threads must be positive")
+        self._decode_low_bit_depth = (
+            source_bit_depth is not None and source_bit_depth <= 8
+        )
+        bytes_per_channel = 1 if self._decode_low_bit_depth else 2
+        self.frame_bytes = self.width * self.height * 3 * bytes_per_channel
         self._buffer = bytearray(self.frame_bytes)
+        self._expanded_buffer = (
+            np.empty((self.height, self.width, 3), dtype=np.uint16)
+            if self._decode_low_bit_depth
+            else None
+        )
         if start_frame < 0:
             raise ValueError("decoder start_frame cannot be negative")
         if start_time is not None and start_time < 0.0:
@@ -449,6 +502,17 @@ class VideoDecoder:
             "-hide_banner",
             "-loglevel",
             "error",
+            # Five simultaneous 6K decoders using FFmpeg's automatic thread
+            # count can retain several gigabytes of reference frames. A small
+            # per-camera cap keeps renderer memory bounded while cameras still
+            # decode concurrently.
+            "-threads",
+            str(decoder_threads),
+            # libswscale otherwise creates a CPU-sized filter pool in every
+            # camera process. At 6K RGB48 each worker can retain a full frame,
+            # multiplying RSS by several gigabytes across five cameras.
+            "-filter_threads",
+            "1",
         ]
         if seek_time > 0.0 and not exact_frame_seek:
             # Input-side accurate seeking jumps to the nearest keyframe and then
@@ -482,28 +546,74 @@ class VideoDecoder:
             filters.append(scale)
         if filters:
             command.extend(["-vf", ",".join(filters)])
-        command.extend(["-f", "rawvideo", "-pix_fmt", "rgb48le", "pipe:1"])
+        command.extend(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24" if self._decode_low_bit_depth else "rgb48le",
+                "pipe:1",
+            ]
+        )
         self.process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=8 * 1024 * 1024,
         )
+        assert self.process.stderr is not None
+        self._stderr = _BoundedPipeReader(self.process.stderr)
+        self._closed = False
 
     def read(self, *, copy: bool = True) -> np.ndarray | None:
         assert self.process.stdout is not None
         if not _read_exact(self.process.stdout, self._buffer):
             return None
+        if self._decode_low_bit_depth:
+            frame8 = np.frombuffer(self._buffer, dtype=np.uint8).reshape(
+                self.height, self.width, 3
+            )
+            assert self._expanded_buffer is not None
+            np.multiply(
+                frame8,
+                257,
+                out=self._expanded_buffer,
+                dtype=np.uint16,
+                casting="unsafe",
+            )
+            return self._expanded_buffer.copy() if copy else self._expanded_buffer
         frame = np.frombuffer(self._buffer, dtype="<u2").reshape(
             self.height, self.width, 3
         )
         return frame.copy() if copy else frame
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # A prefetch worker may currently be blocked in stdout.readinto().
+        # Stop FFmpeg first so that read returns EOF; closing the buffered pipe
+        # first can deadlock on its internal lock while that read is active.
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=3)
         if self.process.stdout:
-            self.process.stdout.close()
-        self.process.terminate()
-        self.process.wait(timeout=10)
+            try:
+                self.process.stdout.close()
+            except OSError:
+                pass
+        stderr_reader = getattr(self, "_stderr", None)
+        if stderr_reader is not None:
+            stderr_reader.finish()
+        if self.process.stderr:
+            try:
+                self.process.stderr.close()
+            except OSError:
+                pass
 
 
 def _metadata_args(video: Video) -> list[str]:
@@ -561,7 +671,10 @@ class VideoEncoder:
         width: int,
         height: int,
         video: Video,
+        encoder_threads: int = 2,
     ):
+        if encoder_threads < 1:
+            raise ValueError("encoder_threads must be positive")
         if video.output_codec == "hevc-444-10" and width * height > 35_651_584:
             raise ValueError(
                 "hevc-444-10 output exceeds the largest standard HEVC picture level; "
@@ -572,6 +685,8 @@ class VideoEncoder:
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-filter_threads",
+            "1",
             "-y",
             "-f",
             "rawvideo",
@@ -666,6 +781,7 @@ class VideoEncoder:
             )
         else:
             raise ValueError(f"unsupported output codec: {video.output_codec}")
+        command.extend(["-threads", str(encoder_threads)])
         command.extend(_metadata_args(video))
         if video.output_codec.startswith("prores"):
             command.extend(["-movflags", "+write_colr"])
@@ -676,6 +792,8 @@ class VideoEncoder:
             stderr=subprocess.PIPE,
             bufsize=8 * 1024 * 1024,
         )
+        assert self.process.stderr is not None
+        self._stderr = _BoundedPipeReader(self.process.stderr)
 
     def write(self, frame: np.ndarray) -> None:
         assert self.process.stdin is not None
@@ -692,8 +810,10 @@ class VideoEncoder:
             self.process.stdin.close()
         except BrokenPipeError:
             pass
-        stderr = self.process.stderr.read().decode("utf-8", errors="replace") if self.process.stderr else ""
         return_code = self.process.wait()
+        stderr = self._stderr.finish()
+        if self.process.stderr:
+            self.process.stderr.close()
         if return_code:
             raise OSError(f"ffmpeg encode failed ({return_code}): {stderr}")
 
@@ -752,6 +872,8 @@ class DpxSequenceEncoder:
             stderr=subprocess.PIPE,
             bufsize=8 * 1024 * 1024,
         )
+        assert self.process.stderr is not None
+        self._stderr = _BoundedPipeReader(self.process.stderr)
 
     def write(self, frame: np.ndarray) -> None:
         expected = (self.height, self.width, 3)
@@ -768,12 +890,10 @@ class DpxSequenceEncoder:
             self.process.stdin.close()
         except BrokenPipeError:
             pass
-        stderr = (
-            self.process.stderr.read().decode("utf-8", errors="replace")
-            if self.process.stderr
-            else ""
-        )
         return_code = self.process.wait()
+        stderr = self._stderr.finish()
+        if self.process.stderr:
+            self.process.stderr.close()
         if return_code:
             raise OSError(f"ffmpeg DPX encode failed ({return_code}): {stderr}")
         manifest = {

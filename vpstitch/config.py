@@ -24,6 +24,22 @@ OUTPUT_CODECS = {
 }
 
 
+def repair_legacy_p3_pq_target(
+    color: dict[str, Any], video: dict[str, Any]
+) -> bool:
+    """Repair configs written when Apple EDR was incorrectly tagged as PQ."""
+    if (
+        color.get("output_mode") == "display_view"
+        and color.get("display") == "Display P3 HDR - Display"
+        and "hdr" in str(color.get("view") or "").casefold()
+        and "p3" in str(color.get("view") or "").casefold()
+        and video.get("color_trc") == "smpte2084"
+    ):
+        color["display"] = "ST2084-P3-D65 - Display"
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class Lens:
     model: str
@@ -48,6 +64,15 @@ class Camera:
     frame_offset: int = 0
     input_color_space: str | None = None
     input_video_range: str | None = None
+    scale: float = 1.0
+    crop_left: float = 0.0
+    crop_right: float = 0.0
+    crop_top: float = 0.0
+    crop_bottom: float = 0.0
+    feather_left_deg: float | None = None
+    feather_right_deg: float | None = None
+    color_gain: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    color_match_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,13 @@ class Color:
     ocio_config: str | None = None
     working_space: str | None = None
     output_space: str | None = None
+    output_mode: str = "colorspace"
+    display: str | None = None
+    view: str | None = None
+    match_enabled: bool = False
+    match_reference: str | None = None
+    match_strength: float = 1.0
+    preserve_luminance: bool = True
     integer_dither: bool = True
     dither_seed: int = 7349
 
@@ -141,7 +173,11 @@ def _camera(raw: dict[str, Any]) -> Camera:
     input_video_range = raw.get("input_video_range")
     if input_video_range not in {None, "tv", "pc"}:
         raise ConfigError("camera.input_video_range must be tv, pc, or null")
-    return Camera(
+    color_gain = tuple(float(value) for value in raw.get("color_gain", (1.0, 1.0, 1.0)))
+    if len(color_gain) != 3:
+        raise ConfigError("camera.color_gain must contain exactly three values")
+    color_match_confidence = raw.get("color_match_confidence")
+    camera = Camera(
         name=str(raw["name"]),
         width=int(raw["width"]),
         height=int(raw["height"]),
@@ -153,7 +189,53 @@ def _camera(raw: dict[str, Any]) -> Camera:
         frame_offset=int(raw.get("frame_offset", 0)),
         input_color_space=input_color_space,
         input_video_range=input_video_range,
+        scale=float(raw.get("scale", 1.0)),
+        crop_left=float(raw.get("crop_left", 0.0)),
+        crop_right=float(raw.get("crop_right", 0.0)),
+        crop_top=float(raw.get("crop_top", 0.0)),
+        crop_bottom=float(raw.get("crop_bottom", 0.0)),
+        feather_left_deg=(
+            None
+            if raw.get("feather_left_deg") is None
+            else float(raw["feather_left_deg"])
+        ),
+        feather_right_deg=(
+            None
+            if raw.get("feather_right_deg") is None
+            else float(raw["feather_right_deg"])
+        ),
+        color_gain=color_gain,  # type: ignore[arg-type]
+        color_match_confidence=(
+            None
+            if color_match_confidence is None
+            else float(color_match_confidence)
+        ),
     )
+    if not 0.1 <= camera.scale <= 4.0:
+        raise ConfigError("camera.scale must be between 0.1 and 4.0")
+    crops = (
+        camera.crop_left,
+        camera.crop_right,
+        camera.crop_top,
+        camera.crop_bottom,
+    )
+    if any(value < 0.0 or value >= 1.0 for value in crops):
+        raise ConfigError("camera crop values must be between 0 and 1")
+    if camera.crop_left + camera.crop_right >= 1.0:
+        raise ConfigError("camera horizontal crops must leave visible pixels")
+    if camera.crop_top + camera.crop_bottom >= 1.0:
+        raise ConfigError("camera vertical crops must leave visible pixels")
+    for value in (camera.feather_left_deg, camera.feather_right_deg):
+        if value is not None and not 0.05 <= value <= 30.0:
+            raise ConfigError("camera feather values must be between 0.05 and 30 degrees")
+    if any(not 0.25 <= value <= 4.0 for value in camera.color_gain):
+        raise ConfigError("camera.color_gain values must be between 0.25 and 4.0")
+    if (
+        camera.color_match_confidence is not None
+        and not 0.0 <= camera.color_match_confidence <= 1.0
+    ):
+        raise ConfigError("camera.color_match_confidence must be between 0 and 1")
+    return camera
 
 
 def load_config(path: str | Path) -> RigConfig:
@@ -192,23 +274,38 @@ def load_config(path: str | Path) -> RigConfig:
         raise ConfigError("tile dimensions must be at least 32 pixels")
 
     color_raw = _expect_dict(root.get("color", {}), "color")
+    video_raw = root.get("video")
+    repair_legacy_p3_pq_target(
+        color_raw,
+        video_raw if isinstance(video_raw, dict) else {},
+    )
     color = Color(**color_raw)
     if color.mode not in {"passthrough", "ocio"}:
         raise ConfigError("color.mode must be 'passthrough' or 'ocio'")
     if color.mode == "ocio":
-        missing = [
-            name
-            for name, value in {
-                "ocio_config": color.ocio_config,
-                "working_space": color.working_space,
-                "output_space": color.output_space,
-            }.items()
-            if not value
-        ]
+        if color.output_mode not in {"colorspace", "display_view"}:
+            raise ConfigError("color.output_mode must be 'colorspace' or 'display_view'")
+        required = {
+            "ocio_config": color.ocio_config,
+            "working_space": color.working_space,
+        }
+        if color.output_mode == "display_view":
+            required.update({"display": color.display, "view": color.view})
+        else:
+            required["output_space"] = color.output_space
+        missing = [name for name, value in required.items() if not value]
         if missing:
             raise ConfigError(f"OCIO mode requires: {', '.join(missing)}")
         if any(not camera.colorspace for camera in cameras):
             raise ConfigError("OCIO mode requires colorspace on every camera")
+    if not 0.0 <= color.match_strength <= 1.0:
+        raise ConfigError("color.match_strength must be between 0 and 1")
+    if color.match_enabled and color.mode != "ocio":
+        raise ConfigError("camera color matching requires OCIO mode")
+    if color.match_reference is not None and color.match_reference not in {
+        camera.name for camera in cameras
+    }:
+        raise ConfigError("color.match_reference must name a configured camera")
 
     flow_raw = _expect_dict(root.get("flow", {}), "flow")
     flow = Flow(**flow_raw)
@@ -219,7 +316,6 @@ def load_config(path: str | Path) -> RigConfig:
     if not 0.0 <= flow.confidence_threshold <= 1.0:
         raise ConfigError("flow.confidence_threshold must be between 0 and 1")
 
-    video_raw = root.get("video")
     video = None if video_raw is None else Video(**_expect_dict(video_raw, "video"))
     if video is not None:
         if video.fps <= 0.0:

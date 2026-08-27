@@ -52,6 +52,28 @@ Post-fix evidence shows no clipped labels or values at 1298 × 768 or 1487 × 10
 
 final result: passed
 
+## OCIO Output / Manual Slot Assignment Follow-up
+
+- Date: 2026-08-26
+- User reference: `/var/folders/zt/p0f5n5t1775dvq_fzxrh7r6m0000gn/T/TemporaryItems/NSIRD_screencaptureui_XtMIm5/스크린샷 2026-08-26 오전 7.19.24.png`
+- Implementation screenshot: `audit/latest-color-ui.png`
+- Manual assignment dialog: `audit/camera-assignment-dialog.png`
+- Viewport: 1512 × 982 px
+- State: real five-camera project, active COLOR Inspector, aligned 12-frame playback range.
+
+### Findings
+
+- Output Transform is now in the main PIPELINE group immediately after Input Transform and Working Space; no lower hidden delivery section is required.
+- A thin divider separates source/working transforms from output controls. Media Pool and Plate Sets retain distinct bordered cards, tree dividers, and visible splitter handles.
+- The Inspector has a 360 px minimum width, so `Output transform` and all controls remain visible without clipping at the audited viewport. The center viewer remains the dominant region.
+- OCIO values are list-only dropdowns. The invalid saved value `sRGB - Displayㄴ` visibly resolves to `sRGB - Display` before preview or render configuration is collected.
+- Arbitrary filenames use a compact three- or five-row slot dialog labeled with physical P01–P05 or P06–P08 positions. Duplicate clip assignment disables confirmation.
+- The actual five-source playback path generated a 960×264 H.264 proxy for 12 frames after OCIO recovery. The GUI and project snapshot both retained the corrected output transform.
+
+No P0, P1, or P2 visual issue remains in the inspected states. Native Computer Use capture remains unavailable because the macOS accessibility crash-suppression shim intentionally blocks external AX enumeration; the packaged app was visually verified from an offscreen Qt render at the same production layout size.
+
+final result: passed
+
 ## Stability / Timeline Follow-up
 
 - Date: 2026-08-24

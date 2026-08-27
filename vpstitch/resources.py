@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from math import ceil
 
 from .config import RigConfig
+from .renderflow import DEFAULT_PREFETCH_MAX_BYTES
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,8 @@ class ResourceEstimate:
     uncompressed_sequence_bytes_per_minute: int | None
     estimated_peak_working_bytes: int
     recommended_free_memory_bytes: int
+    decode_prefetch_extra_bytes: int
+    decode_prefetch_recommended: bool
     notes: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -50,14 +53,21 @@ def estimate_resources(config: RigConfig) -> ResourceEstimate:
     # Warps, weights, masks, flow fields, blend accumulator, and OCIO output.
     tile_scratch = tile_pixels * (cameras * (3 * 4 + 4 + 1) + 40)
 
-    # Reserve one decoded frame plus a second frame's worth for codec internals,
-    # the disk-backed destination, and one encoder-side raw frame.
-    peak = input_frame * 2 + output_frame * 2 + tile_scratch
+    # Five concurrent high-resolution FFmpeg decoders and the encoder retain
+    # native reference/filter frames beyond the Python-owned source and output
+    # buffers. These conservative factors come from 5x6K -> 20K process-tree
+    # measurements and intentionally overestimate low-bit-depth inputs.
+    runtime_overhead = 2 * 2**30
+    peak = input_frame * 7 + output_frame * 3 + tile_scratch + runtime_overhead
+    prefetch_recommended = input_frame <= DEFAULT_PREFETCH_MAX_BYTES
+    if prefetch_recommended:
+        peak += input_frame
     if config.color.mode == "ocio":
         peak += camera_pixels * 3 * 4
-    # Keep headroom for the OS, Python/OpenCV, and codec-dependent FFmpeg
-    # reference frames that are not visible to this static estimate.
-    recommended = int(ceil((peak * 1.5 + 4 * 2**30) / 2**30) * 2**30)
+    # Keep four GiB beyond the measured working set, then round up in 2 GiB
+    # increments so borderline machines receive a clear warning.
+    memory_step = 2 * 2**30
+    recommended = int(ceil((peak * 1.25 + 4 * 2**30) / memory_step) * memory_step)
 
     sequence_per_minute = None
     if config.video is not None:
@@ -66,7 +76,13 @@ def estimate_resources(config: RigConfig) -> ResourceEstimate:
         "Projection cache size is independent of clip duration.",
         "The sequence figure is an uncompressed RGB-equivalent worst-case size.",
         "FFV1/ProRes sizes depend on image content and cannot be predicted exactly.",
+        "Peak memory includes concurrent FFmpeg decoder and encoder working sets.",
     ]
+    notes.append(
+        "Decode prefetch is enabled because one copied camera bundle fits the safe budget."
+        if prefetch_recommended
+        else "Decode prefetch is disabled to avoid duplicating a high-resolution camera bundle."
+    )
     if config.video and config.video.output_codec == "hevc-444-10":
         notes.append("HEVC is intended for delivery, not the preservation master.")
     if config.color.mode == "ocio":
@@ -78,5 +94,7 @@ def estimate_resources(config: RigConfig) -> ResourceEstimate:
         uncompressed_sequence_bytes_per_minute=sequence_per_minute,
         estimated_peak_working_bytes=peak,
         recommended_free_memory_bytes=recommended,
+        decode_prefetch_extra_bytes=input_frame if prefetch_recommended else 0,
+        decode_prefetch_recommended=prefetch_recommended,
         notes=tuple(notes),
     )

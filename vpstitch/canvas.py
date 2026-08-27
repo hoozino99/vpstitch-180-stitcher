@@ -43,14 +43,18 @@ def _align_up(value: float, alignment: int) -> int:
 
 def _camera_boundary(camera: Camera, samples_per_edge: int) -> np.ndarray:
     lens = camera.lens
-    xs = np.linspace(0.0, camera.width - 1.001, samples_per_edge)
-    ys = np.linspace(0.0, camera.height - 1.001, samples_per_edge)
+    x_min = camera.crop_left * camera.width
+    x_max = (1.0 - camera.crop_right) * camera.width - 1.001
+    y_min = camera.crop_top * camera.height
+    y_max = (1.0 - camera.crop_bottom) * camera.height - 1.001
+    xs = np.linspace(x_min, x_max, samples_per_edge)
+    ys = np.linspace(y_min, y_max, samples_per_edge)
     rectangle = np.concatenate(
         [
-            np.stack([xs, np.zeros_like(xs)], axis=-1),
-            np.stack([xs, np.full_like(xs, camera.height - 1.001)], axis=-1),
-            np.stack([np.zeros_like(ys), ys], axis=-1),
-            np.stack([np.full_like(ys, camera.width - 1.001), ys], axis=-1),
+            np.stack([xs, np.full_like(xs, y_min)], axis=-1),
+            np.stack([xs, np.full_like(xs, y_max)], axis=-1),
+            np.stack([np.full_like(ys, x_min), ys], axis=-1),
+            np.stack([np.full_like(ys, x_max), ys], axis=-1),
         ]
     )
     if lens.circle_radius is not None:
@@ -63,24 +67,24 @@ def _camera_boundary(camera: Camera, samples_per_edge: int) -> np.ndarray:
             axis=-1,
         )
         points = np.concatenate([rectangle, circle])
-        inside_frame = (
-            (points[:, 0] >= 0.0)
-            & (points[:, 0] <= camera.width - 1.001)
-            & (points[:, 1] >= 0.0)
-            & (points[:, 1] <= camera.height - 1.001)
+        inside_crop = (
+            (points[:, 0] >= x_min)
+            & (points[:, 0] <= x_max)
+            & (points[:, 1] >= y_min)
+            & (points[:, 1] <= y_max)
         )
         inside_circle = (
             (points[:, 0] - lens.cx) ** 2 + (points[:, 1] - lens.cy) ** 2
             <= lens.circle_radius**2 + 1e-6
         )
-        points = points[inside_frame & inside_circle]
+        points = points[inside_crop & inside_circle]
     else:
         points = rectangle
 
     matrix = np.array(
         [
-            [lens.fx, 0.0, lens.cx],
-            [0.0, lens.fy, lens.cy],
+            [lens.fx * camera.scale, 0.0, lens.cx],
+            [0.0, lens.fy * camera.scale, lens.cy],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
@@ -94,7 +98,10 @@ def _camera_boundary(camera: Camera, samples_per_edge: int) -> np.ndarray:
 
     # Invert the exact equidistant polynomial used by geometry.camera_map.
     distorted = np.column_stack(
-        [(points[:, 0] - lens.cx) / lens.fx, (points[:, 1] - lens.cy) / lens.fy]
+        [
+            (points[:, 0] - lens.cx) / (lens.fx * camera.scale),
+            (points[:, 1] - lens.cy) / (lens.fy * camera.scale),
+        ]
     )
     radius = np.linalg.norm(distorted, axis=1)
     theta = np.minimum(radius, np.pi - 1e-7)

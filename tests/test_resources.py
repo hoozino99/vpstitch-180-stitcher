@@ -13,4 +13,7 @@ def test_20k_resource_estimate_counts_exact_frame_and_map_sizes() -> None:
     assert report.output_frame_bytes == 20000 * 6000 * 3 * 2
     assert report.projection_cache_bytes == 20000 * 6000 * 5 * 2 * 4
     assert report.recommended_free_memory_bytes >= report.estimated_peak_working_bytes
+    assert report.recommended_free_memory_bytes >= 16 * 2**30
     assert report.uncompressed_sequence_bytes_per_minute is not None
+    assert not report.decode_prefetch_recommended
+    assert report.decode_prefetch_extra_bytes == 0

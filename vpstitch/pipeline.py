@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable
 
+import cv2
 import numpy as np
 
 from .blend import weighted_blend
 from .color import ColorPipeline, quantize_u16
+from .compute import RemapBackendDecision, select_remap_backend
 from .config import RigConfig
 from .geometry import (
     camera_map,
@@ -22,6 +25,20 @@ from .mapcache import MapCache
 
 
 Progress = Callable[[int, int], None]
+DEFAULT_OPENCL_SOURCE_BUDGET = 512 * 1024 * 1024
+
+
+def _opencl_source_budget() -> int:
+    default_megabytes = DEFAULT_OPENCL_SOURCE_BUDGET // (1024 * 1024)
+    try:
+        megabytes = int(
+            os.environ.get(
+                "VPSTITCH_OPENCL_SOURCE_BUDGET_MB", str(default_megabytes)
+            )
+        )
+    except ValueError:
+        megabytes = default_megabytes
+    return max(64, megabytes) * 1024 * 1024
 
 
 class Stitcher:
@@ -29,8 +46,17 @@ class Stitcher:
         self.config = config
         self.map_cache = map_cache
         self.color = ColorPipeline(
-            config.color, [camera.colorspace for camera in config.cameras]
+            config.color,
+            [camera.colorspace for camera in config.cameras],
+            [camera.color_gain for camera in config.cameras],
         )
+        self.hardware_accelerated = False
+        self.backend_decision = RemapBackendDecision(
+            "cpu", "waiting for representative final-render tile"
+        )
+        self._backend_profile: tuple[object, ...] | None = None
+        self._camera_backend_decisions: dict[int, RemapBackendDecision] = {}
+        self._backend_rejected = False
 
     def stitch_arrays(
         self,
@@ -66,6 +92,16 @@ class Stitcher:
             working_sources = sources
 
         total = tile_count(self.config.output)
+        gpu_sources: list[cv2.UMat] = []
+        if self.hardware_accelerated:
+            try:
+                gpu_sources = [cv2.UMat(source) for source in working_sources]
+            except (cv2.error, MemoryError) as error:
+                self.hardware_accelerated = False
+                self._backend_rejected = True
+                self.backend_decision = RemapBackendDecision(
+                    "cpu", f"OpenCL source upload failed; CPU fallback: {error}"
+                )
         for number, tile in enumerate(iter_tiles(self.config.output), start=1):
             # DIS needs surrounding context to avoid a discontinuity at every
             # processing-tile boundary. Render a halo and retain only the core.
@@ -95,7 +131,99 @@ class Stitcher:
             for index, (source, mapping) in enumerate(
                 zip(working_sources, maps, strict=True)
             ):
-                mapped = remap_camera(source, mapping[0], mapping[1])
+                backend_profile = (
+                    source.shape,
+                    source.dtype.str,
+                    render_tile.width,
+                    render_tile.height,
+                    len(self.config.cameras),
+                )
+                if (
+                    not self.hardware_accelerated
+                    and not self._backend_rejected
+                    and index not in self._camera_backend_decisions
+                    and np.count_nonzero(mapping[2]) >= 1024
+                ):
+                    source_bytes = sum(item.nbytes for item in working_sources)
+                    source_budget = _opencl_source_budget()
+                    if source_bytes > source_budget:
+                        self.backend_decision = RemapBackendDecision(
+                            "cpu",
+                            "aggregate OpenCL source uploads exceed "
+                            f"the {source_budget // (1024 * 1024)} MiB budget",
+                        )
+                        self._backend_rejected = True
+                        self._backend_profile = backend_profile
+                    else:
+                        decision = select_remap_backend(
+                            source,
+                            mapping[0],
+                            mapping[1],
+                            interpolation=cv2.INTER_LANCZOS4,
+                            source_reuse_count=max(1, total),
+                            maps_reused=False,
+                            max_probe_source_bytes=source_budget,
+                            min_speedup=0.10,
+                            max_normalized_error=2.0 / 65535.0,
+                            mean_normalized_error=0.25 / 65535.0,
+                            max_absolute_error=2.0 / 65535.0,
+                        )
+                        self._camera_backend_decisions[index] = decision
+                        if decision.backend != "opencl":
+                            self.backend_decision = RemapBackendDecision(
+                                "cpu",
+                                f"camera {index + 1}: {decision.reason}",
+                                cpu_seconds=decision.cpu_seconds,
+                                opencl_seconds=decision.opencl_seconds,
+                                max_normalized_error=decision.max_normalized_error,
+                                mean_normalized_error=decision.mean_normalized_error,
+                                max_absolute_error=decision.max_absolute_error,
+                            )
+                            self._backend_rejected = True
+                            self._backend_profile = backend_profile
+                        elif len(self._camera_backend_decisions) == len(
+                            working_sources
+                        ):
+                            try:
+                                gpu_sources = [
+                                    cv2.UMat(working_source)
+                                    for working_source in working_sources
+                                ]
+                                self.hardware_accelerated = True
+                                self.backend_decision = RemapBackendDecision(
+                                    "opencl",
+                                    "every camera passed measured speed and quality checks",
+                                )
+                                self._backend_profile = backend_profile
+                            except (cv2.error, MemoryError) as error:
+                                self.hardware_accelerated = False
+                                self._backend_rejected = True
+                                self.backend_decision = RemapBackendDecision(
+                                    "cpu",
+                                    f"OpenCL source upload failed; CPU fallback: {error}",
+                                )
+                if self.hardware_accelerated:
+                    try:
+                        mapped = cv2.remap(
+                            gpu_sources[index],
+                            cv2.UMat(mapping[0]),
+                            cv2.UMat(mapping[1]),
+                            interpolation=cv2.INTER_LANCZOS4,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0,
+                        ).get()
+                    except (cv2.error, MemoryError) as error:
+                        # Preserve the authoritative render: permanently demote
+                        # this Stitcher and rerun the current map on CPU.
+                        self.hardware_accelerated = False
+                        self._backend_rejected = True
+                        gpu_sources.clear()
+                        self.backend_decision = RemapBackendDecision(
+                            "cpu", f"OpenCL remap failed; CPU fallback: {error}"
+                        )
+                        mapped = remap_camera(source, mapping[0], mapping[1])
+                else:
+                    mapped = remap_camera(source, mapping[0], mapping[1])
                 warped.append(
                     mapped
                     if self.config.color.mode == "ocio"
