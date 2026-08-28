@@ -505,6 +505,9 @@ class ProjectStore:
         self._bins = list(bins)
         self._media = list(media)
         self._timelines = list(timelines)
+        self.change_listener: (
+            Callable[[dict[str, Any], dict[str, Any]], None] | None
+        ) = None
         self._validate()
 
     @classmethod
@@ -592,11 +595,19 @@ class ProjectStore:
         old_bins = list(self._bins)
         old_media = list(self._media)
         old_timelines = list(self._timelines)
+        before = self.to_dict() if self.change_listener is not None else None
         try:
             result = operation()
             self._validate()
             if self.autosave:
                 self.save()
+            if self.change_listener is not None and before is not None:
+                try:
+                    self.change_listener(before, self.to_dict())
+                except Exception:
+                    # Project persistence must not fail because an optional UI
+                    # observer (for example undo history) could not refresh.
+                    pass
             return result
         except Exception:
             self.settings = old_settings
@@ -1004,12 +1015,15 @@ class ProjectStore:
         return target
 
     @classmethod
-    def load(cls, path: str | PurePath, *, autosave: bool = True) -> ProjectStore:
+    def from_dict(
+        cls,
+        path: str | PurePath,
+        payload: Mapping[str, Any],
+        *,
+        autosave: bool = True,
+    ) -> ProjectStore:
+        """Build a validated store from an in-memory project snapshot."""
         store_path = Path(path)
-        try:
-            payload = json.loads(store_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ProjectError(f"cannot load project {store_path}: {exc}") from exc
         if not isinstance(payload, Mapping):
             raise ProjectError("project root must be an object")
         version = payload.get("version")
@@ -1056,3 +1070,12 @@ class ProjectStore:
             loaded_timelines,
             autosave=autosave,
         )
+
+    @classmethod
+    def load(cls, path: str | PurePath, *, autosave: bool = True) -> ProjectStore:
+        store_path = Path(path)
+        try:
+            payload = json.loads(store_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError(f"cannot load project {store_path}: {exc}") from exc
+        return cls.from_dict(store_path, payload, autosave=autosave)

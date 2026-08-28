@@ -135,6 +135,7 @@ VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
 AUTOSAVE_INTERVAL_MS = 10 * 60 * 1000
 _MEDIA_BIN_UNSET = object()
+TIMELINE_CLIPBOARD_MIME = "application/x-vpstitch-timeline"
 FPS_MODE_MATCH_SOURCE = "match_source"
 FPS_MODE_CUSTOM = "custom"
 FPS_MATCH_TOLERANCE = 0.001
@@ -2334,12 +2335,27 @@ class MainWindow(QMainWindow):
         )
         self._auto_workflows_enabled = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
         self._last_autosave_digest: str | None = None
+        self._project_undo_stack: list[
+            tuple[dict[str, object], str | None, str | None]
+        ] = []
+        self._project_redo_stack: list[
+            tuple[dict[str, object], str | None, str | None]
+        ] = []
+        self._pending_project_undo: (
+            tuple[dict[str, object], str | None, str | None] | None
+        ) = None
+        self._restoring_project_snapshot = False
+        self._undo_capture_timer = QTimer(self)
+        self._undo_capture_timer.setSingleShot(True)
+        self._undo_capture_timer.setInterval(350)
+        self._undo_capture_timer.timeout.connect(self._flush_pending_project_undo)
         self._fullscreen_preview: QDialog | None = None
         self._fullscreen_video: PlaybackVideoWidget | None = None
         self._reverse_timer = QTimer(self)
         self._reverse_timer.setInterval(42)
         self._reverse_timer.timeout.connect(self._reverse_tick)
         self.project_store = self._open_project_store(project_path)
+        self.project_store.change_listener = self._project_store_changed
         project_directory = self.project_store.path.parent
         self._working_dir = project_directory / "work"
         self._cache_dir = project_directory / "cache"
@@ -2382,6 +2398,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Ready · Quick Preview uses one 2K frame; final render stays full resolution"
         )
+        self._clear_project_history()
 
     def _open_project_store(self, project_path: Path | None) -> ProjectStore:
         testing = bool(os.environ.get("PYTEST_CURRENT_TEST"))
@@ -3004,15 +3021,83 @@ class MainWindow(QMainWindow):
             menu.addAction(item)
             return item
 
+        def standard_action(
+            menu,
+            text: str,
+            callback: Callable[[], None],
+            standard_key: QKeySequence.StandardKey,
+            ctrl_fallback: str,
+        ) -> QAction:
+            item = action(menu, text, callback)
+            shortcuts = list(QKeySequence.keyBindings(standard_key))
+            shortcuts.append(QKeySequence(ctrl_fallback))
+            unique: dict[str, QKeySequence] = {}
+            for shortcut in shortcuts:
+                unique[shortcut.toString(QKeySequence.SequenceFormat.PortableText)] = shortcut
+            item.setShortcuts(list(unique.values()))
+            item.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            return item
+
         file_menu = bar.addMenu("File")
         action(file_menu, "New Project…", self.new_project)
         action(file_menu, "Open Project…", self.open_project)
         file_menu.addSeparator()
         action(file_menu, "Import Media…", self.choose_videos)
+        self.save_project_action = standard_action(
+            file_menu,
+            "Save Project",
+            self.save_project,
+            QKeySequence.StandardKey.Save,
+            "Ctrl+S",
+        )
         file_menu.addSeparator()
         action(file_menu, "Quit", self.close)
 
         edit_menu = bar.addMenu("Edit")
+        self.undo_action = standard_action(
+            edit_menu,
+            "Undo",
+            lambda: self._dispatch_edit_command("undo"),
+            QKeySequence.StandardKey.Undo,
+            "Ctrl+Z",
+        )
+        self.redo_action = standard_action(
+            edit_menu,
+            "Redo",
+            lambda: self._dispatch_edit_command("redo"),
+            QKeySequence.StandardKey.Redo,
+            "Ctrl+Shift+Z",
+        )
+        edit_menu.addSeparator()
+        self.cut_action = standard_action(
+            edit_menu,
+            "Cut",
+            lambda: self._dispatch_edit_command("cut"),
+            QKeySequence.StandardKey.Cut,
+            "Ctrl+X",
+        )
+        self.copy_action = standard_action(
+            edit_menu,
+            "Copy",
+            lambda: self._dispatch_edit_command("copy"),
+            QKeySequence.StandardKey.Copy,
+            "Ctrl+C",
+        )
+        self.paste_action = standard_action(
+            edit_menu,
+            "Paste",
+            lambda: self._dispatch_edit_command("paste"),
+            QKeySequence.StandardKey.Paste,
+            "Ctrl+V",
+        )
+        self.select_all_action = standard_action(
+            edit_menu,
+            "Select All",
+            lambda: self._dispatch_edit_command("select-all"),
+            QKeySequence.StandardKey.SelectAll,
+            "Ctrl+A",
+        )
+        edit_menu.addSeparator()
         action(edit_menu, "New Folder…", self.create_media_bin)
         action(edit_menu, "Rename Selected…", self.rename_focused_item)
         action(edit_menu, "Delete Selected…", self.delete_focused_item)
@@ -3065,6 +3150,372 @@ class MainWindow(QMainWindow):
 
         help_menu = bar.addMenu("Help")
         action(help_menu, "Keyboard Shortcuts", self.show_shortcuts)
+        self._update_edit_action_state()
+
+    @staticmethod
+    def _editable_project_payload(payload: dict[str, object]) -> dict[str, object]:
+        """Remove generated cache state that should never create an undo step."""
+        editable = json.loads(json.dumps(payload))
+        for media in editable.get("media", []):
+            if isinstance(media, dict):
+                for key in (
+                    "source_cache_path",
+                    "source_cache_status",
+                    "source_cache_error",
+                ):
+                    media.pop(key, None)
+        for timeline in editable.get("timelines", []):
+            if isinstance(timeline, dict):
+                for key in (
+                    "playback_cache_path",
+                    "playback_cache_status",
+                    "stitch_status",
+                    "updated_at",
+                ):
+                    timeline.pop(key, None)
+        return editable
+
+    def _project_store_changed(
+        self,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> None:
+        if self._restoring_project_snapshot:
+            return
+        if self._editable_project_payload(before) == self._editable_project_payload(after):
+            return
+        if self._pending_project_undo is None:
+            self._pending_project_undo = (
+                json.loads(json.dumps(before)),
+                self._active_timeline_id,
+                self._active_bin_id,
+            )
+        self._undo_capture_timer.start()
+        self._project_redo_stack.clear()
+        self._update_edit_action_state()
+
+    def _flush_pending_project_undo(self) -> None:
+        pending = self._pending_project_undo
+        self._pending_project_undo = None
+        if pending is None:
+            self._update_edit_action_state()
+            return
+        current = self.project_store.to_dict()
+        if self._editable_project_payload(pending[0]) == self._editable_project_payload(current):
+            self._update_edit_action_state()
+            return
+        if not self._project_undo_stack or (
+            self._editable_project_payload(self._project_undo_stack[-1][0])
+            != self._editable_project_payload(pending[0])
+        ):
+            self._project_undo_stack.append(pending)
+            del self._project_undo_stack[:-64]
+        self._update_edit_action_state()
+
+    def _clear_project_history(self) -> None:
+        self._undo_capture_timer.stop()
+        self._pending_project_undo = None
+        self._project_undo_stack.clear()
+        self._project_redo_stack.clear()
+        self._update_edit_action_state()
+
+    def _update_edit_action_state(self) -> None:
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(
+                self._pending_project_undo is not None or bool(self._project_undo_stack)
+            )
+        if hasattr(self, "redo_action"):
+            self.redo_action.setEnabled(bool(self._project_redo_stack))
+
+    def _current_project_snapshot(
+        self,
+    ) -> tuple[dict[str, object], str | None, str | None]:
+        return (
+            json.loads(json.dumps(self.project_store.to_dict())),
+            self._active_timeline_id,
+            self._active_bin_id,
+        )
+
+    def _restore_project_snapshot(
+        self,
+        snapshot: tuple[dict[str, object], str | None, str | None],
+        *,
+        verb: str,
+    ) -> bool:
+        if self.process is not None:
+            self.statusBar().showMessage(
+                f"Finish {self._process_task_name or 'the current task'} before {verb.lower()}",
+                7000,
+            )
+            return False
+        payload, timeline_id, bin_id = snapshot
+        self._restoring_project_snapshot = True
+        try:
+            self._live_preview_timer.stop()
+            self._playback_warmup_timer.stop()
+            self._live_preview_pending = False
+            self._live_preview_revision += 1
+            self.project_store.change_listener = None
+            self._cancel_source_proxy_items()
+            self._stop_playback(clear=True)
+            restored = ProjectStore.from_dict(
+                self.project_store.path,
+                payload,
+                autosave=self.project_store.autosave,
+            )
+            restored.save()
+            restored.change_listener = self._project_store_changed
+            self.project_store = restored
+            self._last_autosave_digest = None
+            self._active_timeline_id = None
+            known_bins = {item.id for item in restored.bins}
+            self._active_bin_id = bin_id if bin_id in known_bins else None
+            known_timelines = {item.id for item in restored.timelines}
+            if timeline_id in known_timelines:
+                self.load_project_timeline(str(timeline_id))
+            else:
+                self.clear_sources()
+                self._apply_project_defaults()
+                self._refresh_media_tree()
+            self._update_project_header()
+            self.statusBar().showMessage(f"{verb} complete", 5000)
+            return True
+        except (OSError, ProjectError, TypeError, ValueError) as error:
+            self._error(verb, str(error))
+            return False
+        finally:
+            self._restoring_project_snapshot = False
+            self._update_edit_action_state()
+
+    def _undo_project_edit(self) -> None:
+        self._undo_capture_timer.stop()
+        self._flush_pending_project_undo()
+        if not self._project_undo_stack:
+            self.statusBar().showMessage("Nothing to undo", 2500)
+            return
+        target = self._project_undo_stack.pop()
+        current = self._current_project_snapshot()
+        if self._restore_project_snapshot(target, verb="Undo"):
+            self._project_redo_stack.append(current)
+        else:
+            self._project_undo_stack.append(target)
+        self._update_edit_action_state()
+
+    def _redo_project_edit(self) -> None:
+        if not self._project_redo_stack:
+            self.statusBar().showMessage("Nothing to redo", 2500)
+            return
+        target = self._project_redo_stack.pop()
+        current = self._current_project_snapshot()
+        if self._restore_project_snapshot(target, verb="Redo"):
+            self._project_undo_stack.append(current)
+        else:
+            self._project_redo_stack.append(target)
+        self._update_edit_action_state()
+
+    @staticmethod
+    def _focused_text_editor() -> QLineEdit | QPlainTextEdit | None:
+        widget = QApplication.focusWidget()
+        while widget is not None:
+            if isinstance(widget, (QLineEdit, QPlainTextEdit)):
+                return widget
+            widget = widget.parentWidget()
+        return None
+
+    @staticmethod
+    def _focus_within(widget: QWidget) -> bool:
+        focused = QApplication.focusWidget()
+        return focused is widget or (
+            focused is not None and widget.isAncestorOf(focused)
+        )
+
+    def _dispatch_edit_command(self, command: str) -> None:
+        editor = self._focused_text_editor()
+        if editor is not None:
+            if command == "undo":
+                available = (
+                    editor.isUndoAvailable()
+                    if isinstance(editor, QLineEdit)
+                    else editor.document().isUndoAvailable()
+                )
+                if available:
+                    editor.undo()
+                    return
+            elif command == "redo":
+                available = (
+                    editor.isRedoAvailable()
+                    if isinstance(editor, QLineEdit)
+                    else editor.document().isRedoAvailable()
+                )
+                if available:
+                    editor.redo()
+                    return
+            elif command == "cut":
+                editor.cut()
+                return
+            elif command == "copy":
+                editor.copy()
+                return
+            elif command == "paste":
+                editor.paste()
+                return
+            elif command == "select-all":
+                editor.selectAll()
+                return
+        if command == "undo":
+            self._undo_project_edit()
+        elif command == "redo":
+            self._redo_project_edit()
+        elif command == "copy":
+            self._copy_contextual()
+        elif command == "paste":
+            self._paste_contextual()
+        elif command == "select-all":
+            self._select_all_contextual()
+        elif command == "cut":
+            self.statusBar().showMessage("Cut is available while editing text", 3000)
+
+    def _copy_table_selection(self, table: QTableWidget) -> bool:
+        indexes = [index for index in table.selectedIndexes() if not table.isColumnHidden(index.column())]
+        if not indexes:
+            return False
+        rows = sorted({index.row() for index in indexes})
+        columns = sorted({index.column() for index in indexes})
+        lines: list[str] = []
+        for row in rows:
+            values = []
+            for column in columns:
+                item = table.item(row, column)
+                values.append(item.text() if item is not None else "")
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage(f"Copied {len(rows)} row{'s' if len(rows) != 1 else ''}", 3000)
+        return True
+
+    def _copy_contextual(self) -> None:
+        if self._focus_within(self.media_tree):
+            records = self._selected_media_records()
+            if not records:
+                return
+            mime = QMimeData()
+            paths = [str(record.path) for record in records]
+            mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+            mime.setText("\n".join(paths))
+            QApplication.clipboard().setMimeData(mime)
+            self.statusBar().showMessage(
+                f"Copied {len(paths)} media path{'s' if len(paths) != 1 else ''}",
+                3000,
+            )
+            return
+        if self._focus_within(self.timeline_tree):
+            kind, timeline_id = self._selected_timeline_item()
+            if kind != "timeline" or not timeline_id:
+                timeline_id = self._active_timeline_id
+            timeline = next(
+                (item for item in self.project_store.timelines if item.id == timeline_id),
+                None,
+            )
+            if timeline is None:
+                return
+            mime = QMimeData()
+            mime.setData(
+                TIMELINE_CLIPBOARD_MIME,
+                json.dumps(
+                    {"version": 1, "timeline": timeline.to_dict()},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+            mime.setText(timeline.name)
+            QApplication.clipboard().setMimeData(mime)
+            self.statusBar().showMessage(f"Copied timeline: {timeline.name}", 3000)
+            return
+        for table in (self.source_table, self.queue_table):
+            if self._focus_within(table) and self._copy_table_selection(table):
+                return
+
+    def _paste_contextual(self) -> None:
+        mime = QApplication.clipboard().mimeData()
+        if self._focus_within(self.timeline_tree) and mime.hasFormat(TIMELINE_CLIPBOARD_MIME):
+            try:
+                payload = json.loads(bytes(mime.data(TIMELINE_CLIPBOARD_MIME)).decode("utf-8"))
+                if not isinstance(payload, dict) or payload.get("version") != 1:
+                    raise ProjectError("Unsupported timeline clipboard data")
+                raw = payload.get("timeline")
+                if not isinstance(raw, dict):
+                    raise ProjectError("Timeline clipboard data is incomplete")
+                source = TimelineRecord.from_dict(raw)
+                kind, selected_id = self._selected_timeline_item()
+                known_bins = {item.id for item in self.project_store.bins}
+                destination = (
+                    str(selected_id)
+                    if kind == "bin" and selected_id in known_bins
+                    else source.bin_id
+                    if source.bin_id in known_bins
+                    else self._active_bin_id
+                    if self._active_bin_id in known_bins
+                    else None
+                )
+                duplicate = TimelineRecord.create(
+                    name=self._unique_timeline_name(f"{source.name} Copy"),
+                    source_paths=source.source_paths,
+                    config_snapshot=source.config_snapshot,
+                    inherits_project_settings=source.inherits_project_settings,
+                    bin_id=destination,
+                    tc_alignment_snapshot=source.tc_alignment_snapshot,
+                    in_frame=source.in_frame,
+                    out_frame=source.out_frame,
+                    playback_cache_path=source.playback_cache_path,
+                    playback_cache_status=source.playback_cache_status,
+                    stitch_status=source.stitch_status,
+                    order=len(self.project_store.list_timelines(destination)),
+                )
+                self.project_store.add_timeline(duplicate)
+                self._active_timeline_id = duplicate.id
+                self._active_bin_id = duplicate.bin_id
+                self._remember_active_timeline()
+                self._refresh_media_tree()
+                self.statusBar().showMessage(f"Pasted timeline: {duplicate.name}", 4000)
+            except (json.JSONDecodeError, UnicodeDecodeError, ProjectError, TypeError, ValueError) as error:
+                self._error("Paste Timeline", str(error))
+            return
+        if self._focus_within(self.media_tree):
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            if not paths and mime.hasText():
+                candidates = [line.strip() for line in mime.text().splitlines() if line.strip()]
+                paths = [path for path in candidates if Path(path).is_file()]
+            paths = [path for path in paths if Path(path).is_file()]
+            if not paths:
+                self.statusBar().showMessage("Clipboard contains no local media files", 3500)
+                return
+            try:
+                added = self.import_media_paths(
+                    paths,
+                    destination_bin_id=self._media_tree_destination_bin(default_to_first=True),
+                )
+                self.statusBar().showMessage(
+                    f"Pasted {len(added)} media file{'s' if len(added) != 1 else ''}",
+                    4000,
+                )
+            except ProjectError as error:
+                self._error("Paste Media", str(error))
+
+    def _select_all_contextual(self) -> None:
+        for widget in (self.media_tree, self.timeline_tree, self.source_table, self.queue_table):
+            if self._focus_within(widget):
+                widget.selectAll()
+                return
+
+    def save_project(self) -> None:
+        saved = self._autosave_project_snapshot(force=True)
+        self._undo_capture_timer.stop()
+        self._flush_pending_project_undo()
+        if not saved:
+            self.statusBar().showMessage("Project save failed · see Task Log", 7000)
+            return
+        stamp = time.strftime("%H:%M")
+        self.autosave_status.setText(f"SAVED · {stamp}")
+        self.statusBar().showMessage(f"Project saved · {stamp}", 5000)
+        self._append_log(f"Saved project: {self.project_store.path}")
 
     def _show_right_tab(self, index: int) -> None:
         self.inspector_panel.show()
@@ -3810,7 +4261,9 @@ class MainWindow(QMainWindow):
     def _switch_project(self, store: ProjectStore) -> None:
         self._save_active_timeline()
         self._cancel_source_proxy_items()
+        self.project_store.change_listener = None
         self.project_store = store
+        self.project_store.change_listener = self._project_store_changed
         self._last_autosave_digest = None
         self._active_timeline_id = None
         self._active_bin_id = None
@@ -3834,6 +4287,7 @@ class MainWindow(QMainWindow):
         if self._auto_workflows_enabled:
             self._restore_active_timeline()
             self._queue_source_proxies(list(self.project_store.media))
+        self._clear_project_history()
 
     def _autosave_project_snapshot(self, *, force: bool = False) -> bool:
         """Refresh a low-frequency recovery copy only when project data changed."""
@@ -4867,8 +5321,16 @@ class MainWindow(QMainWindow):
     def show_shortcuts(self) -> None:
         self._show_message(
             QMessageBox.Icon.Information,
-            "Playback Shortcuts",
-            "Click the preview, then use:\n\nP  Full screen\nSpace  Play / Pause\n"
+            "Keyboard Shortcuts",
+            "PROJECT / EDIT\n"
+            "⌘/Ctrl+S  Save project\n"
+            "⌘/Ctrl+Z  Undo\n"
+            "⌘/Ctrl+Shift+Z  Redo\n"
+            "⌘/Ctrl+C  Copy\n"
+            "⌘/Ctrl+V  Paste\n"
+            "⌘/Ctrl+A  Select all\n\n"
+            "PLAYBACK\n"
+            "P  Full screen\nSpace  Play / Pause\n"
             "J  Reverse\nK  Stop\nL  Forward\n← / →  Step one frame",
         )
 

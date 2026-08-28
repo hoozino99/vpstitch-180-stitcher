@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QToolBar,
     QTreeWidgetItem,
@@ -2404,6 +2405,123 @@ def test_autosave_snapshot_skips_unchanged_project(tmp_path: Path) -> None:
     window.project_store.update_settings(name="Autosave Updated")
     assert window._autosave_project_snapshot() is True
     assert ProjectStore.load(recovery, autosave=False).settings.name == "Autosave Updated"
+    window.close()
+    app.processEvents()
+
+
+def test_standard_edit_shortcuts_work_from_the_window(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Shortcuts" / "project.json"
+    store = ProjectStore.create(project_path, name="Shortcuts")
+    store.add_bin(Bin.create("Master"))
+    window = MainWindow(project_path)
+    editor = QLineEdit("first", window)
+    editor.show()
+    window.show()
+    app.processEvents()
+
+    editor.setFocus()
+    editor.selectAll()
+    QApplication.clipboard().setText("second")
+    QTest.keyClick(editor, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    assert editor.text() == "second"
+    QTest.keyClick(editor, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert editor.text() == "first"
+    editor.selectAll()
+    QTest.keyClick(editor, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert QApplication.clipboard().text() == "first"
+
+    window.setFocus()
+    QTest.keyClick(window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+    assert project_path.with_name("project.autosave.json").is_file()
+    assert window.autosave_status.text().startswith("SAVED ·")
+    window.close()
+    app.processEvents()
+
+
+def test_timeline_copy_paste_and_project_undo_redo(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Timeline Clipboard" / "project.json"
+    store = ProjectStore.create(project_path, name="Timeline Clipboard")
+    store.add_timeline(
+        TimelineRecord.create(
+            name="Hero Take",
+            source_paths=(),
+            config_snapshot=json.loads(
+                Path("configs/drive_5cam_180.prores-hq.json").read_text()
+            ),
+        )
+    )
+    window = MainWindow(project_path)
+    window.timeline_tree.setCurrentItem(window.timeline_tree.topLevelItem(0))
+    window.show()
+    window.timeline_tree.setFocus()
+    app.processEvents()
+
+    QTest.keyClick(
+        window.timeline_tree,
+        Qt.Key.Key_C,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    QTest.keyClick(
+        window.timeline_tree,
+        Qt.Key.Key_V,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert [item.name for item in window.project_store.timelines] == [
+        "Hero Take",
+        "Hero Take Copy",
+    ]
+
+    QTest.keyClick(
+        window.timeline_tree,
+        Qt.Key.Key_Z,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert [item.name for item in window.project_store.timelines] == ["Hero Take"]
+    QTest.keyClick(
+        window.timeline_tree,
+        Qt.Key.Key_Z,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert [item.name for item in window.project_store.timelines] == [
+        "Hero Take",
+        "Hero Take Copy",
+    ]
+    window.close()
+    app.processEvents()
+
+
+def test_media_clipboard_imports_into_the_selected_folder(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Media Clipboard" / "project.json"
+    store = ProjectStore.create(project_path, name="Media Clipboard")
+    destination = store.add_bin(Bin.create("Destination"))
+    clip = tmp_path / "P06_clip.mov"
+    clip.touch()
+    window = MainWindow(project_path)
+    window.show()
+    app.processEvents()
+
+    iterator = QTreeWidgetItemIterator(window.media_tree)
+    while iterator.value() is not None:
+        item = iterator.value()
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) == destination.id:
+            window.media_tree.setCurrentItem(item)
+            break
+        iterator += 1
+    window.media_tree.setFocus()
+    QApplication.clipboard().setText(str(clip))
+    QTest.keyClick(
+        window.media_tree,
+        Qt.Key.Key_V,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+
+    imported = window.project_store.media
+    assert len(imported) == 1
+    assert imported[0].path == clip
+    assert imported[0].bin_id == destination.id
     window.close()
     app.processEvents()
 
