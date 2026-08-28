@@ -208,8 +208,15 @@ def test_render_progress_formats_percent_and_eta_compactly() -> None:
     assert render_progress_text(1, 4, 65) == "25.0% · 01:05 LEFT"
     assert render_progress_text(4, 4, 0) == "100%"
     assert render_queue_status_text(RenderStatus.RENDERING, (1, 4, 65)) == (
-        "25.0% · 01:05"
+        "25.0% · 01:05 LEFT"
     )
+    assert render_queue_status_text(
+        RenderStatus.RENDERING,
+        (0, 4, None),
+        elapsed_seconds=12,
+        phase="projection-cache",
+        map_progress=(1, 4),
+    ) == "MAPS 25.0% · 00:12 RUN"
     assert render_queue_status_text(RenderStatus.DONE, (4, 4, 0)) == "100% · DONE"
 
 
@@ -239,6 +246,29 @@ def test_queue_progress_updates_percent_eta_and_status_columns(tmp_path: Path) -
     assert window.queue_table.item(0, 3).text() != "25.0% · —"
     assert window.task_label.text().startswith("FRAME 1/4 · 25.0%")
     window.render_queue.remove(job.id)
+    window.close()
+    app.processEvents()
+
+
+def test_render_clock_starts_immediately_and_keeps_elapsed_time_visible(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Clock" / "project.json"
+    ProjectStore.create(project_path, name="Clock")
+    window = MainWindow(project_path)
+
+    window._begin_render_progress(520)
+    window._render_progress_started_at = time.monotonic() - 5.0
+    window._process_phase = "projection-cache"
+    window._render_map_progress = (2, 10)
+    window._refresh_render_clock()
+
+    assert window._render_progress_timer.isActive()
+    assert window.task_label.text().startswith("PREPARING MAPS 2/10")
+    assert window.task_label.text().endswith("ELAPSED")
+    window._end_render_progress()
+    assert not window._render_progress_timer.isActive()
     window.close()
     app.processEvents()
 

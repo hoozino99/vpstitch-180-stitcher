@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +15,29 @@ BUNDLED_ACES_STUDIO_ID = "vpstitch://aces-studio-v4.0.0"
 BUNDLED_ACES_STUDIO_FILENAME = (
     "studio-config-v4.0.0_aces-v2.0_ocio-v2.5.ocio"
 )
+OCIO_PARALLEL_MIN_PIXELS = 512 * 512
+_OCIO_EXECUTOR: ThreadPoolExecutor | None = None
+_OCIO_EXECUTOR_LOCK = threading.Lock()
+
+
+def _ocio_worker_count() -> int:
+    default = min(8, max(1, (os.cpu_count() or 1) - 2))
+    try:
+        requested = int(os.environ.get("VPSTITCH_OCIO_THREADS", str(default)))
+    except ValueError:
+        requested = default
+    return min(16, max(1, requested))
+
+
+def _ocio_executor() -> ThreadPoolExecutor:
+    global _OCIO_EXECUTOR
+    with _OCIO_EXECUTOR_LOCK:
+        if _OCIO_EXECUTOR is None:
+            _OCIO_EXECUTOR = ThreadPoolExecutor(
+                max_workers=16,
+                thread_name_prefix="vpstitch-ocio",
+            )
+    return _OCIO_EXECUTOR
 
 
 def bundled_aces_studio_path() -> Path:
@@ -105,6 +131,30 @@ class ColorPipeline:
 
         contiguous = np.ascontiguousarray(image, dtype=np.float32)
         height, width, channels = contiguous.shape
+        apply_rgb = getattr(processor, "applyRGB", None)
+        workers = min(_ocio_worker_count(), height)
+        if (
+            callable(apply_rgb)
+            and workers > 1
+            and height * width >= OCIO_PARALLEL_MIN_PIXELS
+        ):
+            # PyOpenColorIO releases the GIL while applying a CPUProcessor.
+            # Process disjoint packed-row views concurrently so the expensive
+            # ACES output transform uses the available CPU cores. The transform
+            # is pixel-local, therefore splitting rows is bit-identical to one
+            # packed-image call.
+            chunks = [
+                chunk
+                for chunk in np.array_split(contiguous, workers, axis=0)
+                if chunk.size
+            ]
+            futures = [_ocio_executor().submit(apply_rgb, chunk) for chunk in chunks]
+            for future in futures:
+                future.result()
+            return contiguous
+        if callable(apply_rgb):
+            apply_rgb(contiguous)
+            return contiguous
         descriptor = ocio.PackedImageDesc(contiguous, width, height, channels)
         processor.apply(descriptor)
         return contiguous

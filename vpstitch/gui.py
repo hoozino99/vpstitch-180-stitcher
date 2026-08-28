@@ -505,18 +505,32 @@ def render_progress_text(
 def render_queue_status_text(
     status: RenderStatus,
     progress: tuple[int, int, float | None] | None,
+    *,
+    elapsed_seconds: float | None = None,
+    phase: str = "",
+    map_progress: tuple[int, int] | None = None,
 ) -> str:
     if status is RenderStatus.DONE:
         return "100% · DONE"
     if status is not RenderStatus.RENDERING or progress is None:
         return status.value.upper()
     done, total, eta_seconds = progress
+    elapsed = (
+        "" if elapsed_seconds is None else f" · {format_render_duration(elapsed_seconds)} RUN"
+    )
+    if phase == "projection-cache":
+        if map_progress is None or map_progress[1] <= 0:
+            return "MAPS" + elapsed
+        map_done, map_total = map_progress
+        percent = 100.0 * min(max(0, map_done), map_total) / map_total
+        return f"MAPS {percent:.1f}%" + elapsed
     if total <= 0:
-        return "0.0% · EST"
+        return "STARTING" + elapsed
     bounded = min(max(0, int(done)), int(total))
     percent = 100.0 * bounded / total
-    eta = "—" if eta_seconds is None else format_render_duration(eta_seconds)
-    return f"{percent:.1f}% · {eta}"
+    if eta_seconds is None:
+        return f"{percent:.1f}% · EST" + elapsed
+    return f"{percent:.1f}% · {format_render_duration(eta_seconds)} LEFT" + elapsed
 
 
 def ocio_space_names(identifier: str) -> tuple[str, ...]:
@@ -2359,6 +2373,11 @@ class MainWindow(QMainWindow):
         self._render_progress_last_at: float | None = None
         self._render_progress_last_done = 0
         self._render_seconds_per_frame: float | None = None
+        self._render_progress_total = 0
+        self._render_map_progress: tuple[int, int] | None = None
+        self._render_progress_timer = QTimer(self)
+        self._render_progress_timer.setInterval(1000)
+        self._render_progress_timer.timeout.connect(self._refresh_render_clock)
         self._process_output_buffer = ""
         self._process_phase = ""
         self._active_timeline_id: str | None = None
@@ -9768,7 +9787,19 @@ class MainWindow(QMainWindow):
                     str(video.get("output_codec", "Unknown")),
                 ),
                 render_queue_status_text(
-                    job.status, self._queue_progress.get(job.id)
+                    job.status,
+                    self._queue_progress.get(job.id),
+                    elapsed_seconds=(
+                        self._render_elapsed_seconds()
+                        if job.id == self._queue_current_id
+                        else None
+                    ),
+                    phase=self._process_phase if job.id == self._queue_current_id else "",
+                    map_progress=(
+                        self._render_map_progress
+                        if job.id == self._queue_current_id
+                        else None
+                    ),
                 ),
             )
             for column, value in enumerate(values):
@@ -10016,10 +10047,7 @@ class MainWindow(QMainWindow):
             else int(job.config_snapshot.get("video", {}).get("frames") or 0)
         )
         self._queue_progress[job.id] = (0, total_frames, None)
-        self._render_progress_started_at = time.monotonic()
-        self._render_progress_last_at = self._render_progress_started_at
-        self._render_progress_last_done = 0
-        self._render_seconds_per_frame = None
+        self._begin_render_progress(total_frames)
         self._append_log(
             f"Queue settings locked: {job.snapshot_digest} · {job.name}"
         )
@@ -10181,6 +10209,19 @@ class MainWindow(QMainWindow):
         if self._tc_alignment_path:
             arguments.extend(["--alignment-plan", str(self._tc_alignment_path)])
         arguments.extend(sources)
+        configured_frames = int(
+            json.loads(config.read_text(encoding="utf-8"))
+            .get("video", {})
+            .get("frames")
+            or 0
+        )
+        total_frames = (
+            max(0, self.timeline_out.value() - self.timeline_in.value())
+            if self._tc_alignment
+            else int(self.frame_limit.value() or configured_frames)
+        )
+        self._begin_render_progress(total_frames)
+
         def render_complete() -> None:
             self._commit_render_staging(staging, output_path)
             self._show_message(
@@ -10247,6 +10288,7 @@ class MainWindow(QMainWindow):
                 self._process_interactive = False
                 self._process_task_name = ""
                 self._set_busy_ui(False)
+                self._end_render_progress()
                 self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
                 process.deleteLater()
                 if failure:
@@ -10276,11 +10318,14 @@ class MainWindow(QMainWindow):
             self.task_label.setText("FAILED")
             self.cancel_button.setVisible(False)
             self._set_busy_ui(False)
+            self._end_render_progress()
             self._append_log(f"✕ {task} could not start: {error}")
             process.deleteLater()
             if failure:
                 failure()
             self.statusBar().showMessage("Task could not start · see Task Log", 10000)
+        elif self._render_progress_started_at is not None:
+            self._refresh_render_clock()
 
     def _set_busy_ui(self, busy: bool) -> None:
         sources_ready = all(self.source_table.paths())
@@ -10331,7 +10376,19 @@ class MainWindow(QMainWindow):
         for line in normalized.splitlines():
             phase = re.fullmatch(r"\s*phase\s+([a-z-]+)\s*", line)
             if phase:
-                self._process_phase = phase.group(1)
+                next_phase = phase.group(1)
+                if (
+                    next_phase == "render"
+                    and self._process_phase != "render"
+                    and self._render_progress_started_at is not None
+                ):
+                    # Projection-map startup is part of elapsed runtime, but it
+                    # must not inflate the per-frame ETA estimate.
+                    self._render_progress_last_at = time.monotonic()
+                    self._render_progress_last_done = 0
+                    self._render_seconds_per_frame = None
+                    self._render_map_progress = None
+                self._process_phase = next_phase
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
             if match:
                 progress_value = int(match.group(1)), int(match.group(2))
@@ -10351,21 +10408,31 @@ class MainWindow(QMainWindow):
         if progress_value is not None:
             done, total = progress_value
             if self._process_phase == "projection-cache":
+                if self._render_progress_started_at is not None:
+                    self._render_map_progress = (done, total)
                 self.progress.setRange(0, total)
                 self.progress.setValue(done)
-                self.task_label.setText(f"PREPARING MAPS {done}/{total}")
+                if self._render_progress_started_at is not None:
+                    self._refresh_render_clock()
+                else:
+                    self.task_label.setText(f"PREPARING MAPS {done}/{total}")
             elif frame_progress is None and self._queue_current_id is None:
                 self.progress.setRange(0, total)
                 self.progress.setValue(done)
         if frame_progress is not None:
             self._update_render_progress(*frame_progress)
-        if frame_value is not None and frame_progress is None:
+        if (
+            frame_value is not None
+            and frame_progress is None
+            and self._render_progress_started_at is None
+        ):
             prefix = "CACHE" if self._process_task_name == "BUILD PLAYBACK PROXY" else "FRAME"
             self.task_label.setText(f"{prefix} {frame_value}")
 
     def _update_render_progress(self, done: int, total: int) -> None:
         done = min(max(0, int(done)), max(0, int(total)))
         total = max(0, int(total))
+        self._render_progress_total = total
         now = time.monotonic()
         if (
             done > self._render_progress_last_done
@@ -10388,12 +10455,112 @@ class MainWindow(QMainWindow):
         )
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(done)
-        self.task_label.setText(
-            f"FRAME {done}/{total} · {render_progress_text(done, total, eta)}"
-        )
         if self._queue_current_id is not None:
             self._queue_progress[self._queue_current_id] = (done, total, eta)
-            self._refresh_queue_table()
+        if self._render_progress_started_at is not None:
+            self._refresh_render_clock()
+        else:
+            self.task_label.setText(
+                f"FRAME {done}/{total} · {render_progress_text(done, total, eta)}"
+            )
+            if self._queue_current_id is not None:
+                self._refresh_queue_table()
+
+    def _begin_render_progress(self, total_frames: int) -> None:
+        now = time.monotonic()
+        self._render_progress_started_at = now
+        self._render_progress_last_at = now
+        self._render_progress_last_done = 0
+        self._render_seconds_per_frame = None
+        self._render_progress_total = max(0, int(total_frames))
+        self._render_map_progress = None
+        self._render_progress_timer.start()
+        self._refresh_render_clock()
+
+    def _end_render_progress(self) -> None:
+        self._render_progress_timer.stop()
+        self._render_progress_started_at = None
+        self._render_progress_last_at = None
+        self._render_progress_last_done = 0
+        self._render_seconds_per_frame = None
+        self._render_progress_total = 0
+        self._render_map_progress = None
+
+    def _render_elapsed_seconds(self) -> float | None:
+        if self._render_progress_started_at is None:
+            return None
+        return max(0.0, time.monotonic() - self._render_progress_started_at)
+
+    def _refresh_render_clock(self) -> None:
+        elapsed = self._render_elapsed_seconds()
+        if elapsed is None:
+            self._render_progress_timer.stop()
+            return
+        if self._queue_current_id is not None:
+            progress = self._queue_progress.get(self._queue_current_id)
+        else:
+            eta = (
+                None
+                if self._render_seconds_per_frame is None
+                else self._render_seconds_per_frame
+                * max(0, self._render_progress_total - self._render_progress_last_done)
+            )
+            progress = (
+                self._render_progress_last_done,
+                self._render_progress_total,
+                eta,
+            )
+        done, total, eta = progress or (0, self._render_progress_total, None)
+        if self._process_phase == "projection-cache":
+            if self._render_map_progress is None:
+                stage = "PREPARING MAPS"
+            else:
+                map_done, map_total = self._render_map_progress
+                stage = f"PREPARING MAPS {map_done}/{map_total}"
+            self.task_label.setText(
+                f"{stage} · {format_render_duration(elapsed)} ELAPSED"
+            )
+        elif done <= 0:
+            self.task_label.setText(
+                f"STARTING RENDER · {format_render_duration(elapsed)} ELAPSED"
+            )
+        else:
+            self.task_label.setText(
+                f"FRAME {done}/{total} · {render_progress_text(done, total, eta)}"
+                f" · {format_render_duration(elapsed)} ELAPSED"
+            )
+        if self._queue_current_id is not None:
+            self._refresh_active_queue_status()
+
+    def _refresh_active_queue_status(self) -> None:
+        """Update only the running row so the one-second clock never rebuilds the table."""
+        if self._queue_current_id is None or not hasattr(self, "queue_table"):
+            return
+        job = next(
+            (
+                candidate
+                for candidate in self.render_queue.jobs
+                if candidate.id == self._queue_current_id
+            ),
+            None,
+        )
+        if job is None:
+            return
+        status = render_queue_status_text(
+            job.status,
+            self._queue_progress.get(job.id),
+            elapsed_seconds=self._render_elapsed_seconds(),
+            phase=self._process_phase,
+            map_progress=self._render_map_progress,
+        )
+        for row in range(self.queue_table.rowCount()):
+            identity = self.queue_table.item(row, 0)
+            if identity is None or identity.data(Qt.ItemDataRole.UserRole) != job.id:
+                continue
+            item = self.queue_table.item(row, 3)
+            if item is not None:
+                item.setText(status)
+            return
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
         sender = self.sender()
@@ -10403,6 +10570,7 @@ class MainWindow(QMainWindow):
         failure = self._process_failure
         process = self.process
         task = self._process_task_name or self.task_label.text()
+        render_elapsed = self._render_elapsed_seconds()
         cancelled_for_interaction = bool(
             task == "BUILD PLAYBACK PROXY"
             and self._playback_cache_cancelled_for_interaction
@@ -10412,6 +10580,7 @@ class MainWindow(QMainWindow):
         self._process_failure = None
         self._process_interactive = False
         self._process_task_name = ""
+        self._end_render_progress()
         try:
             process.readyReadStandardOutput.disconnect(self._read_process)
             process.finished.disconnect(self._process_finished)
@@ -10434,6 +10603,10 @@ class MainWindow(QMainWindow):
             process.deleteLater()
         if exit_code == 0:
             self._append_log(f"✓ {task} complete")
+            if render_elapsed is not None:
+                self._append_log(
+                    f"  elapsed {format_render_duration(render_elapsed)}"
+                )
             if callback:
                 try:
                     callback()

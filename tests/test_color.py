@@ -61,3 +61,23 @@ def test_camera_match_gain_is_applied_in_working_space_with_strength() -> None:
 
     expected_gain = np.sqrt(np.array([1.08, 0.96, 1.02], dtype=np.float32))
     np.testing.assert_allclose(matched, base * expected_gain, rtol=1e-5, atol=1e-7)
+
+
+def test_parallel_ocio_output_is_bit_identical_to_single_thread(monkeypatch) -> None:
+    settings = Color(
+        mode="ocio",
+        ocio_config=BUNDLED_ACES_STUDIO_ID,
+        working_space="ACEScct",
+        output_mode="display_view",
+        display="ST2084-P3-D65 - Display",
+        view="ACES 2.0 - HDR 1000 nits (P3 D65)",
+    )
+    pipeline = ColorPipeline(settings, ["Camera Rec.709"])
+    image = np.random.default_rng(19).random((512, 512, 3), dtype=np.float32)
+
+    monkeypatch.setenv("VPSTITCH_OCIO_THREADS", "1")
+    single_thread = pipeline.working_to_output(image.copy())
+    monkeypatch.setenv("VPSTITCH_OCIO_THREADS", "4")
+    parallel = pipeline.working_to_output(image.copy())
+
+    np.testing.assert_array_equal(parallel, single_thread)
