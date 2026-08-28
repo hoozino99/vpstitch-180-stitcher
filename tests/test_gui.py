@@ -784,7 +784,7 @@ def test_gui_uses_compact_resolve_style_workspace() -> None:
     assert window.media_tree.topLevelItemCount() == 1
     assert window.timeline_tree.topLevelItemCount() == 0
     assert window.new_timeline_button.text() == "NEW TIMELINE"
-    assert window.render_selected_queue_button.text() == "RENDER"
+    assert window.render_selected_queue_button.text() == "RENDER SELECTED"
     assert window.render_all_queue_button.text() == "RENDER ALL"
     assert window.queue_table.columnCount() == 5
     assert [
@@ -792,6 +792,11 @@ def test_gui_uses_compact_resolve_style_workspace() -> None:
         for column in range(5)
     ] == ["TIMELINE", "FPS", "FORMAT", "FILE", "STATUS"]
     assert window.media_tree.selectionMode().name == "ExtendedSelection"
+    assert window.import_button.text() == "IMPORT"
+    assert window.assign_media_button.text() == "ASSIGN SELECTED"
+    assert window.rig_align_button.text() == "STITCH"
+    assert window.add_queue_button.objectName() == "primaryButton"
+    assert window.render_button.objectName() == "secondaryButton"
     assert window.source_table.isColumnHidden(3)
     assert all(window.source_table.isColumnHidden(column) for column in (5, 6, 7, 8))
     assert "Auto Profile" in window.profile_label.text()
