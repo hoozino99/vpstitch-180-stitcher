@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, QProcess, Qt
 from PySide6.QtGui import QPixmap, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
@@ -38,6 +38,7 @@ from vpstitch.gui import (
     ProjectManagerDialog,
     ScrubbableDoubleSpinBox,
     TrimRangeBar,
+    live_playback_limits,
     order_camera_plates,
     plate_number,
     preview_dimensions,
@@ -186,6 +187,13 @@ def test_preview_dimensions_preserve_canvas_aspect() -> None:
     assert preview_dimensions(15360, 3968) == (3840, 992)
     assert preview_dimensions(20000, 6000) == (3840, 1152)
     assert preview_dimensions(20000, 32) == (3840, 6)
+
+
+def test_live_playback_limits_budget_more_pixels_for_three_cameras() -> None:
+    assert live_playback_limits(3) == (720, 405)
+    assert live_playback_limits(5) == (576, 324)
+    with pytest.raises(ValueError, match="3-camera or 5-camera"):
+        live_playback_limits(8)
 
 
 def test_render_output_name_is_canonical_and_codec_specific(tmp_path: Path) -> None:
@@ -2416,7 +2424,7 @@ def test_plate_fine_tune_reuses_reference_images_and_runs_latest_live_preview(
     app.processEvents()
 
 
-def test_plate_adjustment_does_not_automatically_rebuild_playback_cache() -> None:
+def test_plate_adjustment_debounces_automatic_playback_cache_rebuild() -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
@@ -2426,9 +2434,11 @@ def test_plate_adjustment_does_not_automatically_rebuild_playback_cache() -> Non
     window.plate_position_x.setValue(-70.0)
 
     assert window._live_preview_pending is True
-    assert window._auto_cache_requested is False
+    assert window._auto_cache_requested is True
+    assert window._playback_warmup_timer.isActive()
     assert window._playback_key is None
     window._live_preview_timer.stop()
+    window._playback_warmup_timer.stop()
     window.close()
     app.processEvents()
 
@@ -2447,6 +2457,7 @@ def test_plate_adjustment_cancels_an_in_progress_stale_playback_cache() -> None:
     process = CacheProcess()
     window.process = process  # type: ignore[assignment]
     window._process_task_name = "BUILD PLAYBACK PROXY"
+    window._tc_alignment = {"fps": 24.0}
     window._auto_cache_in_progress = True
     window._auto_cache_requested = True
 
@@ -2454,9 +2465,34 @@ def test_plate_adjustment_cancels_an_in_progress_stale_playback_cache() -> None:
 
     assert process.killed is True
     assert window._playback_cache_cancelled_for_interaction is True
-    assert window._auto_cache_requested is False
+    assert window._auto_cache_requested is True
     window.process = None
     window._live_preview_timer.stop()
+    window.close()
+    app.processEvents()
+
+
+def test_cancelled_stale_cache_restarts_after_live_preview_settles() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    process = QProcess(window)
+    process.readyReadStandardOutput.connect(window._read_process)
+    process.finished.connect(window._process_finished)
+    window.process = process
+    window._process_task_name = "BUILD PLAYBACK PROXY"
+    window._process_interactive = True
+    window._playback_cache_cancelled_for_interaction = True
+    window._auto_cache_requested = True
+    window._live_preview_pending = True
+    window._tc_alignment = {"fps": 24.0}
+
+    window._process_finished(-1, None)
+
+    assert window.process is None
+    assert window._playback_warmup_timer.isActive()
+    window._live_preview_pending = False
+    window._live_preview_timer.stop()
+    window._playback_warmup_timer.stop()
     window.close()
     app.processEvents()
 

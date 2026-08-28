@@ -200,6 +200,10 @@ class LivePlaybackSession:
         self.decoder: SynchronizedProxyDecoder | None = None
         self._frame_cache: OrderedDict[int, FrameBundle] = OrderedDict()
         self._frame_cache_limit = 8
+        self._render_cache: OrderedDict[
+            int, tuple[FrameBundle, np.ndarray]
+        ] = OrderedDict()
+        self._render_cache_limit = 12
 
     def can_reconfigure(
         self,
@@ -220,6 +224,9 @@ class LivePlaybackSession:
         if not self.can_reconfigure(self.sources, config, self.plan):
             raise ValueError("live playback decode geometry changed")
         self.config = config
+        # Decoded camera frames remain valid across color/geometry changes,
+        # while stitched images must be regenerated with the new settings.
+        self._render_cache.clear()
 
     def _remember(self, bundle: FrameBundle) -> None:
         self._frame_cache[bundle.timeline_frame] = bundle
@@ -230,7 +237,14 @@ class LivePlaybackSession:
     def has_cached_frame(self, timeline_frame: int) -> bool:
         return timeline_frame in self._frame_cache
 
+    def has_rendered_frame(self, timeline_frame: int) -> bool:
+        return timeline_frame in self._render_cache
+
     def render_frame(self, timeline_frame: int) -> tuple[FrameBundle, np.ndarray]:
+        rendered = self._render_cache.get(timeline_frame)
+        if rendered is not None:
+            self._render_cache.move_to_end(timeline_frame)
+            return rendered
         bundle = self._frame_cache.get(timeline_frame)
         if bundle is not None:
             self._frame_cache.move_to_end(timeline_frame)
@@ -254,10 +268,16 @@ class LivePlaybackSession:
             bundle.frames,
             frame_token=bundle.timeline_frame,
         )
-        return bundle, image
+        rendered = (bundle, image)
+        self._render_cache[timeline_frame] = rendered
+        self._render_cache.move_to_end(timeline_frame)
+        while len(self._render_cache) > self._render_cache_limit:
+            self._render_cache.popitem(last=False)
+        return rendered
 
     def close(self) -> None:
         if self.decoder is not None:
             self.decoder.close()
             self.decoder = None
         self._frame_cache.clear()
+        self._render_cache.clear()

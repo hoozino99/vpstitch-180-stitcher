@@ -469,6 +469,15 @@ def preview_dimensions(
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
+def live_playback_limits(camera_count: int) -> tuple[int, int]:
+    """Return a real-time draft ceiling tuned for the active camera count."""
+    if camera_count == 3:
+        return 720, 405
+    if camera_count == 5:
+        return 576, 324
+    raise ValueError("live playback requires a 3-camera or 5-camera set")
+
+
 def ocio_space_names(identifier: str) -> tuple[str, ...]:
     """Return every named color space exposed by an OCIO config."""
     config = load_ocio_config(identifier)
@@ -2235,6 +2244,9 @@ class MainWindow(QMainWindow):
         self._live_preview_timer.setInterval(180)
         self._live_preview_timer.setSingleShot(True)
         self._live_preview_timer.timeout.connect(self._run_live_preview)
+        self._playback_warmup_timer = QTimer(self)
+        self._playback_warmup_timer.setSingleShot(True)
+        self._playback_warmup_timer.timeout.connect(self._warm_playback_cache)
         self._live_preview_pending = False
         self._live_preview_revision = 0
         self._live_preview_message = "Live preview updated"
@@ -2640,7 +2652,7 @@ class MainWindow(QMainWindow):
         title.setProperty("sectionTitle", True)
         self.preview_context = QLabel("NO TIMELINE OPEN")
         self.preview_context.setProperty("muted", True)
-        preview_limit = QLabel("LIVE 960PX  ·  FINAL FULL QUALITY")
+        preview_limit = QLabel("LIVE ADAPTIVE  ·  FINAL FULL QUALITY")
         preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
         preview_header.addSpacing(12)
@@ -2758,7 +2770,7 @@ class MainWindow(QMainWindow):
         self.playback_button = QPushButton("▶  PLAY")
         self.playback_button.setObjectName("quietButton")
         self.playback_button.setToolTip(
-            "Space plays the prewarmed 960px proxy; missing caches build automatically"
+            "Space starts the adaptive live draft immediately; a 960px playback cache replaces it when ready"
         )
         self.playback_button.clicked.connect(self.toggle_playback)
         timing_values.addWidget(self.playback_button)
@@ -7248,11 +7260,12 @@ class MainWindow(QMainWindow):
         directory = self._working_dir / "live-playback"
         directory.mkdir(parents=True, exist_ok=True)
         preview_config = directory / f"{playback_key}.json"
+        max_width, max_height = live_playback_limits(len(playback_sources))
         width, height = preview_dimensions(
             self.canvas_width.value(),
             self.canvas_height.value(),
-            max_width=960,
-            max_height=540,
+            max_width=max_width,
+            max_height=max_height,
         )
         self._write_preview_config(
             full_config,
@@ -7280,8 +7293,8 @@ class MainWindow(QMainWindow):
             playback_sources,
             config,
             plan,
-            max_width=960,
-            max_height=540,
+            max_width=max_width,
+            max_height=max_height,
         )
 
     def _request_live_proxy_frame(
@@ -7352,7 +7365,9 @@ class MainWindow(QMainWindow):
         future = self._live_playback_executor.submit(render_live_frame)
         self._live_playback_future = future
         activity = (
-            "applying settings to memory frame"
+            "reusing stitched memory frame"
+            if session.has_rendered_frame(frame)
+            else "applying settings to memory frame"
             if session.has_cached_frame(frame)
             else "decoding frame in background"
         )
@@ -7400,8 +7415,14 @@ class MainWindow(QMainWindow):
                     and self._live_playback_session.renderer.hardware_accelerated
                     else "CPU fallback"
                 )
+                live_size = (
+                    f"{self._live_playback_session.config.output.width}×"
+                    f"{self._live_playback_session.config.output.height}"
+                    if self._live_playback_session is not None
+                    else "adaptive"
+                )
                 self.preview_note.setText(
-                    f"{message} · LIVE SOURCE PROXY · {backend}"
+                    f"{message} · LIVE DRAFT {live_size} · {backend}"
                 )
                 if self._live_playing:
                     lower, upper = self.timeline_bar.values()
@@ -7535,6 +7556,8 @@ class MainWindow(QMainWindow):
         if self._live_playing:
             self._stop_live_proxy_playback()
             self.playback_button.setText("▶  PLAY")
+            if self._auto_cache_requested:
+                self._request_playback_warmup(delay_ms=0)
             return
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
@@ -8133,6 +8156,11 @@ class MainWindow(QMainWindow):
         else:
             self.preview_note.setText(f"{message} · updating draft…")
         self._live_preview_timer.start(0 if immediate else 40)
+        if self._tc_alignment:
+            # Rebuild only after the controls have been idle for a moment. This
+            # keeps slider/drag feedback interactive while ensuring Space does
+            # not remain on the slower frame-by-frame fallback indefinitely.
+            self._request_playback_warmup(delay_ms=700)
 
     def _sync_cached_preview_config(self) -> tuple[list[str], Path]:
         reference = self._last_reference_dir
@@ -8754,17 +8782,23 @@ class MainWindow(QMainWindow):
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return destination
 
-    def _request_playback_warmup(self, *, autoplay: bool = False) -> None:
+    def _request_playback_warmup(
+        self,
+        *,
+        autoplay: bool = False,
+        delay_ms: int = 0,
+    ) -> None:
         """Coalesce a low-resolution proxy build after interactive work finishes."""
         if self._closing or not self._tc_alignment:
             return
         self._auto_cache_requested = True
         if autoplay:
             self._pending_playback_request = True
-        if self.process is None and not self._live_preview_pending:
-            QTimer.singleShot(0, self._warm_playback_cache)
+        if self.process is None:
+            self._playback_warmup_timer.start(max(0, int(delay_ms)))
 
     def _warm_playback_cache(self) -> None:
+        self._playback_warmup_timer.stop()
         if self._closing:
             self._auto_cache_requested = False
             self._pending_playback_request = False
@@ -8775,6 +8809,18 @@ class MainWindow(QMainWindow):
             return
         if self.process is not None:
             self._auto_cache_requested = True
+            return
+        if (
+            self._live_preview_pending
+            or (
+                self._interactive_future is not None
+                and not self._interactive_future.done()
+            )
+            or self._live_playback_future is not None
+            or self._live_playing
+        ):
+            self._auto_cache_requested = True
+            self._playback_warmup_timer.start(800 if self._live_playing else 220)
             return
         autoplay = self._pending_playback_request
         try:
@@ -9620,9 +9666,17 @@ class MainWindow(QMainWindow):
                 if failure:
                     failure()
                 return
-            self.process.start(str(cli_program), arguments)
+            program = str(cli_program)
+            process_arguments = list(arguments)
         else:
-            self.process.start(sys.executable, ["-m", "vpstitch.cli", *arguments])
+            program = sys.executable
+            process_arguments = ["-m", "vpstitch.cli", *arguments]
+        if task == "BUILD PLAYBACK PROXY" and os.name != "nt":
+            nice = shutil.which("nice")
+            if nice:
+                process_arguments = ["-n", "10", program, *process_arguments]
+                program = nice
+        self.process.start(program, process_arguments)
         if not self.process.waitForStarted(3000):
             error = self.process.errorString() or "process did not start"
             process = self.process
@@ -9784,8 +9838,10 @@ class MainWindow(QMainWindow):
                     self._append_log(f"✕ {task} cleanup failed: {error}")
         if self._live_preview_pending and self.process is None:
             QTimer.singleShot(0, self._run_live_preview)
+            if self._auto_cache_requested:
+                self._playback_warmup_timer.start(700)
         elif self._auto_cache_requested and self.process is None:
-            QTimer.singleShot(0, self._warm_playback_cache)
+            self._request_playback_warmup(delay_ms=0)
 
     def cancel_task(self) -> None:
         if self.process is not None:
@@ -9944,6 +10000,7 @@ class MainWindow(QMainWindow):
             self.media_player.stop()
             self._reverse_timer.stop()
             self._live_preview_timer.stop()
+            self._playback_warmup_timer.stop()
             self._live_preview_pending = False
             self._auto_cache_requested = False
             self._pending_playback_request = False
@@ -9967,6 +10024,7 @@ class MainWindow(QMainWindow):
             self.media_player.stop()
             self._reverse_timer.stop()
             self._live_preview_timer.stop()
+            self._playback_warmup_timer.stop()
             self._live_preview_pending = False
             self._auto_cache_requested = False
             self._pending_playback_request = False

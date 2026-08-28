@@ -173,6 +173,43 @@ def test_live_session_keeps_decoder_between_sequential_frames(
     assert len(_FakeDecoder.instances) == 3
 
 
+def test_live_session_reuses_rendered_frame_until_settings_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _FakeDecoder.instances.clear()
+    _FakeDecoder.fail_enabled = False
+    config = RigConfig(
+        cameras=_cameras(3),
+        output=Output(width=32, height=12, tile_width=32, tile_height=12),
+        color=Color(integer_dither=False),
+    )
+    sources = [str(tmp_path / f"P0{index}.mp4") for index in range(1, 4)]
+    plan = AlignedFramePlan(24.0, (0, 0, 0), (20, 20, 20), 20)
+    session = LivePlaybackSession(
+        sources,
+        config,
+        plan,
+        decoder_factory=_FakeDecoder,
+        max_width=32,
+        max_height=12,
+    )
+    renders: list[int] = []
+
+    def render_frames(_config, frames, *, frame_token):  # type: ignore[no-untyped-def]
+        renders.append(frame_token)
+        return frames[0]
+
+    monkeypatch.setattr(session.renderer, "render_frames", render_frames)
+
+    first = session.render_frame(4)
+    second = session.render_frame(4)
+
+    assert second is first
+    assert session.has_rendered_frame(4)
+    assert renders == [4]
+    assert len(_FakeDecoder.instances) == 3
+
+
 def test_live_session_reuses_decoded_frame_across_setting_changes(
     tmp_path: Path, monkeypatch
 ) -> None:
