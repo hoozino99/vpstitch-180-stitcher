@@ -1142,6 +1142,7 @@ class NewTimelineDialog(QDialog):
         default_name: str,
         suggested_count: int,
         selected_plate_count: int | None,
+        selected_media_names: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("New Plate Set Timeline")
@@ -1192,11 +1193,45 @@ class NewTimelineDialog(QDialog):
         self.layout_buttons[suggested_count].setChecked(True)
         layout.addLayout(choices)
 
+        selection_card = QFrame()
+        selection_card.setObjectName("selectedMediaCard")
+        selection_layout = QVBoxLayout(selection_card)
+        selection_layout.setContentsMargins(12, 10, 12, 10)
+        selection_layout.setSpacing(7)
+
+        selection_header = QHBoxLayout()
+        selection_title = QLabel("MEDIA POOL SELECTION")
+        selection_title.setProperty("sectionTitle", True)
+        self.selected_media_state = QLabel()
+        self.selected_media_state.setObjectName("selectedMediaState")
+        self.selected_media_state.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        selection_header.addWidget(selection_title)
+        selection_header.addStretch(1)
+        selection_header.addWidget(self.selected_media_state)
+        selection_layout.addLayout(selection_header)
+
+        self.selected_media_files = QLabel()
+        self.selected_media_files.setObjectName("selectedMediaFiles")
+        self.selected_media_files.setWordWrap(True)
+        self.selected_media_files.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        selection_layout.addWidget(self.selected_media_files)
+
         self.add_selected = QCheckBox()
-        self._selected_plate_count = selected_plate_count
+        self._selected_plate_count = max(0, int(selected_plate_count or 0))
+        self._selected_media_names = list(selected_media_names or [])
         self.layout_group.idClicked.connect(self._update_selected_media_option)
-        self._update_selected_media_option(suggested_count)
-        layout.addWidget(self.add_selected)
+        selection_layout.addWidget(self.add_selected)
+
+        self.selection_note = QLabel()
+        self.selection_note.setWordWrap(True)
+        self.selection_note.setProperty("muted", True)
+        selection_layout.addWidget(self.selection_note)
+        layout.addWidget(selection_card)
+        self.selected_media_card = selection_card
 
         note = QLabel(
             "You can replace the set later. Manual assignments stay in the saved timeline order."
@@ -1210,26 +1245,85 @@ class NewTimelineDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel
         )
         create = buttons.button(QDialogButtonBox.StandardButton.Save)
-        create.setText("CREATE TIMELINE")
         create.setObjectName("primaryButton")
+        self.create_button = create
+        self.add_selected.toggled.connect(self._update_create_button)
+        self._update_selected_media_option(suggested_count)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     def _update_selected_media_option(self, count: int) -> None:
-        matches = self._selected_plate_count == count
-        if self._selected_plate_count in SUPPORTED_CAMERA_COUNTS:
-            selected = int(self._selected_plate_count)
+        selected = self._selected_plate_count
+        matches = selected == count and selected in SUPPORTED_CAMERA_COUNTS
+        if matches:
             plate_range = "P06–P08" if selected == 3 else "P01–P05"
+            state = "ready"
+            self.selected_media_state.setText(f"READY · {selected} PLATES")
             self.add_selected.setText(
-                f"Add the {selected} selected Media Pool plates ({plate_range}) now"
+                f"Add these {selected} plates ({plate_range}) to the new timeline"
+            )
+            self.selection_note.setText(
+                "The selected clips will be assigned during creation. "
+                "Numbered files map automatically."
+            )
+        elif selected == 0:
+            state = "empty"
+            self.selected_media_state.setText("NO PLATES SELECTED")
+            self.add_selected.setText("Create without Media Pool plates")
+            self.selection_note.setText(
+                "This will create an empty timeline. Select 3 or 5 clips first "
+                "to add a complete camera set during creation."
+            )
+        elif selected in SUPPORTED_CAMERA_COUNTS:
+            state = "warning"
+            self.selected_media_state.setText(
+                f"MISMATCH · {selected} SELECTED / {count} REQUIRED"
+            )
+            self.add_selected.setText(
+                f"The {selected} selected clips do not match this {count}-camera layout"
+            )
+            self.selection_note.setText(
+                "Choose the matching camera layout or return to the Media Pool "
+                "and select the intended complete set."
             )
         else:
-            self.add_selected.setText(
-                "Select 3 or 5 Media Pool clips to add them during creation"
+            state = "warning"
+            self.selected_media_state.setText(
+                f"INCOMPLETE · {selected} SELECTED"
             )
+            self.add_selected.setText(
+                "A timeline needs exactly 3 or 5 selected Media Pool clips"
+            )
+            self.selection_note.setText(
+                "Return to the Media Pool and select the complete 3-camera or "
+                "5-camera plate set, or continue with an empty timeline."
+            )
+
+        if self._selected_media_names:
+            self.selected_media_files.setText("\n".join(self._selected_media_names))
+        elif selected:
+            self.selected_media_files.setText(f"{selected} Media Pool clips selected")
+        else:
+            self.selected_media_files.setText("No Media Pool clips selected")
+
+        for widget in (self.selected_media_card, self.selected_media_state):
+            widget.setProperty("state", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
         self.add_selected.setEnabled(matches)
         self.add_selected.setChecked(matches)
+        self._update_create_button()
+
+    def _update_create_button(self) -> None:
+        if not hasattr(self, "create_button"):
+            return
+        if self.add_selected.isEnabled() and self.add_selected.isChecked():
+            self.create_button.setText(
+                f"CREATE WITH {self._selected_plate_count} PLATES"
+            )
+        else:
+            self.create_button.setText("CREATE EMPTY TIMELINE")
 
     def values(self) -> tuple[str, int, bool]:
         return (
@@ -3960,7 +4054,7 @@ class MainWindow(QMainWindow):
         self, default_name: str
     ) -> tuple[str, int, bool] | None:
         records = self._selected_media_records()
-        selected_count = len(records) if len(records) in SUPPORTED_CAMERA_COUNTS else None
+        selected_count = len(records)
         cameras = self.config_data.get("cameras")
         current_count = len(cameras) if isinstance(cameras, list) else 5
         suggested_count = (
@@ -3975,6 +4069,7 @@ class MainWindow(QMainWindow):
             default_name=default_name,
             suggested_count=suggested_count,
             selected_plate_count=selected_count,
+            selected_media_names=[record.path.name for record in records],
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
@@ -5915,6 +6010,30 @@ class MainWindow(QMainWindow):
                 background:#28282c;
                 color:#f7f8f8;
                 border:1px solid #7170ff;
+            }
+            QFrame#selectedMediaCard {
+                background:#141516;
+                border:1px solid #34343a;
+                border-radius:7px;
+            }
+            QFrame#selectedMediaCard[state='ready'] { border-color:#3f6255; }
+            QFrame#selectedMediaCard[state='warning'] { border-color:#735744; }
+            QLabel#selectedMediaState {
+                color:#8a8f98;
+                font-size:9px;
+                font-weight:650;
+                letter-spacing:.5px;
+            }
+            QLabel#selectedMediaState[state='ready'] { color:#7fc5a9; }
+            QLabel#selectedMediaState[state='warning'] { color:#d6a274; }
+            QLabel#selectedMediaFiles {
+                color:#d0d6e0;
+                background:#0f1011;
+                border-top:1px solid #23252a;
+                border-bottom:1px solid #23252a;
+                padding:7px 8px;
+                font-family:'Cascadia Mono','SF Mono','Menlo';
+                font-size:10px;
             }
             QPushButton#workflowButton {
                 background:rgba(255,255,255,0.03);

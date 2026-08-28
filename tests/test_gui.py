@@ -133,14 +133,50 @@ def test_new_timeline_dialog_makes_camera_layout_explicit() -> None:
         default_name="Front Take",
         suggested_count=3,
         selected_plate_count=3,
+        selected_media_names=[
+            "P06_front.mov",
+            "P07_front.mov",
+            "P08_front.mov",
+        ],
     )
 
     assert dialog.values() == ("Front Take", 3, True)
+    assert dialog.selected_media_state.text() == "READY · 3 PLATES"
+    assert "P06_front.mov" in dialog.selected_media_files.text()
+    assert dialog.create_button.text() == "CREATE WITH 3 PLATES"
+    dialog.add_selected.setChecked(False)
+    assert dialog.create_button.text() == "CREATE EMPTY TIMELINE"
+    dialog.add_selected.setChecked(True)
     assert "P06–P08" in dialog.layout_buttons[3].text()
     assert "P01–P05" in dialog.layout_buttons[5].text()
     dialog.layout_buttons[5].click()
     assert dialog.values() == ("Front Take", 5, False)
+    assert dialog.selected_media_state.text() == "MISMATCH · 3 SELECTED / 5 REQUIRED"
+    assert dialog.create_button.text() == "CREATE EMPTY TIMELINE"
     assert not dialog.add_selected.isEnabled()
+    dialog.close()
+    parent.close()
+    app.processEvents()
+
+
+def test_new_timeline_dialog_explains_incomplete_media_selection() -> None:
+    app = QApplication.instance() or QApplication([])
+    parent = MainWindow()
+    dialog = NewTimelineDialog(
+        parent,
+        default_name="Incomplete Take",
+        suggested_count=5,
+        selected_plate_count=2,
+        selected_media_names=["camera-left.mov", "camera-right.mov"],
+    )
+
+    assert dialog.selected_media_state.text() == "INCOMPLETE · 2 SELECTED"
+    assert dialog.selected_media_files.text().splitlines() == [
+        "camera-left.mov",
+        "camera-right.mov",
+    ]
+    assert not dialog.add_selected.isEnabled()
+    assert dialog.create_button.text() == "CREATE EMPTY TIMELINE"
     dialog.close()
     parent.close()
     app.processEvents()
