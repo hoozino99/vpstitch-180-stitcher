@@ -18,6 +18,10 @@ struct RenderParams {
     uint32_t tileY;
     uint32_t dither;
     uint32_t seed;
+    uint32_t outputWidth;
+    uint32_t outputOriginX;
+    uint32_t outputOriginY;
+    uint32_t outputPadding;
     uint32_t sourceWidths[kMaxCameras];
     uint32_t sourceHeights[kMaxCameras];
 };
@@ -65,6 +69,8 @@ struct InputParams {
 @property(nonatomic, strong) NSMutableArray<id<MTLTexture>> *textures;
 @property(nonatomic, strong) NSMutableArray<id<MTLSamplerState>> *samplers;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, VPStitchMetalTile *> *preparedTiles;
+@property(nonatomic, strong) id<MTLBuffer> frameOutput;
+@property(nonatomic) NSUInteger frameOutputLength;
 @property(nonatomic, copy) NSString *lastError;
 @end
 
@@ -187,6 +193,7 @@ static int executeTile(
     params.tileY = tileY;
     params.dither = dither;
     params.seed = seed;
+    params.outputWidth = tile.width;
 
     id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
@@ -682,6 +689,141 @@ extern "C" int vpstitch_metal_render_prepared_tile(
     }
 }
 
+extern "C" int vpstitch_metal_render_prepared_frame(
+    void *opaque,
+    const uint32_t *tileIDs,
+    const uint32_t *tileXs,
+    const uint32_t *tileYs,
+    uint32_t tileCount,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    uint32_t frameIndex,
+    uint32_t dither,
+    uint32_t seed,
+    uint16_t *output
+) {
+    @autoreleasepool {
+        if (opaque == nullptr || tileIDs == nullptr || tileXs == nullptr ||
+            tileYs == nullptr || tileCount == 0 || outputWidth == 0 ||
+            outputHeight == 0 || output == nullptr) {
+            return 0;
+        }
+        VPStitchMetalContext *context = (__bridge VPStitchMetalContext *)opaque;
+        if (context.pipeline == nil || context.queue == nil) {
+            setError(context, @"Metal frame pipeline is not ready");
+            return 0;
+        }
+        const NSUInteger pixels = static_cast<NSUInteger>(outputWidth) * outputHeight;
+        const NSUInteger outputLength = pixels * 3 * sizeof(uint16_t);
+        if (outputLength > context.device.maxBufferLength) {
+            setError(context, @"Metal frame output exceeds the device buffer limit");
+            return 0;
+        }
+        if (context.frameOutput == nil || context.frameOutputLength != outputLength) {
+            context.frameOutput = [context.device newBufferWithLength:outputLength
+                                                               options:MTLResourceStorageModeShared];
+            context.frameOutputLength = outputLength;
+        }
+        if (context.frameOutput == nil) {
+            setError(context, @"Metal frame output allocation failed");
+            return 0;
+        }
+        id<MTLBuffer> dummy = [context.device newBufferWithLength:sizeof(float) * 3
+                                                          options:MTLResourceStorageModeShared];
+        if (dummy == nil) {
+            setError(context, @"Metal frame dummy-buffer allocation failed");
+            return 0;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [context.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit fillBuffer:context.frameOutput range:NSMakeRange(0, outputLength) value:0];
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:context.pipeline];
+        [encoder setBuffer:context.frameOutput offset:0 atIndex:0];
+        for (NSUInteger binding = 0; binding < kMaxTextures; ++binding) {
+            id<MTLTexture> texture = arrayValue(context.textures, binding);
+            id<MTLSamplerState> sampler = arrayValue(context.samplers, binding);
+            if (texture != nil) [encoder setTexture:texture atIndex:binding];
+            if (sampler != nil) [encoder setSamplerState:sampler atIndex:binding];
+        }
+
+        bool failed = false;
+        for (uint32_t tileIndex = 0; tileIndex < tileCount; ++tileIndex) {
+            VPStitchMetalTile *tile = context.preparedTiles[@(tileIDs[tileIndex])];
+            if (tile == nil || tileXs[tileIndex] + tile.width > outputWidth ||
+                tileYs[tileIndex] + tile.height > outputHeight) {
+                setError(context, @"Metal prepared frame tile is missing or out of bounds");
+                failed = true;
+                break;
+            }
+            RenderParams params = {};
+            params.width = tile.width;
+            params.height = tile.height;
+            params.activeCount = static_cast<uint32_t>(tile.cameraIndices.count);
+            params.frameIndex = frameIndex;
+            params.tileX = tileXs[tileIndex];
+            params.tileY = tileYs[tileIndex];
+            params.dither = dither;
+            params.seed = seed;
+            params.outputWidth = outputWidth;
+            params.outputOriginX = tileXs[tileIndex];
+            params.outputOriginY = tileYs[tileIndex];
+
+            for (NSUInteger slot = 0; slot < kMaxCameras; ++slot) {
+                id<MTLBuffer> sourceBuffer = dummy;
+                id<MTLBuffer> x = dummy;
+                id<MTLBuffer> y = dummy;
+                id<MTLBuffer> weight = dummy;
+                if (slot < tile.cameraIndices.count) {
+                    uint32_t camera = tile.cameraIndices[slot].unsignedIntValue;
+                    sourceBuffer = arrayValue(context.sources, camera);
+                    x = tile.mapXBuffers[slot];
+                    y = tile.mapYBuffers[slot];
+                    weight = tile.weightBuffers[slot];
+                    params.sourceWidths[slot] = tile.sourceWidths[slot].unsignedIntValue;
+                    params.sourceHeights[slot] = tile.sourceHeights[slot].unsignedIntValue;
+                }
+                if (sourceBuffer == nil) {
+                    setError(context, @"Metal source disappeared before frame render");
+                    failed = true;
+                    break;
+                }
+                [encoder setBuffer:sourceBuffer offset:0 atIndex:2 + slot];
+                [encoder setBuffer:x offset:0 atIndex:7 + slot];
+                [encoder setBuffer:y offset:0 atIndex:12 + slot];
+                [encoder setBuffer:weight offset:0 atIndex:17 + slot];
+            }
+            if (failed) break;
+            [encoder setBytes:&params length:sizeof(params) atIndex:1];
+            NSUInteger threadWidth = context.pipeline.threadExecutionWidth;
+            NSUInteger threadHeight = std::max<NSUInteger>(
+                1,
+                std::min<NSUInteger>(
+                    16,
+                    context.pipeline.maxTotalThreadsPerThreadgroup / threadWidth
+                )
+            );
+            [encoder dispatchThreads:MTLSizeMake(tile.width, tile.height, 1)
+               threadsPerThreadgroup:MTLSizeMake(threadWidth, threadHeight, 1)];
+        }
+        [encoder endEncoding];
+        if (failed) return 0;
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        if (commandBuffer.status == MTLCommandBufferStatusError) {
+            setError(context, [NSString stringWithFormat:@"Metal frame execution failed: %@",
+                                                           commandBuffer.error.localizedDescription]);
+            return 0;
+        }
+        std::memcpy(output, context.frameOutput.contents, outputLength);
+        return 1;
+    }
+}
+
 extern "C" int vpstitch_metal_render_tile(
     void *opaque,
     const uint32_t *cameraIndices,
@@ -728,6 +870,7 @@ extern "C" int vpstitch_metal_render_tile(
         params.tileY = tileY;
         params.dither = dither;
         params.seed = seed;
+        params.outputWidth = width;
 
         id<MTLBuffer> sourceBuffers[kMaxCameras] = {};
         id<MTLBuffer> mapXBuffers[kMaxCameras] = {};

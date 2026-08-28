@@ -490,6 +490,33 @@ def format_render_duration(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def robust_render_seconds_per_frame(
+    samples: list[float],
+    previous: float | None = None,
+) -> float | None:
+    """Return a stable frame-time estimate without hiding sustained slowdown."""
+    values = np.asarray(
+        [value for value in samples if np.isfinite(value) and value > 0.0],
+        dtype=np.float64,
+    )
+    if values.size < 2:
+        return previous
+    median = float(np.median(values))
+    deviation = np.abs(values - median)
+    mad = float(np.median(deviation))
+    tolerance = max(median * 0.15, mad * 4.4478, 1.0e-6)
+    inliers = values[deviation <= tolerance]
+    if inliers.size == 0:
+        inliers = values
+    center = median * 0.65 + float(np.mean(inliers)) * 0.35
+    if previous is None or not np.isfinite(previous) or previous <= 0.0:
+        return center
+    # Follow real thermal/I/O changes, but prevent one irregular frame from
+    # making a long render jump by many minutes in either direction.
+    bounded = float(np.clip(center, previous * 0.8, previous * 1.25))
+    return previous * 0.82 + bounded * 0.18
+
+
 def render_progress_text(
     done: int, total: int, eta_seconds: float | None = None
 ) -> str:
@@ -2373,6 +2400,8 @@ class MainWindow(QMainWindow):
         self._render_progress_last_at: float | None = None
         self._render_progress_last_done = 0
         self._render_seconds_per_frame: float | None = None
+        self._render_frame_samples: list[float] = []
+        self._render_eta_warmup_remaining = 3
         self._render_progress_total = 0
         self._render_map_progress: tuple[int, int] | None = None
         self._render_progress_timer = QTimer(self)
@@ -10387,6 +10416,8 @@ class MainWindow(QMainWindow):
                     self._render_progress_last_at = time.monotonic()
                     self._render_progress_last_done = 0
                     self._render_seconds_per_frame = None
+                    self._render_frame_samples.clear()
+                    self._render_eta_warmup_remaining = 3
                     self._render_map_progress = None
                 self._process_phase = next_phase
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
@@ -10441,11 +10472,22 @@ class MainWindow(QMainWindow):
             sample = (now - self._render_progress_last_at) / (
                 done - self._render_progress_last_done
             )
-            self._render_seconds_per_frame = (
-                sample
-                if self._render_seconds_per_frame is None
-                else self._render_seconds_per_frame * 0.75 + sample * 0.25
-            )
+            if self._render_eta_warmup_remaining > 0:
+                # Initial frames upload fixed Metal maps, allocate the reusable
+                # frame buffer, and warm GPU/VM pages. None represent steady
+                # rendering, so wait for two post-warmup samples before ETA.
+                self._render_eta_warmup_remaining = max(
+                    0,
+                    self._render_eta_warmup_remaining
+                    - (done - self._render_progress_last_done),
+                )
+            elif np.isfinite(sample) and sample > 0.0:
+                self._render_frame_samples.append(float(sample))
+                del self._render_frame_samples[:-21]
+                self._render_seconds_per_frame = robust_render_seconds_per_frame(
+                    self._render_frame_samples,
+                    self._render_seconds_per_frame,
+                )
             self._render_progress_last_at = now
             self._render_progress_last_done = done
         eta = (
@@ -10472,6 +10514,8 @@ class MainWindow(QMainWindow):
         self._render_progress_last_at = now
         self._render_progress_last_done = 0
         self._render_seconds_per_frame = None
+        self._render_frame_samples.clear()
+        self._render_eta_warmup_remaining = 3
         self._render_progress_total = max(0, int(total_frames))
         self._render_map_progress = None
         self._render_progress_timer.start()
@@ -10483,6 +10527,8 @@ class MainWindow(QMainWindow):
         self._render_progress_last_at = None
         self._render_progress_last_done = 0
         self._render_seconds_per_frame = None
+        self._render_frame_samples.clear()
+        self._render_eta_warmup_remaining = 3
         self._render_progress_total = 0
         self._render_map_progress = None
 
@@ -10511,6 +10557,8 @@ class MainWindow(QMainWindow):
                 eta,
             )
         done, total, eta = progress or (0, self._render_progress_total, None)
+        if eta is not None and self._render_progress_last_at is not None:
+            eta = max(0.0, eta - (time.monotonic() - self._render_progress_last_at))
         if self._process_phase == "projection-cache":
             if self._render_map_progress is None:
                 stage = "PREPARING MAPS"
@@ -10530,9 +10578,12 @@ class MainWindow(QMainWindow):
                 f" · {format_render_duration(elapsed)} ELAPSED"
             )
         if self._queue_current_id is not None:
-            self._refresh_active_queue_status()
+            self._refresh_active_queue_status((done, total, eta))
 
-    def _refresh_active_queue_status(self) -> None:
+    def _refresh_active_queue_status(
+        self,
+        display_progress: tuple[int, int, float | None] | None = None,
+    ) -> None:
         """Update only the running row so the one-second clock never rebuilds the table."""
         if self._queue_current_id is None or not hasattr(self, "queue_table"):
             return
@@ -10548,7 +10599,7 @@ class MainWindow(QMainWindow):
             return
         status = render_queue_status_text(
             job.status,
-            self._queue_progress.get(job.id),
+            display_progress or self._queue_progress.get(job.id),
             elapsed_seconds=self._render_elapsed_seconds(),
             phase=self._process_phase,
             map_progress=self._render_map_progress,

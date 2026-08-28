@@ -175,6 +175,20 @@ def _load_metal_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint16),
     ]
     library.vpstitch_metal_render_prepared_tile.restype = ctypes.c_int
+    library.vpstitch_metal_render_prepared_frame.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    library.vpstitch_metal_render_prepared_frame.restype = ctypes.c_int
     if not library.vpstitch_metal_available():
         raise MetalBackendError("Metal device is unavailable")
     return library
@@ -368,6 +382,10 @@ struct VPParams {{
     uint tileY;
     uint dither;
     uint seed;
+    uint outputWidth;
+    uint outputOriginX;
+    uint outputOriginY;
+    uint outputPadding;
     uint sourceWidths[VP_MAX_CAMERAS];
     uint sourceHeights[VP_MAX_CAMERAS];
 }};
@@ -546,7 +564,9 @@ kernel void {METAL_KERNEL_NAME}(
         encoded += noise;
     }}
     encoded = clamp(encoded, float3(0.0f), float3(1.0f));
-    uint outputOffset = pixel * 3u;
+    uint outputPixel = (params.outputOriginY + gid.y) * params.outputWidth
+        + params.outputOriginX + gid.x;
+    uint outputOffset = outputPixel * 3u;
     output[outputOffset] = ushort(round(encoded.r * 65535.0f));
     output[outputOffset + 1u] = ushort(round(encoded.g * 65535.0f));
     output[outputOffset + 2u] = ushort(round(encoded.b * 65535.0f));
@@ -827,6 +847,41 @@ class MetalStitchBackend:
         ):
             raise MetalBackendError(self.last_error())
         return output
+
+    def render_prepared_frame(
+        self,
+        tiles: list[tuple[int, int, int]],
+        destination: np.ndarray,
+        *,
+        frame_index: int,
+        dither: bool,
+        seed: int,
+    ) -> None:
+        if destination.dtype != np.uint16 or destination.ndim != 3:
+            raise MetalBackendError("Metal frame destination must be uint16 RGB")
+        height, width, channels = destination.shape
+        if channels != 3 or not destination.flags.c_contiguous:
+            raise MetalBackendError("Metal frame destination must be contiguous RGB")
+        if not tiles:
+            destination.fill(0)
+            return
+        tile_ids = (ctypes.c_uint32 * len(tiles))(*(item[0] for item in tiles))
+        tile_xs = (ctypes.c_uint32 * len(tiles))(*(item[1] for item in tiles))
+        tile_ys = (ctypes.c_uint32 * len(tiles))(*(item[2] for item in tiles))
+        if not self._library.vpstitch_metal_render_prepared_frame(
+            self._context,
+            tile_ids,
+            tile_xs,
+            tile_ys,
+            len(tiles),
+            width,
+            height,
+            frame_index,
+            int(dither),
+            int(seed) & 0xFFFFFFFF,
+            destination.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+        ):
+            raise MetalBackendError(self.last_error())
 
 
 def create_metal_backend(

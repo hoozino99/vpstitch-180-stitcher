@@ -78,6 +78,36 @@ def test_metal_input_color_match_matches_cpu_pipeline() -> None:
         dither=False,
         seed=1,
     )
+    batched = np.full((40, 64, 3), 65535, dtype=np.uint16)
+    backend.render_prepared_frame(
+        [(1, 8, 4)],
+        batched,
+        frame_index=0,
+        dither=False,
+        seed=1,
+    )
+    assert np.array_equal(batched[4:36, 8:56], actual)
+    assert not np.any(batched[:4])
+    assert not np.any(batched[:, :8])
+    dithered_tile = backend.render_prepared_tile(
+        1,
+        48,
+        32,
+        tile_x=8,
+        tile_y=4,
+        frame_index=3,
+        dither=True,
+        seed=7349,
+    )
+    dithered_batch = np.empty((40, 64, 3), dtype=np.uint16)
+    backend.render_prepared_frame(
+        [(1, 8, 4)],
+        dithered_batch,
+        frame_index=3,
+        dither=True,
+        seed=7349,
+    )
+    assert np.array_equal(dithered_batch[4:36, 8:56], dithered_tile)
 
     color = ColorPipeline(settings, ["Camera Rec.709"], [gain])
     expected = quantize_u16(

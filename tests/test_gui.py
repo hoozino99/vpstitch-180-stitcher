@@ -45,6 +45,7 @@ from vpstitch.gui import (
     order_camera_plates,
     plate_number,
     preview_dimensions,
+    robust_render_seconds_per_frame,
     render_queue_status_text,
     render_progress_text,
     resolved_render_output,
@@ -218,6 +219,44 @@ def test_render_progress_formats_percent_and_eta_compactly() -> None:
         map_progress=(1, 4),
     ) == "MAPS 25.0% · 00:12 RUN"
     assert render_queue_status_text(RenderStatus.DONE, (4, 4, 0)) == "100% · DONE"
+
+
+def test_render_eta_uses_robust_center_and_limits_single_sample_jump() -> None:
+    estimate = robust_render_seconds_per_frame(
+        [1.20, 1.18, 1.22, 8.0, 1.19, 1.21]
+    )
+    assert estimate == pytest.approx(1.20, abs=0.02)
+
+    updated = robust_render_seconds_per_frame([2.0, 2.1], estimate)
+    assert updated is not None
+    assert updated < estimate * 1.05
+
+
+def test_render_eta_excludes_initial_metal_warmup_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Warmup ETA" / "project.json"
+    ProjectStore.create(project_path, name="Warmup ETA")
+    window = MainWindow(project_path)
+    window._render_progress_last_at = 100.0
+    ticks = iter([165.0, 166.2, 166.8, 167.08, 167.35])
+    monkeypatch.setattr("vpstitch.gui.time.monotonic", lambda: next(ticks))
+
+    window._update_render_progress(1, 100)
+    assert window._render_seconds_per_frame is None
+    window._update_render_progress(2, 100)
+    assert window._render_seconds_per_frame is None
+    window._update_render_progress(3, 100)
+    assert window._render_seconds_per_frame is None
+    window._update_render_progress(4, 100)
+    assert window._render_seconds_per_frame is None
+    window._update_render_progress(5, 100)
+    assert window._render_seconds_per_frame == pytest.approx(0.275, abs=0.01)
+
+    window.close()
+    app.processEvents()
 
 
 def test_queue_progress_updates_percent_eta_and_status_columns(tmp_path: Path) -> None:

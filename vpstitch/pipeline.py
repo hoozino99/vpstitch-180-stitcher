@@ -19,7 +19,6 @@ from .geometry import (
     iter_tiles,
     remap_camera,
     seam_weights,
-    tile_count,
 )
 from .imageio import read_image, write_png
 from .flow import refine_adjacent_overlaps
@@ -210,7 +209,41 @@ class Stitcher:
                     "cpu", f"Metal source upload failed; CPU fallback: {error}"
                 )
 
-        total = tile_count(self.config.output)
+        frame_tiles = list(iter_tiles(self.config.output))
+        total = len(frame_tiles)
+        if metal_backend is not None:
+            cached_tiles: list[tuple[int, int, int]] = []
+            cache_complete = True
+            for tile in frame_tiles:
+                tile_key = (tile.x, tile.y, tile.width, tile.height)
+                if tile_key not in self._metal_tile_cache:
+                    cache_complete = False
+                    break
+                prepared_id = self._metal_tile_cache[tile_key]
+                if prepared_id is not None:
+                    cached_tiles.append((prepared_id, tile.x, tile.y))
+            if cache_complete:
+                try:
+                    # All fixed maps already live on the GPU. Encode every tile
+                    # into one command buffer, wait once, then copy one frame.
+                    metal_backend.render_prepared_frame(
+                        cached_tiles,
+                        destination,
+                        frame_index=frame_index,
+                        dither=self.config.color.integer_dither,
+                        seed=self.config.color.dither_seed,
+                    )
+                    if progress:
+                        progress(total, total)
+                    return
+                except (MetalBackendError, MemoryError, ValueError) as error:
+                    self._metal_backend = None
+                    metal_backend = None
+                    self.hardware_accelerated = False
+                    self._backend_rejected = True
+                    self.backend_decision = RemapBackendDecision(
+                        "cpu", f"Metal frame batch failed; CPU fallback: {error}"
+                    )
         gpu_sources: list[cv2.UMat] = []
         if self.hardware_accelerated and metal_backend is None:
             try:
@@ -221,7 +254,7 @@ class Stitcher:
                 self.backend_decision = RemapBackendDecision(
                     "cpu", f"OpenCL source upload failed; CPU fallback: {error}"
                 )
-        for number, tile in enumerate(iter_tiles(self.config.output), start=1):
+        for number, tile in enumerate(frame_tiles, start=1):
             # DIS needs surrounding context to avoid a discontinuity at every
             # processing-tile boundary. Render a halo and retain only the core.
             margin = (
