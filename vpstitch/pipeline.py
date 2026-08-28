@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -23,6 +24,12 @@ from .geometry import (
 from .imageio import read_image, write_png
 from .flow import refine_adjacent_overlaps
 from .mapcache import MapCache
+from .metal import (
+    METAL_MIN_OUTPUT_PIXELS,
+    MetalBackendError,
+    MetalStitchBackend,
+    create_metal_backend,
+)
 
 
 Progress = Callable[[int, int], None]
@@ -115,6 +122,16 @@ class Stitcher:
         self._backend_profile: tuple[object, ...] | None = None
         self._camera_backend_decisions: dict[int, RemapBackendDecision] = {}
         self._backend_rejected = False
+        self._metal_backend: MetalStitchBackend | None = (
+            create_metal_backend(
+                config.color,
+                [camera.colorspace for camera in config.cameras],
+                [camera.color_gain for camera in config.cameras],
+            )
+            if config.output.width * config.output.height >= METAL_MIN_OUTPUT_PIXELS
+            else None
+        )
+        self._metal_tile_cache: dict[tuple[int, int, int, int], int | None] = {}
 
     def stitch_arrays(
         self,
@@ -138,22 +155,66 @@ class Stitcher:
         if destination.shape != expected or destination.dtype not in supported_dtypes:
             raise ValueError(f"destination must be uint16/float16/float32 with shape {expected}")
 
-        # In OCIO mode, convert the camera plates to the scene-linear working
-        # space before any Lanczos resampling. This costs more memory than a
-        # post-warp transform but avoids filtering log/gamma encoded values.
-        if self.config.color.mode == "ocio":
-            working_sources = [
-                self.color.input_to_working(index, source)
-                for index, source in enumerate(sources)
-            ]
-        else:
-            working_sources = sources
+        metal_backend = (
+            self._metal_backend
+            if destination.dtype == np.uint16
+            and not self.config.flow.enabled
+            and self.config.color.mode == "ocio"
+            else None
+        )
+        working_sources: list[np.ndarray] | None = (
+            sources if self.config.color.mode != "ocio" else None
+        )
+
+        def cpu_working_sources() -> list[np.ndarray]:
+            nonlocal working_sources
+            if working_sources is not None:
+                return working_sources
+            # CPU fallback remains fully functional when Metal is unavailable
+            # or fails. Camera transforms are independent, so parallelize them.
+            with ThreadPoolExecutor(
+                max_workers=min(len(sources), 5),
+                thread_name_prefix="vpstitch-input-color",
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self.color.input_to_working,
+                        index,
+                        source,
+                        worker_count=2,
+                    )
+                    for index, source in enumerate(sources)
+                ]
+                working_sources = [future.result() for future in futures]
+            return working_sources
+
+        if metal_backend is not None:
+            try:
+                # Decode stays uint16. OCIO input transforms and camera color
+                # match are applied directly into private GPU working buffers,
+                # avoiding five full-resolution CPU float conversions/copies.
+                metal_backend.transform_sources(sources)
+                self.hardware_accelerated = True
+                self.backend_decision = RemapBackendDecision(
+                    "metal",
+                    "Metal OCIO input/color match plus fused "
+                    f"{metal_backend.filter_name} remap, feather blend, "
+                    "OCIO output, and 16-bit quantization",
+                )
+            except (MetalBackendError, MemoryError, ValueError) as error:
+                self._metal_backend = None
+                metal_backend = None
+                self.hardware_accelerated = False
+                self._backend_rejected = True
+                self.backend_decision = RemapBackendDecision(
+                    "cpu", f"Metal source upload failed; CPU fallback: {error}"
+                )
 
         total = tile_count(self.config.output)
         gpu_sources: list[cv2.UMat] = []
-        if self.hardware_accelerated:
+        if self.hardware_accelerated and metal_backend is None:
             try:
-                gpu_sources = [cv2.UMat(source) for source in working_sources]
+                gpu_sources = [cv2.UMat(source) for source in cpu_working_sources()]
             except (cv2.error, MemoryError) as error:
                 self.hardware_accelerated = False
                 self._backend_rejected = True
@@ -169,6 +230,48 @@ class Stitcher:
                 else 0
             )
             render_tile = expand_tile(tile, self.config.output, margin)
+            destination_slice = (
+                slice(tile.y, tile.y + tile.height),
+                slice(tile.x, tile.x + tile.width),
+            )
+            tile_key = (
+                render_tile.x,
+                render_tile.y,
+                render_tile.width,
+                render_tile.height,
+            )
+            has_prepared = (
+                metal_backend is not None and tile_key in self._metal_tile_cache
+            )
+            if has_prepared:
+                prepared_id = self._metal_tile_cache[tile_key]
+                try:
+                    if prepared_id is not None:
+                        destination[destination_slice] = (
+                            metal_backend.render_prepared_tile(
+                                prepared_id,
+                                tile.width,
+                                tile.height,
+                                tile_x=tile.x,
+                                tile_y=tile.y,
+                                frame_index=frame_index,
+                                dither=self.config.color.integer_dither,
+                                seed=self.config.color.dither_seed,
+                            )
+                        )
+                    else:
+                        destination[destination_slice] = 0
+                    if progress:
+                        progress(number, total)
+                    continue
+                except (MetalBackendError, MemoryError, ValueError) as error:
+                    self._metal_backend = None
+                    metal_backend = None
+                    self.hardware_accelerated = False
+                    self._backend_rejected = True
+                    self.backend_decision = RemapBackendDecision(
+                        "cpu", f"Metal cached tile failed; CPU fallback: {error}"
+                    )
             maps = (
                 self.map_cache.tile_maps(render_tile)
                 if self.map_cache is not None
@@ -190,8 +293,48 @@ class Stitcher:
                 if self.config.flow.enabled
                 else [index for index, weight in enumerate(weights) if np.any(weight)]
             )
+            if metal_backend is not None:
+                if not render_indices:
+                    self._metal_tile_cache[tile_key] = None
+                    destination[destination_slice] = 0
+                    if progress:
+                        progress(number, total)
+                    continue
+                try:
+                    prepared_id = number
+                    metal_backend.prepare_tile(
+                        prepared_id,
+                        render_indices,
+                        [(maps[index][0], maps[index][1]) for index in render_indices],
+                        [weights[index] for index in render_indices],
+                    )
+                    self._metal_tile_cache[tile_key] = prepared_id
+                    destination[destination_slice] = (
+                        metal_backend.render_prepared_tile(
+                            prepared_id,
+                            tile.width,
+                            tile.height,
+                            tile_x=tile.x,
+                            tile_y=tile.y,
+                            frame_index=frame_index,
+                            dither=self.config.color.integer_dither,
+                            seed=self.config.color.dither_seed,
+                        )
+                    )
+                    if progress:
+                        progress(number, total)
+                    continue
+                except (MetalBackendError, MemoryError, ValueError) as error:
+                    self._metal_backend = None
+                    metal_backend = None
+                    self.hardware_accelerated = False
+                    self._backend_rejected = True
+                    self.backend_decision = RemapBackendDecision(
+                        "cpu", f"Metal tile failed; CPU fallback: {error}"
+                    )
             warped: list[np.ndarray] = []
             render_weights: list[np.ndarray] = []
+            working_sources = cpu_working_sources()
             for index in render_indices:
                 source = working_sources[index]
                 mapping = maps[index]
@@ -310,10 +453,6 @@ class Stitcher:
                 crop_y : crop_y + tile.height,
                 crop_x : crop_x + tile.width,
             ]
-            destination_slice = (
-                slice(tile.y, tile.y + tile.height),
-                slice(tile.x, tile.x + tile.width),
-            )
             if destination.dtype == np.uint16:
                 quantize_width, quantize_height = self.quantization_tile_size
                 for local_y in range(0, tile.height, quantize_height):

@@ -15,9 +15,13 @@ fi
 
 mkdir -p "$BUILD_ROOT"
 AX_SHIM="$BUILD_ROOT/libvpstitch_macos_ax.dylib"
+METAL_BACKEND="$BUILD_ROOT/libvpstitch_metal.dylib"
 clang -dynamiclib -O2 -arch "$(uname -m)" \
   -x objective-c -framework AppKit \
   -o "$AX_SHIM" packaging/macos_ax_shim.c
+clang++ -dynamiclib -O3 -std=c++17 -fobjc-arc -arch "$(uname -m)" \
+  -framework Foundation -framework Metal \
+  -o "$METAL_BACKEND" packaging/macos_metal_backend.mm
 if [ ! -x "$VENV/bin/python" ]; then
   "$PYTHON_BIN" -m venv "$VENV"
 fi
@@ -34,7 +38,8 @@ COMMON_ARGS="\
   --osx-bundle-identifier com.vplab.vpstitch \
   --collect-all imageio_ffmpeg \
   --collect-all PyOpenColorIO \
-  --collect-all cv2"
+  --collect-all cv2 \
+  --add-binary "$METAL_BACKEND:.""
 
 "$VENV/bin/pyinstaller" $COMMON_ARGS \
   --paths "$ROOT_DIR" \

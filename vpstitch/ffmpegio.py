@@ -519,6 +519,14 @@ class VideoDecoder:
             # decodes/discards up to the exact requested timestamp. It avoids
             # reading every leading frame for long aligned plates.
             command.extend(["-ss", f"{seek_time:.9f}", "-accurate_seek"])
+        if (
+            sys.platform == "darwin"
+            and os.environ.get("VPSTITCH_DISABLE_VIDEOTOOLBOX_DECODE") != "1"
+        ):
+            # FFmpeg transparently falls back to software when a source exceeds
+            # the Apple decoder's limits, while supported H.264/HEVC/ProRes
+            # plates use the Mac media engine.
+            command.extend(["-hwaccel", "videotoolbox"])
         command.extend(["-i", str(path)])
         command.extend(["-an", "-sn"])
         filters: list[str] = []
@@ -705,31 +713,69 @@ class VideoEncoder:
                 ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-pix_fmt", "gbrp16le"]
             )
         elif video.output_codec == "prores-4444":
-            command.extend(
-                [
-                    "-vf",
-                    _filter_chain(video),
-                    "-c:v",
-                    "prores_ks",
-                    "-profile:v",
-                    "4",
-                    "-pix_fmt",
-                    "yuv444p10le",
-                ]
-            )
+            if sys.platform == "darwin":
+                command.extend(
+                    [
+                        "-vf",
+                        _filter_chain(video),
+                        "-c:v",
+                        "prores_videotoolbox",
+                        "-profile:v",
+                        "4",
+                        "-allow_sw",
+                        "1",
+                        *( ["-require_sw", "1"] if max(width, height) >= 16384 else [] ),
+                        "-prio_speed",
+                        "1",
+                        "-pix_fmt",
+                        "p410le",
+                    ]
+                )
+            else:
+                command.extend(
+                    [
+                        "-vf",
+                        _filter_chain(video),
+                        "-c:v",
+                        "prores_ks",
+                        "-profile:v",
+                        "4",
+                        "-pix_fmt",
+                        "yuv444p10le",
+                    ]
+                )
         elif video.output_codec == "prores-hq":
-            command.extend(
-                [
-                    "-vf",
-                    _filter_chain(video),
-                    "-c:v",
-                    "prores_ks",
-                    "-profile:v",
-                    "3",
-                    "-pix_fmt",
-                    "yuv422p10le",
-                ]
-            )
+            if sys.platform == "darwin":
+                command.extend(
+                    [
+                        "-vf",
+                        _filter_chain(video),
+                        "-c:v",
+                        "prores_videotoolbox",
+                        "-profile:v",
+                        "3",
+                        "-allow_sw",
+                        "1",
+                        *( ["-require_sw", "1"] if max(width, height) >= 16384 else [] ),
+                        "-prio_speed",
+                        "1",
+                        "-pix_fmt",
+                        "p210le",
+                    ]
+                )
+            else:
+                command.extend(
+                    [
+                        "-vf",
+                        _filter_chain(video),
+                        "-c:v",
+                        "prores_ks",
+                        "-profile:v",
+                        "3",
+                        "-pix_fmt",
+                        "yuv422p10le",
+                    ]
+                )
         elif video.output_codec == "hevc-444-10":
             command.extend(
                 [

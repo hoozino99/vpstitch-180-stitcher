@@ -124,7 +124,12 @@ class ColorPipeline:
         raise TypeError(f"unsupported image dtype: {image.dtype}")
 
     @staticmethod
-    def _apply(processor: object | None, image: np.ndarray) -> np.ndarray:
+    def _apply(
+        processor: object | None,
+        image: np.ndarray,
+        *,
+        worker_count: int | None = None,
+    ) -> np.ndarray:
         if processor is None:
             return image
         import PyOpenColorIO as ocio
@@ -132,7 +137,10 @@ class ColorPipeline:
         contiguous = np.ascontiguousarray(image, dtype=np.float32)
         height, width, channels = contiguous.shape
         apply_rgb = getattr(processor, "applyRGB", None)
-        workers = min(_ocio_worker_count(), height)
+        workers = min(
+            _ocio_worker_count() if worker_count is None else max(1, worker_count),
+            height,
+        )
         if (
             callable(apply_rgb)
             and workers > 1
@@ -165,9 +173,12 @@ class ColorPipeline:
         image: np.ndarray,
         *,
         apply_match: bool = True,
+        worker_count: int | None = None,
     ) -> np.ndarray:
         working = self._apply(
-            self._input_processors[camera_index], self.to_float(image)
+            self._input_processors[camera_index],
+            self.to_float(image),
+            worker_count=worker_count,
         )
         if not apply_match or not self.settings.match_enabled:
             return working

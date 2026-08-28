@@ -10,6 +10,20 @@ from .config import RigConfig
 
 
 DEFAULT_PREFETCH_MAX_BYTES = 256 * 1024 * 1024
+MAX_AUTOMATIC_PREFETCH_BYTES = 1536 * 1024 * 1024
+
+
+def _automatic_prefetch_budget() -> int:
+    try:
+        physical = int(os.sysconf("SC_PHYS_PAGES")) * int(
+            os.sysconf("SC_PAGE_SIZE")
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return DEFAULT_PREFETCH_MAX_BYTES
+    return min(
+        MAX_AUTOMATIC_PREFETCH_BYTES,
+        max(DEFAULT_PREFETCH_MAX_BYTES, physical // 16),
+    )
 
 
 class FrameDecoder(Protocol):
@@ -33,7 +47,7 @@ def should_prefetch_decode(
         return False
     if requested in {"1", "true", "on", "enabled"}:
         return True
-    limit = DEFAULT_PREFETCH_MAX_BYTES if max_extra_bytes is None else max_extra_bytes
+    limit = _automatic_prefetch_budget() if max_extra_bytes is None else max_extra_bytes
     return decoded_bundle_bytes(config) <= max(0, limit)
 
 

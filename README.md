@@ -14,9 +14,12 @@ macOS에서는 `VP Stitch GUI.command`를 더블클릭하거나 Terminal에서 �
 .venv/bin/vpstitch-gui
 ```
 
-macOS와 Windows 모두 동일한 Python/Qt/FFmpeg 파이프라인을 사용합니다. FFmpeg는
-기본적으로 `imageio-ffmpeg`에 포함된 실행 파일을 사용하며, 시스템 FFmpeg를 직접
-지정해야 할 때는 `VPSTITCH_FFMPEG` 환경변수를 설정할 수 있습니다.
+macOS와 Windows는 같은 프로젝트·Rig Profile·렌더큐 형식을 사용하지만 최종 렌더의
+하드웨어 경로는 플랫폼에 맞게 선택합니다. Apple Silicon macOS에서는 Metal과
+VideoToolbox를 우선 사용하고, 지원되지 않는 변환이나 코덱은 품질을 유지하는 CPU
+경로로 자동 폴백합니다. FFmpeg는 기본적으로 `imageio-ffmpeg`에 포함된 실행 파일을
+사용하며, 시스템 FFmpeg를 직접 지정해야 할 때는 `VPSTITCH_FFMPEG` 환경변수를 설정할
+수 있습니다.
 
 권장 작업 순서:
 
@@ -116,8 +119,9 @@ uint16/float32 스티칭 및 FFV1/EXR 마스터의 정밀도에는 영향을 주
 Quick Preview는 원본 종횡비를 유지한 채 2K(2048×1152) 안에 맞추므로 크롭이나 늘어남이
 없습니다. Inspector를 드래그하는 동안에는 같은 대표 프레임으로 최대 1280×720의
 인터랙티브 합성을 사용하고, 원본 프레임과 변경되지 않은 카메라 와프를 메모리에서 재사용합니다.
-OpenCL 장치가 있으면 카메라 remap은 GPU에서 실행하며, macOS Metal/OpenCL 또는 Windows
-OpenCL 장치가 없을 때만 CPU로 폴백합니다.
+Apple Silicon의 최종 OCIO 렌더는 카메라 입력 변환·컬러매치·remap·feather blend·출력
+변환·디더/정수화를 Metal에서 처리합니다. Windows/OpenCL 또는 Metal을 사용할 수 없는
+조합에서는 CPU로 폴백합니다.
 소스 프록시는 프리뷰 전용 8-bit 캐시이며 `fps_mode=passthrough`로 프레임 복제·누락을
 막습니다. Render Queue와 최종 렌더는 이 파일을 입력으로 사용하지 않고 큐에 잠근
 원본 10/12-bit 경로와 설정 스냅샷만 사용합니다.
@@ -166,9 +170,11 @@ DaVinci Resolve처럼 입력 색공간(자동/Rec.709/Rec.2020/Rec.601)과 Video
 
 ## macOS 호환성과 성능
 
-macOS는 지원 대상입니다. 렌더 엔진은 CUDA나 DirectX에 의존하지 않고 Python,
-NumPy, OpenCV, FFmpeg, OpenColorIO를 사용하므로 Apple Silicon과 Intel Mac에서
-동일한 설정 파일과 CLI를 사용할 수 있습니다.
+macOS는 지원 대상입니다. Apple Silicon 앱은 네이티브 arm64 Metal 라이브러리를 포함하며,
+OCIO 입력 변환과 카메라 컬러매치, 고정 리그 remap, feather blend, OCIO 출력 변환,
+디더와 uint16 양자화를 GPU에서 연속 처리합니다. 고정 투영 맵과 seam weight는 첫 프레임에
+한 번만 GPU에 올리고 이후 모든 프레임에서 재사용합니다. Metal을 쓸 수 없는 설정은 같은
+정밀도의 NumPy/OpenCV/OpenColorIO CPU 경로로 자동 전환됩니다.
 
 스티칭의 주된 병목은 운영체제보다 다음 항목입니다.
 
@@ -177,25 +183,30 @@ NumPy, OpenCV, FFmpeg, OpenColorIO를 사용하므로 Apple Silicon과 Intel Mac
 - `flow.enabled`를 켰을 때의 CPU optical-flow 분석
 - ProRes/HEVC 인코딩 방식
 
-따라서 같은 CPU·SSD·출력 설정이면 Windows와 macOS의 차이는 크지 않으며, 최신
-Apple Silicon Mac은 일반적인 CPU 기반 렌더에서 충분히 경쟁력 있습니다. VP Stitch는
-대표 remap에서 CPU와 OpenCL의 업로드·다운로드까지 포함해 측정하고, 품질 허용치를
-통과하면서 충분히 빠른 경로만 선택합니다. 따라서 GPU가 존재하더라도 CPU가 더 빠르면
-프리뷰와 최종 렌더의 remap은 CPU를 유지합니다. `VPSTITCH_REMAP_BACKEND=cpu|opencl|auto`
-환경변수로 진단용 강제 선택도 가능하지만 기본값은 `auto`입니다.
+macOS 기본값은 `VPSTITCH_GPU_BACKEND=auto`이며 OCIO·uint16·optical-flow off 조건에서
+Metal 최종 렌더를 선택합니다. `VPSTITCH_GPU_BACKEND=metal|cpu`로 진단용 강제 선택이
+가능합니다. 기본 Metal 재샘플러는 품질과 속도의 균형이 좋은 cubic이며,
+`VPSTITCH_METAL_FILTER=lanczos4`로 더 느린 Lanczos4 비교 렌더를 실행할 수 있습니다.
+Windows와 CPU 폴백의 remap 진단은 기존
+`VPSTITCH_REMAP_BACKEND=cpu|opencl|auto`를 사용합니다.
 
 15K~20K 출력, OCIO 또는 optical flow를 사용하면 Apple Silicon에서도 CPU·메모리·SSD
 부하가 크게 걸리는 정상적인 오프라인 렌더입니다. 현재는 타일 처리, 디스크 기반 투영
 맵 재사용, decoder frame-buffer 재사용, bounded 메모리, TC/트림 시작점의 정확한
-frame-index trim이 적용되어 있습니다. 동기화된 입력 프레임 한 묶음이 256 MiB 이하일
-때만 한 프레임 선읽기를 사용하며, 그보다 큰 고해상도 촬영본은 zero-copy 순차 경로로
-자동 전환합니다. FFmpeg 오류 출력은 256 KiB 링버퍼로 계속 배출해 장시간 렌더의 파이프
+frame-index trim이 적용되어 있습니다. 동기화된 입력 프레임 한 묶음이 시스템 메모리 기반
+자동 예산 안에 들어오면 한 프레임 선읽기로 디코딩과 Metal 렌더를 겹치며, 예산을 넘으면
+bounded 순차 경로로 자동 전환합니다. FFmpeg 오류 출력은 256 KiB 링버퍼로 계속 배출해 장시간 렌더의 파이프
 정체를 방지합니다.
 가장 큰 속도 개선은 `flow.enabled=false`로 먼저 렌더하고, 반복 작업에서는 동일한
 projection cache를 유지하며, 프리뷰를 작은 canvas로 확인한 뒤 마스터를 렌더하는 것입니다.
 임포트 프록시는 macOS에서 VideoToolbox, Windows에서 NVENC/QSV/AMF를 가용 순서대로
 시도하고 초기화가 실패하면 자동으로 `libx264`로 되돌아갑니다. 이 경로는 저해상도
 8-bit 재생 프록시에만 적용되며 10/12-bit 마스터 렌더 품질에는 영향을 주지 않습니다.
+
+개발 기준 M3 Pro(18-core GPU), 5952×3968 5카메라, 20000×5504 P3-PQ 출력에서 고정 맵
+준비 후 스티치 구간은 약 1.2초/프레임으로 측정되었습니다. 24 fps 1분은 ProRes 인코딩과
+초기 준비 시간을 포함해 약 35–40분 범위가 목표이며, 저장장치·소스 코덱·flow 설정에
+따라 달라집니다.
 
 ## 품질 원칙
 
