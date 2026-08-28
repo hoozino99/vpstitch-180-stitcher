@@ -471,12 +471,52 @@ def preview_dimensions(
 
 
 def live_playback_limits(camera_count: int) -> tuple[int, int]:
-    """Return a real-time draft ceiling tuned for the active camera count."""
+    """Return a sharp low-latency ceiling tuned for the active camera count."""
     if camera_count == 3:
-        return 720, 405
+        return 1920, 1080
     if camera_count == 5:
-        return 576, 324
+        return 1280, 720
     raise ValueError("live playback requires a 3-camera or 5-camera set")
+
+
+def format_render_duration(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds) or seconds < 0.0:
+        return "ESTIMATING"
+    rounded = max(0, int(round(seconds)))
+    hours, remainder = divmod(rounded, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def render_progress_text(
+    done: int, total: int, eta_seconds: float | None = None
+) -> str:
+    if total <= 0:
+        return "ESTIMATING"
+    bounded = min(max(0, int(done)), int(total))
+    percent = 100.0 * bounded / total
+    if bounded >= total:
+        return "100%"
+    return f"{percent:.1f}% · {format_render_duration(eta_seconds)} LEFT"
+
+
+def render_queue_status_text(
+    status: RenderStatus,
+    progress: tuple[int, int, float | None] | None,
+) -> str:
+    if status is RenderStatus.DONE:
+        return "100% · DONE"
+    if status is not RenderStatus.RENDERING or progress is None:
+        return status.value.upper()
+    done, total, eta_seconds = progress
+    if total <= 0:
+        return "0.0% · EST"
+    bounded = min(max(0, int(done)), int(total))
+    percent = 100.0 * bounded / total
+    eta = "—" if eta_seconds is None else format_render_duration(eta_seconds)
+    return f"{percent:.1f}% · {eta}"
 
 
 def ocio_space_names(identifier: str) -> tuple[str, ...]:
@@ -2251,7 +2291,9 @@ class MainWindow(QMainWindow):
         self._live_preview_pending = False
         self._live_preview_revision = 0
         self._live_preview_message = "Live preview updated"
-        self._interactive_renderer = InteractivePreviewRenderer()
+        self._interactive_renderer = InteractivePreviewRenderer(
+            max_width=2048, max_height=1152
+        )
         self._interactive_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="vpstitch-preview",
@@ -2312,6 +2354,13 @@ class MainWindow(QMainWindow):
         self._queue_running = False
         self._queue_current_id: str | None = None
         self._queue_load_error: str | None = None
+        self._queue_progress: dict[str, tuple[int, int, float | None]] = {}
+        self._render_progress_started_at: float | None = None
+        self._render_progress_last_at: float | None = None
+        self._render_progress_last_done = 0
+        self._render_seconds_per_frame: float | None = None
+        self._process_output_buffer = ""
+        self._process_phase = ""
         self._active_timeline_id: str | None = None
         self._active_bin_id: str | None = None
         self._loading_timeline = False
@@ -2335,6 +2384,7 @@ class MainWindow(QMainWindow):
         )
         self._auto_workflows_enabled = not bool(os.environ.get("PYTEST_CURRENT_TEST"))
         self._last_autosave_digest: str | None = None
+        self._last_autosave_at: float | None = None
         self._project_undo_stack: list[
             tuple[dict[str, object], str | None, str | None]
         ] = []
@@ -2875,9 +2925,9 @@ class MainWindow(QMainWindow):
         self.queue_status = QLabel("No timelines queued")
         self.queue_status.setProperty("muted", True)
         queue_layout.addWidget(self.queue_status)
-        self.queue_table = QTableWidget(0, 5)
+        self.queue_table = QTableWidget(0, 4)
         self.queue_table.setHorizontalHeaderLabels(
-            ["TIMELINE", "FPS", "FORMAT", "FILE", "STATUS"]
+            ["TIMELINE", "FPS", "FORMAT", "STATUS / ETA"]
         )
         self.queue_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -2888,7 +2938,7 @@ class MainWindow(QMainWindow):
         self.queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.queue_table.verticalHeader().setVisible(False)
         self.queue_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
+            0, QHeaderView.ResizeMode.Stretch
         )
         self.queue_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents
@@ -2897,10 +2947,7 @@ class MainWindow(QMainWindow):
             2, QHeaderView.ResizeMode.ResizeToContents
         )
         self.queue_table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.Stretch
-        )
-        self.queue_table.horizontalHeader().setSectionResizeMode(
-            4, QHeaderView.ResizeMode.ResizeToContents
+            3, QHeaderView.ResizeMode.ResizeToContents
         )
         self.queue_table.doubleClicked.connect(self.load_selected_queue_job)
         self.queue_table.itemSelectionChanged.connect(
@@ -2971,7 +3018,7 @@ class MainWindow(QMainWindow):
         self.autosave_status = QLabel("AUTOSAVE ON")
         self.autosave_status.setObjectName("autosaveStatus")
         self.autosave_status.setToolTip(
-            "Project edits save atomically as they happen. A recovery snapshot is refreshed every 10 minutes only when content changed."
+            "Project edits save atomically as they happen. The time shown is the last verified disk save; a recovery snapshot refreshes every 10 minutes only when content changed."
         )
         self.task_label = QLabel("READY")
         self.progress = QProgressBar()
@@ -3267,6 +3314,7 @@ class MainWindow(QMainWindow):
             restored.change_listener = self._project_store_changed
             self.project_store = restored
             self._last_autosave_digest = None
+            self._last_autosave_at = None
             self._active_timeline_id = None
             known_bins = {item.id for item in restored.bins}
             self._active_bin_id = bin_id if bin_id in known_bins else None
@@ -4265,6 +4313,7 @@ class MainWindow(QMainWindow):
         self.project_store = store
         self.project_store.change_listener = self._project_store_changed
         self._last_autosave_digest = None
+        self._last_autosave_at = None
         self._active_timeline_id = None
         self._active_bin_id = None
         project_directory = store.path.parent
@@ -4301,14 +4350,22 @@ class MainWindow(QMainWindow):
             ).encode("utf-8")
             digest = hashlib.sha256(encoded).hexdigest()
             if not force and digest == self._last_autosave_digest:
-                self.autosave_status.setText("AUTOSAVE · UP TO DATE")
+                stamp = (
+                    time.strftime("%H:%M", time.localtime(self._last_autosave_at))
+                    if self._last_autosave_at is not None
+                    else "VERIFIED"
+                )
+                self.autosave_status.setText(f"AUTOSAVE · UP TO DATE · {stamp}")
                 return False
             self.project_store.save()
             self.project_store.save_copy(
                 self.project_store.path.with_name("project.autosave.json")
             )
             self._last_autosave_digest = digest
-            self.autosave_status.setText(f"AUTOSAVED · {time.strftime('%H:%M')}")
+            self._last_autosave_at = time.time()
+            self.autosave_status.setText(
+                f"AUTOSAVED · {time.strftime('%H:%M', time.localtime(self._last_autosave_at))}"
+            )
             return True
         except (OSError, ProjectError, TypeError, ValueError) as error:
             self.autosave_status.setText("AUTOSAVE · ERROR")
@@ -7720,6 +7777,7 @@ class MainWindow(QMainWindow):
             stat = Path(source).stat()
             playback_fingerprints.append((source, stat.st_size, stat.st_mtime_ns))
         payload = {
+            "playback_pipeline": 2,
             "config": config,
             "viewer_monitor": str(self.viewer_monitor.currentData() or "sdr-rec709"),
             "sources": fingerprints,
@@ -9135,8 +9193,8 @@ class MainWindow(QMainWindow):
             width, height = preview_dimensions(
                 self.canvas_width.value(),
                 self.canvas_height.value(),
-                max_width=960,
-                max_height=540,
+                max_width=1920,
+                max_height=1080,
             )
             decode_scale = self._write_preview_config(
                 full_config,
@@ -9709,8 +9767,9 @@ class MainWindow(QMainWindow):
                     str(video.get("output_codec", "")),
                     str(video.get("output_codec", "Unknown")),
                 ),
-                job.output_path.name,
-                job.status.value.upper(),
+                render_queue_status_text(
+                    job.status, self._queue_progress.get(job.id)
+                ),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -9720,6 +9779,7 @@ class MainWindow(QMainWindow):
                         f"{job.name}\nRange {frame_range}\nCanvas {width}×{height}"
                         f"\nFPS {_format_frame_rate(video.get('fps'))}"
                         f" · {str(metadata.get('fps_mode') or FPS_MODE_MATCH_SOURCE)}"
+                        f"\nOutput {job.output_path}"
                         f"\nSettings lock {job.snapshot_digest}"
                     )
                 elif column == 1:
@@ -9738,9 +9798,7 @@ class MainWindow(QMainWindow):
                     item.setToolTip(
                         f"{codec} · {bit_depth}-bit" if bit_depth else codec
                     )
-                elif column == 3:
-                    item.setToolTip(str(job.output_path))
-                if column == 4:
+                if column == 3:
                     colors = {
                         RenderStatus.QUEUED: "#c8c3df",
                         RenderStatus.RENDERING: "#e5c878",
@@ -9748,7 +9806,10 @@ class MainWindow(QMainWindow):
                         RenderStatus.FAILED: "#e37d83",
                     }
                     item.setForeground(QColor(colors[job.status]))
-                    item.setToolTip(job.error or "")
+                    item.setToolTip(
+                        job.error
+                        or f"Output: {job.output_path}\nCompleted frames and estimated remaining render time"
+                    )
                 self.queue_table.setItem(row, column, item)
             if job.id == selected_id:
                 selected_row = row
@@ -9949,6 +10010,16 @@ class MainWindow(QMainWindow):
             return
 
         self._queue_current_id = job.id
+        total_frames = (
+            max(0, job.out_frame - job.in_frame)
+            if job.out_frame is not None
+            else int(job.config_snapshot.get("video", {}).get("frames") or 0)
+        )
+        self._queue_progress[job.id] = (0, total_frames, None)
+        self._render_progress_started_at = time.monotonic()
+        self._render_progress_last_at = self._render_progress_started_at
+        self._render_progress_last_done = 0
+        self._render_seconds_per_frame = None
         self._append_log(
             f"Queue settings locked: {job.snapshot_digest} · {job.name}"
         )
@@ -9974,6 +10045,9 @@ class MainWindow(QMainWindow):
 
         def completed() -> None:
             self._commit_render_staging(staging, output)
+            progress = self._queue_progress.get(job.id)
+            if progress is not None:
+                self._queue_progress[job.id] = (progress[1], progress[1], 0.0)
             self.render_queue.update(
                 job.id, status=RenderStatus.DONE, error=None
             )
@@ -10147,6 +10221,8 @@ class MainWindow(QMainWindow):
         self._process_failure = failure
         self._process_interactive = interactive
         self._process_task_name = task
+        self._process_output_buffer = ""
+        self._process_phase = ""
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(self._working_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -10250,16 +10326,23 @@ class MainWindow(QMainWindow):
         text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         normalized = text.replace("\r", "\n")
         progress_value: tuple[int, int] | None = None
+        frame_progress: tuple[int, int] | None = None
         frame_value: str | None = None
         for line in normalized.splitlines():
+            phase = re.fullmatch(r"\s*phase\s+([a-z-]+)\s*", line)
+            if phase:
+                self._process_phase = phase.group(1)
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
             if match:
                 progress_value = int(match.group(1)), int(match.group(2))
+            completed = re.search(r"progress\s+frames\s+(\d+)/(\d+)", line)
+            if completed:
+                frame_progress = int(completed.group(1)), int(completed.group(2))
             frame = re.search(r"frame\s+(\d+)", line)
             if frame:
                 frame_value = frame.group(1)
             progress_only = re.fullmatch(
-                r"\s*(?:tiles\s+\d+/\d+|frame\s+\d+)\s*",
+                r"\s*(?:phase\s+[a-z-]+|tiles\s+\d+/\d+|frame\s+\d+|progress\s+frames\s+\d+/\d+)\s*",
                 line,
                 flags=re.IGNORECASE,
             )
@@ -10267,11 +10350,50 @@ class MainWindow(QMainWindow):
                 self._append_log(line)
         if progress_value is not None:
             done, total = progress_value
-            self.progress.setRange(0, total)
-            self.progress.setValue(done)
-        if frame_value is not None:
+            if self._process_phase == "projection-cache":
+                self.progress.setRange(0, total)
+                self.progress.setValue(done)
+                self.task_label.setText(f"PREPARING MAPS {done}/{total}")
+            elif frame_progress is None and self._queue_current_id is None:
+                self.progress.setRange(0, total)
+                self.progress.setValue(done)
+        if frame_progress is not None:
+            self._update_render_progress(*frame_progress)
+        if frame_value is not None and frame_progress is None:
             prefix = "CACHE" if self._process_task_name == "BUILD PLAYBACK PROXY" else "FRAME"
             self.task_label.setText(f"{prefix} {frame_value}")
+
+    def _update_render_progress(self, done: int, total: int) -> None:
+        done = min(max(0, int(done)), max(0, int(total)))
+        total = max(0, int(total))
+        now = time.monotonic()
+        if (
+            done > self._render_progress_last_done
+            and self._render_progress_last_at is not None
+        ):
+            sample = (now - self._render_progress_last_at) / (
+                done - self._render_progress_last_done
+            )
+            self._render_seconds_per_frame = (
+                sample
+                if self._render_seconds_per_frame is None
+                else self._render_seconds_per_frame * 0.75 + sample * 0.25
+            )
+            self._render_progress_last_at = now
+            self._render_progress_last_done = done
+        eta = (
+            None
+            if self._render_seconds_per_frame is None
+            else self._render_seconds_per_frame * max(0, total - done)
+        )
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(done)
+        self.task_label.setText(
+            f"FRAME {done}/{total} · {render_progress_text(done, total, eta)}"
+        )
+        if self._queue_current_id is not None:
+            self._queue_progress[self._queue_current_id] = (done, total, eta)
+            self._refresh_queue_table()
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
         sender = self.sender()

@@ -116,7 +116,7 @@ def _world_gradient(camera: Camera, frame_index: int) -> np.ndarray:
 
 
 def test_five_video_cli_roundtrip_is_16bit_and_smooth(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
     source_width, source_height = 320, 240
     output_width, output_height = 1024, 256
@@ -203,6 +203,10 @@ def test_five_video_cli_roundtrip_is_16bit_and_smooth(
     ]
     monkeypatch.setattr(sys, "argv", arguments)
     assert main() == 0
+    output = capsys.readouterr().out
+    assert "progress frames 0/2" in output
+    assert "progress frames 1/2" in output
+    assert "progress frames 2/2" in output
 
     probe = probe_video(output_path)
     assert probe.bit_depth == 16

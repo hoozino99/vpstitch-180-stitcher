@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -28,8 +29,29 @@ Progress = Callable[[int, int], None]
 DEFAULT_OPENCL_SOURCE_BUDGET = 512 * 1024 * 1024
 
 
+def _physical_memory_bytes() -> int | None:
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    total = pages * page_size
+    return total if total > 0 else None
+
+
 def _opencl_source_budget() -> int:
-    default_megabytes = DEFAULT_OPENCL_SOURCE_BUDGET // (1024 * 1024)
+    physical_memory = _physical_memory_bytes()
+    default_bytes = DEFAULT_OPENCL_SOURCE_BUDGET
+    if physical_memory is not None:
+        # Keep the conservative 512 MiB floor on small systems, while allowing
+        # 6K multi-camera plates to use measured OpenCL remapping on machines
+        # with enough unified/device memory. The environment override remains
+        # authoritative for production tuning.
+        default_bytes = min(
+            2 * 1024 * 1024 * 1024,
+            max(DEFAULT_OPENCL_SOURCE_BUDGET, physical_memory // 8),
+        )
+    default_megabytes = default_bytes // (1024 * 1024)
     try:
         megabytes = int(
             os.environ.get(
@@ -41,10 +63,46 @@ def _opencl_source_budget() -> int:
     return max(64, megabytes) * 1024 * 1024
 
 
+def optimized_render_config(config: RigConfig) -> RigConfig:
+    """Use larger execution tiles when memory allows without changing the canvas."""
+    if config.flow.enabled or os.environ.get("VPSTITCH_DISABLE_LARGE_TILES"):
+        return config
+    physical_memory = _physical_memory_bytes()
+    if physical_memory is not None and physical_memory < 16 * 1024**3:
+        return config
+    output = config.output
+    tile_width = (
+        output.tile_width * 2 if output.tile_width <= 1024 else output.tile_width
+    )
+    tile_height = (
+        output.tile_height * 2 if output.tile_height <= 512 else output.tile_height
+    )
+    tile_width = min(output.width, tile_width)
+    tile_height = min(output.height, tile_height)
+    if (tile_width, tile_height) == (output.tile_width, output.tile_height):
+        return config
+    return replace(
+        config,
+        output=replace(output, tile_width=tile_width, tile_height=tile_height),
+    )
+
+
 class Stitcher:
-    def __init__(self, config: RigConfig, map_cache: MapCache | None = None):
+    def __init__(
+        self,
+        config: RigConfig,
+        map_cache: MapCache | None = None,
+        *,
+        quantization_tile_size: tuple[int, int] | None = None,
+    ):
         self.config = config
         self.map_cache = map_cache
+        self.quantization_tile_size = quantization_tile_size or (
+            config.output.tile_width,
+            config.output.tile_height,
+        )
+        if min(self.quantization_tile_size) < 1:
+            raise ValueError("quantization tile dimensions must be positive")
         self.color = ColorPipeline(
             config.color,
             [camera.colorspace for camera in config.cameras],
@@ -127,10 +185,16 @@ class Stitcher:
                 valid_masks,
                 self.config.output.seam_feather_deg,
             )
+            render_indices = (
+                list(range(len(weights)))
+                if self.config.flow.enabled
+                else [index for index, weight in enumerate(weights) if np.any(weight)]
+            )
             warped: list[np.ndarray] = []
-            for index, (source, mapping) in enumerate(
-                zip(working_sources, maps, strict=True)
-            ):
+            render_weights: list[np.ndarray] = []
+            for index in render_indices:
+                source = working_sources[index]
+                mapping = maps[index]
                 backend_profile = (
                     source.shape,
                     source.dtype.str,
@@ -229,8 +293,16 @@ class Stitcher:
                     if self.config.color.mode == "ocio"
                     else self.color.input_to_working(index, mapped)
                 )
-            warped = refine_adjacent_overlaps(warped, weights, self.config.flow)
-            blended = weighted_blend(warped, weights)
+                render_weights.append(weights[index])
+            if warped:
+                warped = refine_adjacent_overlaps(
+                    warped, render_weights, self.config.flow
+                )
+                blended = weighted_blend(warped, render_weights)
+            else:
+                blended = np.zeros(
+                    (render_tile.height, render_tile.width, 3), dtype=np.float32
+                )
             output_tile = self.color.working_to_output(blended)
             crop_y = tile.y - render_tile.y
             crop_x = tile.x - render_tile.x
@@ -243,14 +315,27 @@ class Stitcher:
                 slice(tile.x, tile.x + tile.width),
             )
             if destination.dtype == np.uint16:
-                destination[destination_slice] = quantize_u16(
-                    output_core,
-                    self.config.color.integer_dither,
-                    self.config.color.dither_seed,
-                    frame_index,
-                    tile.x,
-                    tile.y,
-                )
+                quantize_width, quantize_height = self.quantization_tile_size
+                for local_y in range(0, tile.height, quantize_height):
+                    height = min(quantize_height, tile.height - local_y)
+                    for local_x in range(0, tile.width, quantize_width):
+                        width = min(quantize_width, tile.width - local_x)
+                        absolute_x = tile.x + local_x
+                        absolute_y = tile.y + local_y
+                        destination[
+                            absolute_y : absolute_y + height,
+                            absolute_x : absolute_x + width,
+                        ] = quantize_u16(
+                            output_core[
+                                local_y : local_y + height,
+                                local_x : local_x + width,
+                            ],
+                            self.config.color.integer_dither,
+                            self.config.color.dither_seed,
+                            frame_index,
+                            absolute_x,
+                            absolute_y,
+                        )
             else:
                 destination[destination_slice] = output_core.astype(
                     destination.dtype, copy=False

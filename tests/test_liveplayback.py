@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import unicodedata
 from dataclasses import replace
 from pathlib import Path
-import subprocess
 
 import numpy as np
 import pytest
@@ -133,6 +134,27 @@ def test_alignment_rejects_source_path_drift(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="source mismatch"):
         AlignedFramePlan.from_payload(payload, sources, _cameras(3), 24.0)
+
+
+def test_alignment_accepts_equivalent_macos_unicode_paths(tmp_path: Path) -> None:
+    composed_dir = tmp_path / "260828_테스트"
+    composed_dir.mkdir()
+    composed_sources = [composed_dir / f"P0{index}.mp4" for index in range(1, 4)]
+    for source in composed_sources:
+        source.touch()
+    payload = _payload([str(source) for source in composed_sources])
+    decomposed_sources = [
+        unicodedata.normalize("NFD", str(source)) for source in composed_sources
+    ]
+
+    plan = AlignedFramePlan.from_payload(
+        payload,
+        decomposed_sources,
+        _cameras(3),
+        24.0,
+    )
+
+    assert plan.common_frames == 18
 
 
 def test_live_session_keeps_decoder_between_sequential_frames(

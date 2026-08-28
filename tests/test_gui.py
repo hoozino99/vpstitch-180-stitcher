@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,10 +40,13 @@ from vpstitch.gui import (
     ProjectManagerDialog,
     ScrubbableDoubleSpinBox,
     TrimRangeBar,
+    format_render_duration,
     live_playback_limits,
     order_camera_plates,
     plate_number,
     preview_dimensions,
+    render_queue_status_text,
+    render_progress_text,
     resolved_render_output,
     suggest_camera_assignment,
     split_render_output,
@@ -191,10 +195,52 @@ def test_preview_dimensions_preserve_canvas_aspect() -> None:
 
 
 def test_live_playback_limits_budget_more_pixels_for_three_cameras() -> None:
-    assert live_playback_limits(3) == (720, 405)
-    assert live_playback_limits(5) == (576, 324)
+    assert live_playback_limits(3) == (1920, 1080)
+    assert live_playback_limits(5) == (1280, 720)
     with pytest.raises(ValueError, match="3-camera or 5-camera"):
         live_playback_limits(8)
+
+
+def test_render_progress_formats_percent_and_eta_compactly() -> None:
+    assert format_render_duration(None) == "ESTIMATING"
+    assert format_render_duration(65) == "01:05"
+    assert format_render_duration(3_661) == "01:01:01"
+    assert render_progress_text(1, 4, 65) == "25.0% · 01:05 LEFT"
+    assert render_progress_text(4, 4, 0) == "100%"
+    assert render_queue_status_text(RenderStatus.RENDERING, (1, 4, 65)) == (
+        "25.0% · 01:05"
+    )
+    assert render_queue_status_text(RenderStatus.DONE, (4, 4, 0)) == "100% · DONE"
+
+
+def test_queue_progress_updates_percent_eta_and_status_columns(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "ETA" / "project.json"
+    ProjectStore.create(project_path, name="ETA")
+    window = MainWindow(project_path)
+    job = window.render_queue.add(
+        RenderJob.create(
+            name="ETA Take",
+            source_paths=[f"P{number:02d}.mov" for number in range(1, 6)],
+            config_snapshot=json.loads(
+                Path("configs/drive_5cam_180.prores-hq.json").read_text()
+            ),
+            output_path=tmp_path / "eta-take.mov",
+            in_frame=0,
+            out_frame=4,
+        )
+    )
+    window._queue_current_id = job.id
+    window.render_queue.update(job.id, status=RenderStatus.RENDERING)
+    window._render_progress_last_at = time.monotonic() - 2.0
+    window._update_render_progress(1, 4)
+
+    assert window.queue_table.item(0, 3).text().startswith("25.0% · ")
+    assert window.queue_table.item(0, 3).text() != "25.0% · —"
+    assert window.task_label.text().startswith("FRAME 1/4 · 25.0%")
+    window.render_queue.remove(job.id)
+    window.close()
+    app.processEvents()
 
 
 def test_render_output_name_is_canonical_and_codec_specific(tmp_path: Path) -> None:
@@ -317,8 +363,8 @@ def test_gui_builds_small_cached_playback_proxy_config(
     assert captured[0][0] == "BUILD PLAYBACK PROXY"
     config_path = Path(captured[0][1][captured[0][1].index("--config") + 1])
     proxy_config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert proxy_config["output"]["width"] <= 960
-    assert proxy_config["output"]["height"] <= 540
+    assert proxy_config["output"]["width"] == 1920
+    assert proxy_config["output"]["height"] <= 1080
     assert proxy_config["video"]["output_codec"] == "h264-proxy"
     assert proxy_config["video"]["frames"] == 48
     arguments = captured[0][1]
@@ -911,11 +957,11 @@ def test_gui_uses_compact_resolve_style_workspace() -> None:
     assert window.new_timeline_button.text() == "NEW TIMELINE"
     assert window.render_selected_queue_button.text() == "RENDER SELECTED"
     assert window.render_all_queue_button.text() == "RENDER ALL"
-    assert window.queue_table.columnCount() == 5
+    assert window.queue_table.columnCount() == 4
     assert [
         window.queue_table.horizontalHeaderItem(column).text()
-        for column in range(5)
-    ] == ["TIMELINE", "FPS", "FORMAT", "FILE", "STATUS"]
+        for column in range(4)
+    ] == ["TIMELINE", "FPS", "FORMAT", "STATUS / ETA"]
     assert window.media_tree.selectionMode().name == "ExtendedSelection"
     assert window.import_button.text() == "IMPORT"
     assert window.assign_media_button.text() == "ASSIGN SELECTED"
@@ -2401,6 +2447,7 @@ def test_autosave_snapshot_skips_unchanged_project(tmp_path: Path) -> None:
     first_mtime = recovery.stat().st_mtime_ns
     assert window._autosave_project_snapshot() is False
     assert recovery.stat().st_mtime_ns == first_mtime
+    assert window.autosave_status.text().startswith("AUTOSAVE · UP TO DATE · ")
 
     window.project_store.update_settings(name="Autosave Updated")
     assert window._autosave_project_snapshot() is True

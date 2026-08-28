@@ -20,7 +20,7 @@ from .config import (
 )
 from .ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_video
 from .imageio import ExrSequenceEncoder, read_image, write_png
-from .pipeline import Stitcher
+from .pipeline import Stitcher, optimized_render_config
 from .mapcache import MapCache
 from .canvas import analyze_canvas, write_coverage_mask
 from .diagnostics import assess_inputs, interpret_input_probes, resolve_passthrough_video
@@ -196,8 +196,24 @@ def _stitch_video(args: argparse.Namespace) -> None:
             )
         config = replace(config, cameras=tuple(scaled_cameras))
 
+    print("phase projection-cache", flush=True)
     cache = MapCache(config, args.map_cache).open(progress=_progress)
-    stitcher = Stitcher(config, map_cache=cache)
+    print("phase render", flush=True)
+    execution_config = optimized_render_config(config)
+    stitcher = Stitcher(
+        execution_config,
+        map_cache=cache,
+        quantization_tile_size=(
+            config.output.tile_width,
+            config.output.tile_height,
+        ),
+    )
+    if execution_config.output != config.output:
+        print(
+            "render tiles: "
+            f"{config.output.tile_width}x{config.output.tile_height} -> "
+            f"{execution_config.output.tile_width}x{execution_config.output.tile_height}"
+        )
     decoders: list[VideoDecoder] = []
     encoder: ExrSequenceEncoder | DpxSequenceEncoder | VideoEncoder | None = None
     destination: np.memmap | None = None
@@ -269,6 +285,8 @@ def _stitch_video(args: argparse.Namespace) -> None:
             "decode scheduling: "
             + ("one-frame bounded prefetch" if prefetch else "zero-copy sequential")
         )
+        if config.video.frames is not None:
+            print(f"progress frames 0/{config.video.frames}", flush=True)
         while config.video.frames is None or frame_index < config.video.frames:
             prefetch_next = (
                 config.video.frames is None
@@ -287,7 +305,7 @@ def _stitch_video(args: argparse.Namespace) -> None:
                         + ", ".join(ended)
                     )
                 break
-            print(f"frame {frame_index}")
+            print(f"frame {frame_index}", flush=True)
             stitcher.stitch_arrays(
                 sources,  # type: ignore[arg-type]
                 destination,
@@ -301,6 +319,11 @@ def _stitch_video(args: argparse.Namespace) -> None:
                 )
             encoder.write(destination)
             frame_index += 1
+            if config.video.frames is not None:
+                print(
+                    f"progress frames {frame_index}/{config.video.frames}",
+                    flush=True,
+                )
     finally:
         preserving_error = sys.exc_info()[0] is not None
         # Close decoder pipes before joining a possible prefetch read. This

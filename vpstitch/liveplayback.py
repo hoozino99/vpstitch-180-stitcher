@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -43,7 +44,18 @@ class AlignedFramePlan:
             if not isinstance(item, dict):
                 raise ValueError("alignment input entry is invalid")
             planned_path = Path(str(item.get("path", ""))).resolve()
-            if planned_path != Path(source).resolve():
+            source_path = Path(source).resolve()
+            try:
+                paths_match = planned_path.samefile(source_path)
+            except OSError:
+                # Qt/macOS can pass an APFS path in decomposed Unicode (NFD)
+                # while the JSON plan contains the composed spelling (NFC).
+                # They name the same path even though direct string comparison
+                # reports a mismatch.
+                paths_match = unicodedata.normalize(
+                    "NFC", str(planned_path)
+                ) == unicodedata.normalize("NFC", str(source_path))
+            if not paths_match:
                 raise ValueError(
                     f"alignment source mismatch: expected {planned_path}, got {source}"
                 )

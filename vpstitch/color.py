@@ -138,7 +138,7 @@ def quantize_u16(
     tile_x: int,
     tile_y: int,
 ) -> np.ndarray:
-    values = np.clip(image, 0.0, 1.0).astype(np.float64)
+    values = np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
     if dither:
         mixed_seed = (
             seed
@@ -148,6 +148,9 @@ def quantize_u16(
         ) & 0xFFFFFFFF
         rng = np.random.default_rng(mixed_seed)
         # Triangular PDF dither with a +/- 1 LSB peak-to-peak range.
-        noise = rng.random(values.shape) - rng.random(values.shape)
-        values += noise / 65535.0
-    return np.rint(np.clip(values, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        noise = rng.random(values.shape, dtype=np.float32)
+        noise -= rng.random(values.shape, dtype=np.float32)
+        values = values + noise * np.float32(1.0 / 65535.0)
+    return np.rint(np.clip(values, 0.0, 1.0) * np.float32(65535.0)).astype(
+        np.uint16
+    )

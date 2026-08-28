@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 import PyOpenColorIO as ocio
+import vpstitch.pipeline as pipeline
 
 from vpstitch.color import (
     BUNDLED_ACES_STUDIO_ID,
@@ -15,7 +16,7 @@ from vpstitch.color import (
 )
 from vpstitch.config import Camera, Color, Lens, Output, RigConfig, load_config
 from vpstitch.geometry import camera_to_world
-from vpstitch.pipeline import Stitcher
+from vpstitch.pipeline import Stitcher, optimized_render_config
 from vpstitch.renderqueue import RenderJob
 
 
@@ -77,6 +78,59 @@ def test_five_camera_pipeline_preserves_smooth_16bit_gradient() -> None:
     assert np.unique(destination[..., 0]).size > 1000
     assert np.mean(destination[..., 0] == 0) == 0
     assert np.mean(np.abs(center - expected)) < 0.001
+
+
+def test_pipeline_skips_cameras_with_zero_tile_weight(monkeypatch) -> None:
+    rig = _rig()
+    sources = [_world_gradient(camera) for camera in rig.cameras]
+    destination = np.zeros((rig.output.height, rig.output.width, 3), dtype=np.uint16)
+    calls = 0
+    real_remap = pipeline.remap_camera
+
+    def tracked_remap(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_remap(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "remap_camera", tracked_remap)
+    stitcher = Stitcher(rig)
+    stitcher._backend_rejected = True
+    stitcher.stitch_arrays(sources, destination)
+
+    tile_total = 8
+    assert 0 < calls < tile_total * len(rig.cameras)
+    assert np.mean(destination[..., 0] == 0) == 0
+
+
+def test_opencl_source_budget_scales_with_machine_memory(monkeypatch) -> None:
+    monkeypatch.delenv("VPSTITCH_OPENCL_SOURCE_BUDGET_MB", raising=False)
+    monkeypatch.setattr(pipeline, "_physical_memory_bytes", lambda: 32 * 1024**3)
+    assert pipeline._opencl_source_budget() == 2 * 1024**3
+    monkeypatch.setenv("VPSTITCH_OPENCL_SOURCE_BUDGET_MB", "768")
+    assert pipeline._opencl_source_budget() == 768 * 1024**2
+
+
+def test_larger_execution_tiles_keep_authoritative_pixels(monkeypatch) -> None:
+    rig = replace(_rig(), color=Color(integer_dither=True, dither_seed=91))
+    sources = [_world_gradient(camera) for camera in rig.cameras]
+    baseline = np.zeros((rig.output.height, rig.output.width, 3), dtype=np.uint16)
+    optimized = np.zeros_like(baseline)
+    monkeypatch.setattr(pipeline, "_physical_memory_bytes", lambda: 32 * 1024**3)
+    execution = optimized_render_config(rig)
+    assert execution.output.tile_width == rig.output.tile_width * 2
+    assert execution.output.tile_height == rig.output.tile_height * 2
+
+    baseline_stitcher = Stitcher(rig)
+    optimized_stitcher = Stitcher(
+        execution,
+        quantization_tile_size=(rig.output.tile_width, rig.output.tile_height),
+    )
+    baseline_stitcher._backend_rejected = True
+    optimized_stitcher._backend_rejected = True
+    baseline_stitcher.stitch_arrays(sources, baseline, frame_index=4)
+    optimized_stitcher.stitch_arrays(sources, optimized, frame_index=4)
+
+    np.testing.assert_array_equal(optimized, baseline)
 
 
 def test_ocio_raw_roundtrip_uses_float_image_descriptor(tmp_path: Path) -> None:
