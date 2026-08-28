@@ -134,6 +134,7 @@ BUILTIN_ACES_STUDIO = BUNDLED_ACES_STUDIO_ID
 VIDEO_FILTER = "Video files (*.mov *.mp4 *.mkv *.avi *.mxf);;All files (*.*)"
 SUPPORTED_CAMERA_COUNTS = (3, 5)
 AUTOSAVE_INTERVAL_MS = 10 * 60 * 1000
+_MEDIA_BIN_UNSET = object()
 FPS_MODE_MATCH_SOURCE = "match_source"
 FPS_MODE_CUSTOM = "custom"
 FPS_MATCH_TOLERANCE = 0.001
@@ -6363,7 +6364,12 @@ class MainWindow(QMainWindow):
             self.settings.setValue("lastConfig", str(destination))
             self._append_log(f"Saved rig profile: {destination}")
 
-    def import_media_paths(self, files: list[str]) -> list[MediaRecord]:
+    def import_media_paths(
+        self,
+        files: list[str],
+        *,
+        destination_bin_id: str | None | object = _MEDIA_BIN_UNSET,
+    ) -> list[MediaRecord]:
         existing = {str(item.path) for item in self.project_store.media}
         ordered = sorted(
             files,
@@ -6372,7 +6378,18 @@ class MainWindow(QMainWindow):
                 Path(path).name.lower(),
             ),
         )
-        bin_id = self._media_tree_destination_bin(default_to_first=True)
+        if destination_bin_id is _MEDIA_BIN_UNSET:
+            bin_id = self._media_tree_destination_bin(default_to_first=True)
+        else:
+            bin_id = (
+                None
+                if destination_bin_id is None
+                else str(destination_bin_id)
+            )
+        if bin_id is not None and not any(
+            folder.id == bin_id for folder in self.project_store.bins
+        ):
+            raise ProjectError("The selected import folder no longer exists.")
         records: list[MediaRecord] = []
         next_order = len(self.project_store.list_media(bin_id))
         for path in ordered:
@@ -6680,6 +6697,10 @@ class MainWindow(QMainWindow):
                 )
 
     def choose_videos(self) -> None:
+        destination_bin_id = self._media_tree_destination_bin(
+            default_to_first=True
+        )
+        destination_label = self._bin_display_path(destination_bin_id)
         if self._import_dialog is None:
             dialog = QFileDialog(self)
             dialog.setWindowTitle("Import Media · Select Camera Clips")
@@ -6703,9 +6724,13 @@ class MainWindow(QMainWindow):
         if files:
             self.settings.setValue("lastImportDir", str(Path(files[0]).parent))
             try:
-                added = self.import_media_paths(files)
+                added = self.import_media_paths(
+                    files,
+                    destination_bin_id=destination_bin_id,
+                )
                 self.statusBar().showMessage(
-                    f"Imported {len(added)} media clips · right-click the selected clips to add them to a timeline",
+                    f"Imported {len(added)} media clips into {destination_label} · "
+                    "right-click the selected clips to add them to a timeline",
                     12000,
                 )
             except Exception as error:

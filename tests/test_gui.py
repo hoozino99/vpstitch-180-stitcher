@@ -2479,6 +2479,46 @@ def test_gui_reuses_import_dialog_to_avoid_macos_native_teardown(monkeypatch) ->
     app.processEvents()
 
 
+def test_import_button_locks_selected_folder_before_dialog_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._auto_workflows_enabled = False
+    store = ProjectStore.create(tmp_path / "project.json", name="Button Import")
+    shoot = store.add_bin(Bin.create("Shoot", bin_id="shoot"))
+    day = store.add_bin(Bin.create("Day 01", parent_id=shoot.id, bin_id="day-01"))
+    window.project_store = store
+    window._refresh_media_tree()
+    iterator = QTreeWidgetItemIterator(window.media_tree)
+    while iterator.value() is not None:
+        item = iterator.value()
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) == day.id:
+            window.media_tree.setCurrentItem(item)
+            break
+        iterator += 1
+    source = tmp_path / "button_P01.mov"
+
+    def accept_after_focus_change(_dialog: QFileDialog) -> QDialog.DialogCode:
+        root = window.media_tree.topLevelItem(0)
+        window.media_tree.setCurrentItem(root)
+        window._active_bin_id = None
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QFileDialog, "exec", accept_after_focus_change)
+    monkeypatch.setattr(QFileDialog, "selectedFiles", lambda _dialog: [str(source)])
+
+    window.import_button.click()
+
+    imported = store.list_media(day.id)
+    assert len(imported) == 1
+    assert imported[0].path == source
+    assert store.list_media(None) == ()
+    assert "Shoot / Day 01" in window.statusBar().currentMessage()
+    window.close()
+    app.processEvents()
+
+
 def test_input_settings_keep_bitrate_read_only_and_persist_interpretation(
     tmp_path: Path,
 ) -> None:
