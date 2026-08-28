@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 import json
@@ -22,6 +23,7 @@ from .ffmpegio import DpxSequenceEncoder, VideoDecoder, VideoEncoder, probe_vide
 from .imageio import ExrSequenceEncoder, read_image, write_png
 from .pipeline import Stitcher, optimized_render_config
 from .mapcache import MapCache
+from .metal import MetalBackendError, NativeMetalVideoEncoder
 from .canvas import analyze_canvas, write_coverage_mask
 from .diagnostics import assess_inputs, interpret_input_probes, resolve_passthrough_video
 from .calibration import CalibrationError, calibrate_checkerboard
@@ -215,12 +217,37 @@ def _stitch_video(args: argparse.Namespace) -> None:
             f"{execution_config.output.tile_width}x{execution_config.output.tile_height}"
         )
     decoders: list[VideoDecoder] = []
-    encoder: ExrSequenceEncoder | DpxSequenceEncoder | VideoEncoder | None = None
-    destination: np.memmap | None = None
+    encoder: (
+        ExrSequenceEncoder
+        | DpxSequenceEncoder
+        | VideoEncoder
+        | NativeMetalVideoEncoder
+        | None
+    ) = None
+    destination: np.ndarray | np.memmap | None = None
     temporary_context: tempfile.TemporaryDirectory[str] | None = None
     frame_reader: FrameBundleReader | None = None
     frame_index = 0
     cleanup_error: Exception | None = None
+    native_preference = "auto"
+
+    def ensure_frame_destination() -> np.ndarray | np.memmap:
+        nonlocal destination, temporary_context
+        if destination is not None:
+            return destination
+        frame_shape = (config.output.height, config.output.width, 3)
+        temporary_context = tempfile.TemporaryDirectory(prefix="vpstitch-")
+        frame_path = Path(temporary_context.name) / "frame.rgb48"
+        destination_dtype = (
+            np.float16
+            if config.video.output_codec == "exr-half-sequence"
+            else np.uint16
+        )
+        destination = np.memmap(
+            frame_path, dtype=destination_dtype, mode="w+", shape=frame_shape
+        )
+        return destination
+
     try:
         for index, (path, camera, probe) in enumerate(
             zip(args.inputs, config.cameras, probes, strict=True)
@@ -262,23 +289,49 @@ def _stitch_video(args: argparse.Namespace) -> None:
                 config.color,
             )
         else:
-            encoder = VideoEncoder(
-                args.output,
-                config.output.width,
-                config.output.height,
-                config.video,
+            native_preference = os.environ.get(
+                "VPSTITCH_NATIVE_PRORES", "auto"
+            ).strip().lower()
+            native_metadata_supported = (
+                config.video.color_range in {None, "tv"}
+                and config.video.color_primaries
+                in {"bt709", "smpte432", "bt2020"}
+                and config.video.color_trc
+                in {"bt709", "smpte2084", "arib-std-b67"}
+                and config.video.colorspace
+                in {"bt709", "bt2020nc"}
             )
-        frame_shape = (config.output.height, config.output.width, 3)
-        temporary_context = tempfile.TemporaryDirectory(prefix="vpstitch-")
-        frame_path = Path(temporary_context.name) / "frame.rgb48"
-        destination_dtype = (
-            np.float16
-            if config.video.output_codec == "exr-half-sequence"
-            else np.uint16
-        )
-        destination = np.memmap(
-            frame_path, dtype=destination_dtype, mode="w+", shape=frame_shape
-        )
+            use_native = (
+                sys.platform == "darwin"
+                and config.video.output_codec == "prores-hq"
+                and config.color.mode == "ocio"
+                and native_preference not in {"0", "false", "off", "ffmpeg"}
+                and native_metadata_supported
+            )
+            if use_native:
+                try:
+                    encoder = stitcher.create_native_prores_encoder(args.output)
+                    print(
+                        "encode backend: Metal -> IOSurface x422 -> "
+                        "Apple ProRes HQ",
+                        flush=True,
+                    )
+                except MetalBackendError as error:
+                    if native_preference in {"1", "true", "on", "force"}:
+                        raise
+                    print(
+                        f"native ProRes unavailable; FFmpeg fallback: {error}",
+                        flush=True,
+                    )
+            if encoder is None:
+                encoder = VideoEncoder(
+                    args.output,
+                    config.output.width,
+                    config.output.height,
+                    config.video,
+                )
+        if not isinstance(encoder, NativeMetalVideoEncoder):
+            ensure_frame_destination()
         prefetch = should_prefetch_decode(config)
         frame_reader = FrameBundleReader(decoders, prefetch=prefetch)
         print(
@@ -306,18 +359,68 @@ def _stitch_video(args: argparse.Namespace) -> None:
                     )
                 break
             print(f"frame {frame_index}", flush=True)
-            stitcher.stitch_arrays(
-                sources,  # type: ignore[arg-type]
-                destination,
-                frame_index=frame_index,
-                progress=_progress,
+            native_encoder = (
+                encoder if isinstance(encoder, NativeMetalVideoEncoder) else None
             )
+            try:
+                encoded_directly = stitcher.stitch_arrays(
+                    sources,  # type: ignore[arg-type]
+                    destination,
+                    frame_index=frame_index,
+                    progress=_progress,
+                    native_encoder=native_encoder,
+                )
+            except MetalBackendError as error:
+                can_fallback_first_frame = (
+                    native_encoder is not None
+                    and frame_index == 0
+                    and native_preference not in {"1", "true", "on", "force"}
+                )
+                if not can_fallback_first_frame:
+                    raise
+                print(
+                    "native ProRes frame-0 append failed; restarting with "
+                    f"FFmpeg fallback: {error}",
+                    flush=True,
+                )
+                native_encoder.abort()
+                encoder = VideoEncoder(
+                    args.output,
+                    config.output.width,
+                    config.output.height,
+                    config.video,
+                )
+                destination = ensure_frame_destination()
+                native_encoder = None
+                encoded_directly = stitcher.stitch_arrays(
+                    sources,  # type: ignore[arg-type]
+                    destination,
+                    frame_index=frame_index,
+                    progress=_progress,
+                )
             if frame_index == 0:
                 print(
                     f"remap backend: {stitcher.backend_decision.backend} · "
                     f"{stitcher.backend_decision.reason}"
                 )
-            encoder.write(destination)
+            if native_encoder is not None and not encoded_directly:
+                # The first frame prepares fixed stitch maps. Re-render that
+                # one frame through the now-ready direct path; later frames go
+                # directly to IOSurface on their first pass.
+                encoded_directly = stitcher.stitch_arrays(
+                    sources,  # type: ignore[arg-type]
+                    destination,
+                    frame_index=frame_index,
+                    native_encoder=native_encoder,
+                )
+                if not encoded_directly:
+                    raise MetalBackendError(
+                        "native ProRes could not use the prepared Metal frame"
+                    )
+            elif native_encoder is None:
+                if destination is None:
+                    raise RuntimeError("frame destination is unavailable")
+                encoder.write(destination)
             frame_index += 1
             if config.video.frames is not None:
                 print(
@@ -343,7 +446,10 @@ def _stitch_video(args: argparse.Namespace) -> None:
                     cleanup_error = error
         if encoder is not None:
             try:
-                encoder.close()
+                if preserving_error and isinstance(encoder, NativeMetalVideoEncoder):
+                    encoder.abort()
+                else:
+                    encoder.close()
             except Exception as error:
                 if cleanup_error is None:
                     cleanup_error = error

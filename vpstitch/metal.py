@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from fractions import Fraction
 import os
 from pathlib import Path
 import sys
@@ -17,6 +18,19 @@ MAX_METAL_CAMERAS = 5
 METAL_KERNEL_NAME = "vpstitch_render"
 METAL_INPUT_KERNEL_NAME = "vpstitch_input"
 METAL_MIN_OUTPUT_PIXELS = 512 * 512
+
+
+def _frame_rate_fraction(fps: float) -> Fraction:
+    for numerator, denominator in (
+        (24000, 1001),
+        (30000, 1001),
+        (60000, 1001),
+        (120000, 1001),
+    ):
+        candidate = numerator / denominator
+        if abs(fps - candidate) < 0.01:
+            return Fraction(numerator, denominator)
+    return Fraction(str(fps)).limit_denominator(1_000_000)
 
 
 class MetalBackendError(RuntimeError):
@@ -189,6 +203,43 @@ def _load_metal_library() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint16),
     ]
     library.vpstitch_metal_render_prepared_frame.restype = ctypes.c_int
+    library.vpstitch_metal_encoder_create.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+    ]
+    library.vpstitch_metal_encoder_create.restype = ctypes.c_void_p
+    library.vpstitch_metal_encoder_ready.argtypes = [ctypes.c_void_p]
+    library.vpstitch_metal_encoder_ready.restype = ctypes.c_int
+    library.vpstitch_metal_encoder_last_error.argtypes = [ctypes.c_void_p]
+    library.vpstitch_metal_encoder_last_error.restype = ctypes.c_char_p
+    library.vpstitch_metal_encoder_finish.argtypes = [ctypes.c_void_p]
+    library.vpstitch_metal_encoder_finish.restype = ctypes.c_int
+    library.vpstitch_metal_encoder_cancel.argtypes = [ctypes.c_void_p]
+    library.vpstitch_metal_encoder_cancel.restype = None
+    library.vpstitch_metal_encoder_destroy.argtypes = [ctypes.c_void_p]
+    library.vpstitch_metal_encoder_destroy.restype = None
+    library.vpstitch_metal_render_encode_prepared_frame.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    library.vpstitch_metal_render_encode_prepared_frame.restype = ctypes.c_int
     if not library.vpstitch_metal_available():
         raise MetalBackendError("Metal device is unavailable")
     return library
@@ -648,6 +699,30 @@ class MetalStitchBackend:
         message = self._library.vpstitch_metal_last_error(self._context)
         return message.decode("utf-8", errors="replace") if message else "unknown Metal error"
 
+    def create_native_prores_encoder(
+        self,
+        path: str | Path,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        color_primaries: str | None,
+        color_trc: str | None,
+        colorspace: str | None,
+        color_range: str | None,
+    ) -> NativeMetalVideoEncoder:
+        return NativeMetalVideoEncoder(
+            self,
+            path,
+            width,
+            height,
+            fps,
+            color_primaries=color_primaries,
+            color_trc=color_trc,
+            colorspace=colorspace,
+            color_range=color_range,
+        )
+
     def upload_sources(self, sources: list[np.ndarray]) -> None:
         if not 1 <= len(sources) <= MAX_METAL_CAMERAS:
             raise MetalBackendError("Metal supports one to five cameras")
@@ -882,6 +957,120 @@ class MetalStitchBackend:
             destination.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
         ):
             raise MetalBackendError(self.last_error())
+
+
+class NativeMetalVideoEncoder:
+    """ProRes HQ writer fed by IOSurface-backed 10-bit 4:2:2 Metal textures."""
+
+    def __init__(
+        self,
+        backend: MetalStitchBackend,
+        path: str | Path,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        color_primaries: str | None,
+        color_trc: str | None,
+        colorspace: str | None,
+        color_range: str | None,
+    ):
+        if fps <= 0:
+            raise MetalBackendError("native ProRes FPS must be positive")
+        if color_primaries is None or color_trc is None or colorspace is None:
+            raise MetalBackendError(
+                "native ProRes requires explicit primaries, transfer, and matrix metadata"
+            )
+        if colorspace == "bt2020c":
+            raise MetalBackendError(
+                "native ProRes does not support BT.2020 constant-luminance conversion"
+            )
+        ratio = _frame_rate_fraction(fps)
+        self._backend = backend
+        self._library = backend._library
+        self._context = backend._context
+        self._handle = self._library.vpstitch_metal_encoder_create(
+            self._context,
+            os.fsencode(Path(path)),
+            width,
+            height,
+            ratio.numerator,
+            ratio.denominator,
+            color_primaries.encode("ascii"),
+            color_trc.encode("ascii"),
+            colorspace.encode("ascii"),
+            (color_range or "tv").encode("ascii"),
+        )
+        if not self._handle:
+            raise MetalBackendError("native ProRes encoder allocation failed")
+        self._finalizer = weakref.finalize(
+            self,
+            self._library.vpstitch_metal_encoder_destroy,
+            self._handle,
+        )
+        self._closed = False
+        if not self._library.vpstitch_metal_encoder_ready(self._handle):
+            error = self.last_error()
+            self._finalizer()
+            raise MetalBackendError(error)
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+    def last_error(self) -> str:
+        message = self._library.vpstitch_metal_encoder_last_error(self._handle)
+        return (
+            message.decode("utf-8", errors="replace")
+            if message
+            else "unknown native ProRes error"
+        )
+
+    def write_prepared(
+        self,
+        tiles: list[tuple[int, int, int]],
+        *,
+        frame_index: int,
+        dither: bool,
+        seed: int,
+    ) -> None:
+        if self._closed:
+            raise MetalBackendError("native ProRes encoder is closed")
+        if not tiles:
+            raise MetalBackendError("native ProRes frame has no prepared tiles")
+        tile_ids = (ctypes.c_uint32 * len(tiles))(*(item[0] for item in tiles))
+        tile_xs = (ctypes.c_uint32 * len(tiles))(*(item[1] for item in tiles))
+        tile_ys = (ctypes.c_uint32 * len(tiles))(*(item[2] for item in tiles))
+        if not self._library.vpstitch_metal_render_encode_prepared_frame(
+            self._context,
+            self._handle,
+            tile_ids,
+            tile_xs,
+            tile_ys,
+            len(tiles),
+            self.width,
+            self.height,
+            frame_index,
+            int(dither),
+            int(seed) & 0xFFFFFFFF,
+        ):
+            raise MetalBackendError(self.last_error())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if not self._library.vpstitch_metal_encoder_finish(self._handle):
+                raise MetalBackendError(self.last_error())
+        finally:
+            self._finalizer()
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._library.vpstitch_metal_encoder_cancel(self._handle)
+        self._finalizer()
 
 
 def create_metal_backend(

@@ -190,6 +190,19 @@ Metal 최종 렌더를 선택합니다. `VPSTITCH_GPU_BACKEND=metal|cpu`로 진�
 Windows와 CPU 폴백의 remap 진단은 기존
 `VPSTITCH_REMAP_BACKEND=cpu|opencl|auto`를 사용합니다.
 
+macOS의 OCIO·ProRes HQ·limited-range 출력은 스티치된 RGB16 프레임을 CPU로 복사하거나
+FFmpeg stdin으로 보내지 않습니다. Metal이 10-bit 4:2:2 `x422`로 변환한 뒤 IOSurface
+메모리를 `MTLBuffer`로 직접 매핑하고 Apple AVFoundation/VideoToolbox ProRes writer에
+전달합니다. 20000px 출력은 단일 Metal 텍스처 최대 폭 16384px를 넘으므로 텍스처 대신
+stride와 plane offset을 가진 IOSurface buffer를 사용합니다. P3-D65 PQ, Rec.2020 PQ/HLG,
+Rec.709처럼 primaries·transfer·non-constant-luminance matrix가 명시되고 Apple
+메타데이터로 정확히 표현되는 조합만 자동 선택합니다. BT.2020 constant-luminance,
+V-Log처럼 표준 태그가 없는 조합·full-range·비 OCIO 출력은 기존 FFmpeg 고정밀 경로를
+유지합니다. 실제 pixel-buffer pool과 IOSurface/Metal mapping도 프레임 처리 전에
+preflight하므로 지원되지 않는 장치에서는 출력 파일을 시작하기 전에 fallback합니다.
+진단 시 `VPSTITCH_NATIVE_PRORES=off`로 기존 경로를 강제하거나
+`VPSTITCH_NATIVE_PRORES=force`로 네이티브 초기화 실패를 즉시 확인할 수 있습니다.
+
 15K~20K 출력, OCIO 또는 optical flow를 사용하면 Apple Silicon에서도 CPU·메모리·SSD
 부하가 크게 걸리는 정상적인 오프라인 렌더입니다. 현재는 타일 처리, 디스크 기반 투영
 맵 재사용, decoder frame-buffer 재사용, bounded 메모리, TC/트림 시작점의 정확한
@@ -203,10 +216,13 @@ projection cache를 유지하며, 프리뷰를 작은 canvas로 확인한 뒤 �
 시도하고 초기화가 실패하면 자동으로 `libx264`로 되돌아갑니다. 이 경로는 저해상도
 8-bit 재생 프록시에만 적용되며 10/12-bit 마스터 렌더 품질에는 영향을 주지 않습니다.
 
-개발 기준 M3 Pro(18-core GPU), 5952×3968 5카메라, 20000×5504 P3-PQ 출력에서 고정 맵
-준비 후 Metal 스티치만 약 0.27초/프레임, ProRes HQ 파이프까지 포함한 지속 구간은
-중앙값 약 0.9초/프레임으로 측정되었습니다. 24 fps 1분은 초기 준비를 포함해 약 20–25분
-범위가 목표이며, 저장장치·소스 코덱·flow 설정과 열 상태에 따라 달라집니다.
+개발 기준 M3 Pro(18-core GPU), 5952×3968 5카메라, 20000×5504 P3-PQ 출력에서 네이티브
+경로의 60프레임 실측은 초기 셰이더·고정 맵 준비를 포함해 60.17초였습니다. 첫 프레임은
+약 33초, 이후 지속 구간은 약 0.46초/프레임이므로 24 fps 1분은 같은 조건에서 약 12분으로
+추정됩니다. 기존 RGB48→FFmpeg→ProRes 경로는 약 0.9초/프레임이었습니다. 작은 프레임
+5,000개 soak에서 FD는 9개로 고정되고 RSS는 워밍업 후 약 90MB로 안정됐으며, 실제 20K
+60프레임에서도 렌더 안정 구간 RSS는 약 5.52GB로 증가 추세가 없었습니다. 저장장치·소스
+코덱·flow 설정과 열 상태에 따라 실제 시간은 달라집니다.
 
 ## 품질 원칙
 

@@ -27,6 +27,7 @@ from .metal import (
     METAL_MIN_OUTPUT_PIXELS,
     MetalBackendError,
     MetalStitchBackend,
+    NativeMetalVideoEncoder,
     create_metal_backend,
 )
 
@@ -132,13 +133,31 @@ class Stitcher:
         )
         self._metal_tile_cache: dict[tuple[int, int, int, int], int | None] = {}
 
+    def create_native_prores_encoder(
+        self, path: str | Path
+    ) -> NativeMetalVideoEncoder:
+        if self._metal_backend is None or self.config.video is None:
+            raise MetalBackendError("native ProRes requires the Metal video pipeline")
+        video = self.config.video
+        return self._metal_backend.create_native_prores_encoder(
+            path,
+            self.config.output.width,
+            self.config.output.height,
+            video.fps,
+            color_primaries=video.color_primaries,
+            color_trc=video.color_trc,
+            colorspace=video.colorspace,
+            color_range=video.color_range,
+        )
+
     def stitch_arrays(
         self,
         sources: list[np.ndarray],
-        destination: np.ndarray,
+        destination: np.ndarray | None,
         frame_index: int = 0,
         progress: Progress | None = None,
-    ) -> None:
+        native_encoder: NativeMetalVideoEncoder | None = None,
+    ) -> bool:
         if len(sources) != len(self.config.cameras):
             raise ValueError(
                 f"expected {len(self.config.cameras)} sources, got {len(sources)}"
@@ -151,12 +170,16 @@ class Stitcher:
                 )
         expected = (self.config.output.height, self.config.output.width, 3)
         supported_dtypes = {np.dtype("uint16"), np.dtype("float16"), np.dtype("float32")}
-        if destination.shape != expected or destination.dtype not in supported_dtypes:
+        if native_encoder is None and (
+            destination is None
+            or destination.shape != expected
+            or destination.dtype not in supported_dtypes
+        ):
             raise ValueError(f"destination must be uint16/float16/float32 with shape {expected}")
 
         metal_backend = (
             self._metal_backend
-            if destination.dtype == np.uint16
+            if (native_encoder is not None or destination.dtype == np.uint16)
             and not self.config.flow.enabled
             and self.config.color.mode == "ocio"
             else None
@@ -201,6 +224,10 @@ class Stitcher:
                     "OCIO output, and 16-bit quantization",
                 )
             except (MetalBackendError, MemoryError, ValueError) as error:
+                if native_encoder is not None:
+                    raise MetalBackendError(
+                        f"native ProRes source upload failed: {error}"
+                    ) from error
                 self._metal_backend = None
                 metal_backend = None
                 self.hardware_accelerated = False
@@ -211,6 +238,7 @@ class Stitcher:
 
         frame_tiles = list(iter_tiles(self.config.output))
         total = len(frame_tiles)
+        native_prepared_tiles: list[tuple[int, int, int]] = []
         if metal_backend is not None:
             cached_tiles: list[tuple[int, int, int]] = []
             cache_complete = True
@@ -224,19 +252,32 @@ class Stitcher:
                     cached_tiles.append((prepared_id, tile.x, tile.y))
             if cache_complete:
                 try:
-                    # All fixed maps already live on the GPU. Encode every tile
-                    # into one command buffer, wait once, then copy one frame.
-                    metal_backend.render_prepared_frame(
-                        cached_tiles,
-                        destination,
-                        frame_index=frame_index,
-                        dither=self.config.color.integer_dither,
-                        seed=self.config.color.dither_seed,
-                    )
+                    if native_encoder is not None:
+                        native_encoder.write_prepared(
+                            cached_tiles,
+                            frame_index=frame_index,
+                            dither=self.config.color.integer_dither,
+                            seed=self.config.color.dither_seed,
+                        )
+                    else:
+                        # All fixed maps already live on the GPU. Encode every tile
+                        # into one command buffer, wait once, then copy one frame.
+                        assert destination is not None
+                        metal_backend.render_prepared_frame(
+                            cached_tiles,
+                            destination,
+                            frame_index=frame_index,
+                            dither=self.config.color.integer_dither,
+                            seed=self.config.color.dither_seed,
+                        )
                     if progress:
                         progress(total, total)
-                    return
+                    return native_encoder is not None
                 except (MetalBackendError, MemoryError, ValueError) as error:
+                    if native_encoder is not None:
+                        raise MetalBackendError(
+                            f"native ProRes frame batch failed: {error}"
+                        ) from error
                     self._metal_backend = None
                     metal_backend = None
                     self.hardware_accelerated = False
@@ -279,7 +320,16 @@ class Stitcher:
             if has_prepared:
                 prepared_id = self._metal_tile_cache[tile_key]
                 try:
+                    if native_encoder is not None:
+                        if prepared_id is not None:
+                            native_prepared_tiles.append(
+                                (prepared_id, tile.x, tile.y)
+                            )
+                        if progress:
+                            progress(number, total)
+                        continue
                     if prepared_id is not None:
+                        assert destination is not None
                         destination[destination_slice] = (
                             metal_backend.render_prepared_tile(
                                 prepared_id,
@@ -293,11 +343,16 @@ class Stitcher:
                             )
                         )
                     else:
+                        assert destination is not None
                         destination[destination_slice] = 0
                     if progress:
                         progress(number, total)
                     continue
                 except (MetalBackendError, MemoryError, ValueError) as error:
+                    if native_encoder is not None:
+                        raise MetalBackendError(
+                            f"native ProRes cached tile failed: {error}"
+                        ) from error
                     self._metal_backend = None
                     metal_backend = None
                     self.hardware_accelerated = False
@@ -329,7 +384,9 @@ class Stitcher:
             if metal_backend is not None:
                 if not render_indices:
                     self._metal_tile_cache[tile_key] = None
-                    destination[destination_slice] = 0
+                    if native_encoder is None:
+                        assert destination is not None
+                        destination[destination_slice] = 0
                     if progress:
                         progress(number, total)
                     continue
@@ -342,6 +399,13 @@ class Stitcher:
                         [weights[index] for index in render_indices],
                     )
                     self._metal_tile_cache[tile_key] = prepared_id
+                    if native_encoder is not None:
+                        native_prepared_tiles.append(
+                            (prepared_id, tile.x, tile.y)
+                        )
+                        if progress:
+                            progress(number, total)
+                        continue
                     destination[destination_slice] = (
                         metal_backend.render_prepared_tile(
                             prepared_id,
@@ -358,6 +422,10 @@ class Stitcher:
                         progress(number, total)
                     continue
                 except (MetalBackendError, MemoryError, ValueError) as error:
+                    if native_encoder is not None:
+                        raise MetalBackendError(
+                            f"native ProRes tile preparation failed: {error}"
+                        ) from error
                     self._metal_backend = None
                     metal_backend = None
                     self.hardware_accelerated = False
@@ -366,6 +434,10 @@ class Stitcher:
                         "cpu", f"Metal tile failed; CPU fallback: {error}"
                     )
             warped: list[np.ndarray] = []
+            if destination is None:
+                raise MetalBackendError(
+                    "native ProRes lost its direct Metal path before frame encoding"
+                )
             render_weights: list[np.ndarray] = []
             working_sources = cpu_working_sources()
             for index in render_indices:
@@ -514,6 +586,19 @@ class Stitcher:
                 )
             if progress:
                 progress(number, total)
+        if native_encoder is not None:
+            if metal_backend is None or not native_prepared_tiles:
+                raise MetalBackendError(
+                    "native ProRes could not prepare a complete Metal frame"
+                )
+            native_encoder.write_prepared(
+                native_prepared_tiles,
+                frame_index=frame_index,
+                dither=self.config.color.integer_dither,
+                seed=self.config.color.dither_seed,
+            )
+            return True
+        return False
 
     def stitch_images(
         self,

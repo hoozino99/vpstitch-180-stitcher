@@ -20,7 +20,9 @@ clang -dynamiclib -O2 -arch "$(uname -m)" \
   -x objective-c -framework AppKit \
   -o "$AX_SHIM" packaging/macos_ax_shim.c
 clang++ -dynamiclib -O3 -std=c++17 -fobjc-arc -arch "$(uname -m)" \
-  -framework Foundation -framework Metal \
+  -framework Foundation -framework Metal -framework AVFoundation \
+  -framework CoreVideo -framework CoreMedia -framework VideoToolbox \
+  -framework IOSurface \
   -o "$METAL_BACKEND" packaging/macos_metal_backend.mm
 if [ ! -x "$VENV/bin/python" ]; then
   "$PYTHON_BIN" -m venv "$VENV"

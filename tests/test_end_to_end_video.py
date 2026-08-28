@@ -11,9 +11,11 @@ import pytest
 
 import vpstitch.cli as cli
 from vpstitch.cli import main
+from vpstitch.color import BUNDLED_ACES_STUDIO_ID
 from vpstitch.config import Camera, Color, Lens, Output, RigConfig, Video
 from vpstitch.ffmpegio import VideoDecoder, VideoEncoder, probe_video
 from vpstitch.geometry import camera_to_world
+from vpstitch.metal import MetalBackendError
 
 
 class _TrackedResource:
@@ -371,3 +373,99 @@ def test_render_closes_every_resource_when_destination_creation_fails(
     assert [decoder.close_count for decoder in decoders] == [1, 1, 1]
     assert encoder.close_count == 1
     assert _TrackedMapCache.instances[0].close_count == 1
+
+
+def test_native_frame_zero_failure_restarts_with_ffmpeg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cameras = tuple(_source_camera(index, 64, 32) for index in range(3))
+    config = RigConfig(
+        cameras=cameras,
+        output=Output(width=96, height=32),
+        color=Color(
+            mode="ocio",
+            ocio_config=BUNDLED_ACES_STUDIO_ID,
+            working_space="ACEScg",
+            output_space="Output - Rec.709",
+        ),
+        video=Video(
+            fps=24,
+            frames=1,
+            output_codec="prores-hq",
+            color_primaries="bt709",
+            color_trc="bt709",
+            colorspace="bt709",
+            color_range="tv",
+        ),
+    )
+    args = _patch_render_initialization(monkeypatch)
+    args.output = str(tmp_path / "fallback.mov")
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    monkeypatch.setattr(cli, "_apply_canvas_overrides", lambda _config, _args: config)
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.delenv("VPSTITCH_NATIVE_PRORES", raising=False)
+
+    class FakeNativeEncoder:
+        def __init__(self) -> None:
+            self.aborted = False
+
+        def abort(self) -> None:
+            self.aborted = True
+
+        def close(self) -> None:
+            raise AssertionError("aborted native encoder must not be finalized")
+
+    class FakeFallbackEncoder(_TrackedResource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_count = 0
+
+        def write(self, frame: np.ndarray) -> None:
+            assert frame.shape == (32, 96, 3)
+            self.write_count += 1
+
+    native = FakeNativeEncoder()
+    fallback = FakeFallbackEncoder()
+
+    class FakeStitcher:
+        backend_decision = SimpleNamespace(backend="metal", reason="test")
+
+        def create_native_prores_encoder(self, _path: str) -> FakeNativeEncoder:
+            return native
+
+        def stitch_arrays(
+            self,
+            _sources: list[np.ndarray],
+            destination: np.ndarray | None,
+            *,
+            native_encoder: FakeNativeEncoder | None = None,
+            **_kwargs: object,
+        ) -> bool:
+            if native_encoder is not None:
+                raise MetalBackendError("injected first append failure")
+            assert destination is not None
+            destination.fill(1234)
+            return False
+
+    class FakeFrameReader:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def read(self, **_kwargs: object) -> list[np.ndarray]:
+            return [np.zeros((32, 64, 3), dtype=np.uint16) for _ in cameras]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "NativeMetalVideoEncoder", FakeNativeEncoder)
+    monkeypatch.setattr(cli, "Stitcher", lambda *_args, **_kwargs: FakeStitcher())
+    monkeypatch.setattr(cli, "FrameBundleReader", FakeFrameReader)
+    monkeypatch.setattr(cli, "VideoEncoder", lambda *_args, **_kwargs: fallback)
+    monkeypatch.setattr(cli, "VideoDecoder", lambda *_args, **_kwargs: _TrackedResource())
+
+    cli._stitch_video(args)
+
+    assert native.aborted
+    assert fallback.write_count == 1
+    assert fallback.close_count == 1
