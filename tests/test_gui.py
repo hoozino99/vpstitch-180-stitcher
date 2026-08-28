@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QToolBar,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QWidget,
 )
 
@@ -834,6 +835,163 @@ def test_library_sections_are_boxed_and_resizable() -> None:
     assert window.library_splitter.sizes() != initial_library_sizes
     assert all(size > 0 for size in window.library_splitter.sizes())
     assert window.workspace_splitter.sizes()[0] >= 430
+    window.close()
+    app.processEvents()
+
+
+def test_media_pool_hierarchy_drag_moves_persist_and_preserve_selection(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    errors: list[tuple[str, str]] = []
+    window._error = (  # type: ignore[method-assign]
+        lambda title, message: errors.append((title, message))
+    )
+    store = ProjectStore.create(tmp_path / "project.json", name="Folder UX")
+    shoot = store.add_bin(Bin.create("Shoot", bin_id="shoot"))
+    day = store.add_bin(Bin.create("Day 01", parent_id=shoot.id, bin_id="day-01"))
+    selects = store.add_bin(Bin.create("Selects", bin_id="selects", order=1))
+    clips = [
+        store.add_media(
+            MediaRecord.create(
+                tmp_path / f"P{number:02d}.mov",
+                bin_id=shoot.id,
+                media_id=f"p{number:02d}",
+                order=index,
+            )
+        )
+        for index, number in enumerate((1, 2))
+    ]
+    window.project_store = store
+    window._active_bin_id = shoot.id
+    window._refresh_media_tree()
+
+    iterator = QTreeWidgetItemIterator(window.media_tree)
+    items: dict[tuple[str, str], QTreeWidgetItem] = {}
+    while iterator.value() is not None:
+        item = iterator.value()
+        key = (
+            str(item.data(0, Qt.ItemDataRole.UserRole) or ""),
+            str(item.data(0, Qt.ItemDataRole.UserRole + 1) or ""),
+        )
+        items[key] = item
+        iterator += 1
+
+    assert items[("bin", day.id)].parent() is items[("bin", shoot.id)]
+    assert window.media_tree.dragEnabled() is True
+    assert window.media_tree.acceptDrops() is True
+    assert items[("bin", shoot.id)].flags() & Qt.ItemFlag.ItemIsDropEnabled
+    assert items[("media", clips[0].id)].flags() & Qt.ItemFlag.ItemIsDragEnabled
+
+    window.media_tree.clearSelection()
+    window.media_tree.setCurrentItem(items[("media", clips[0].id)])
+    items[("media", clips[0].id)].setSelected(True)
+    items[("media", clips[1].id)].setSelected(True)
+    app.processEvents()
+    assert {item["id"] for item in window.media_tree.selected_payload()} == {
+        "p01",
+        "p02",
+    }
+    drag_pixmap = window.media_tree._drag_pixmap(window.media_tree.selected_payload())
+    assert drag_pixmap.size().width() == 286
+    assert drag_pixmap.size().height() == 42
+    window._move_media_tree_items(
+        window.media_tree.selected_payload(),
+        {"bin_id": day.id, "kind": None, "index": None, "label": "Day 01"},
+    )
+
+    assert [item.id for item in store.list_media(day.id)] == ["p01", "p02"]
+    assert {item["id"] for item in window.media_tree.selected_payload()} == {
+        "p01",
+        "p02",
+    }
+
+    window._move_media_tree_items(
+        [{"kind": "bin", "id": selects.id}],
+        {"bin_id": day.id, "kind": None, "index": None, "label": "Day 01"},
+    )
+    assert errors == []
+    assert store.list_bins(day.id)[0].id == selects.id
+    window._move_media_tree_items(
+        [{"kind": "bin", "id": shoot.id}],
+        {"bin_id": day.id, "kind": None, "index": None, "label": "Day 01"},
+    )
+    assert errors[-1][1] == "A folder cannot be moved into itself or one of its subfolders."
+    assert next(item for item in store.bins if item.id == shoot.id).parent_id is None
+    loaded = ProjectStore.load(store.path)
+    assert [item.id for item in loaded.list_media(day.id)] == ["p01", "p02"]
+    assert loaded.list_bins(day.id)[0].id == selects.id
+    window.close()
+    app.processEvents()
+
+
+def test_media_import_uses_selected_nested_folder_or_explicit_project_root(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._auto_workflows_enabled = False
+    store = ProjectStore.create(tmp_path / "project.json", name="Import Destination")
+    shoot = store.add_bin(Bin.create("Shoot", bin_id="shoot"))
+    day = store.add_bin(Bin.create("Day 01", parent_id=shoot.id, bin_id="day-01"))
+    window.project_store = store
+    window._refresh_media_tree()
+
+    def select_item(kind: str, item_id: str = "") -> None:
+        iterator = QTreeWidgetItemIterator(window.media_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            if (
+                item.data(0, Qt.ItemDataRole.UserRole) == kind
+                and str(item.data(0, Qt.ItemDataRole.UserRole + 1) or "") == item_id
+            ):
+                window.media_tree.setCurrentItem(item)
+                return
+            iterator += 1
+        raise AssertionError(f"missing tree item: {kind} {item_id}")
+
+    select_item("bin", day.id)
+    nested = window.import_media_paths([str(tmp_path / "nested_P01.mov")])
+    select_item("project")
+    root = window.import_media_paths([str(tmp_path / "root_P02.mov")])
+
+    assert nested[0].bin_id == day.id
+    assert root[0].bin_id is None
+    assert ProjectStore.load(store.path).list_media(day.id)[0].id == nested[0].id
+    assert ProjectStore.load(store.path).list_media(None)[0].id == root[0].id
+    window.close()
+    app.processEvents()
+
+
+def test_media_pool_new_folder_uses_selected_nested_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    store = ProjectStore.create(tmp_path / "project.json", name="Folder Create")
+    shoot = store.add_bin(Bin.create("Shoot", bin_id="shoot"))
+    day = store.add_bin(Bin.create("Day 01", parent_id=shoot.id, bin_id="day-01"))
+    window.project_store = store
+    window._refresh_media_tree()
+    iterator = QTreeWidgetItemIterator(window.media_tree)
+    while iterator.value() is not None:
+        item = iterator.value()
+        if item.data(0, Qt.ItemDataRole.UserRole + 1) == day.id:
+            window.media_tree.setCurrentItem(item)
+            break
+        iterator += 1
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *args, **kwargs: ("Selects", True),
+    )
+
+    window.create_media_bin()
+
+    created = next(item for item in store.bins if item.name == "Selects")
+    assert created.parent_id == day.id
+    assert "Shoot / Day 01" in window.statusBar().currentMessage()
     window.close()
     app.processEvents()
 

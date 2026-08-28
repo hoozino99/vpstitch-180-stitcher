@@ -23,6 +23,7 @@ from PySide6.QtCore import (
     QSettings,
     QSize,
     QStandardPaths,
+    QMimeData,
     Qt,
     QTimer,
     QUrl,
@@ -32,6 +33,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QCloseEvent,
+    QDrag,
     QFont,
     QImage,
     QKeySequence,
@@ -77,6 +79,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QStyle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -1339,6 +1342,202 @@ class ChevronComboBox(QComboBox):
 class ScrollableLibraryTree(QTreeWidget):
     """Use native scrolling first, with a deterministic trackpad/wheel fallback."""
 
+    moveRequested = Signal(object, object)
+    dragStatusChanged = Signal(str)
+    MIME_TYPE = "application/x-vpstitch-media-tree-items"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drop_target_item: QTreeWidgetItem | None = None
+        self._drop_indicator = QAbstractItemView.DropIndicatorPosition.OnViewport
+        self._last_drag_status = ""
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    @staticmethod
+    def _item_key(item: QTreeWidgetItem) -> tuple[str, str] | None:
+        kind = item.data(0, Qt.ItemDataRole.UserRole)
+        item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if kind not in {"bin", "media"} or not item_id:
+            return None
+        return str(kind), str(item_id)
+
+    def selected_payload(self) -> list[dict[str, str]]:
+        payload: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in self.selectedItems():
+            key = self._item_key(item)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            payload.append({"kind": key[0], "id": key[1]})
+        return payload
+
+    def startDrag(self, _supported_actions) -> None:  # type: ignore[no-untyped-def]
+        payload = self.selected_payload()
+        if not payload:
+            return
+        indexes = self.selectedIndexes()
+        mime_data = self.model().mimeData(indexes) if indexes else QMimeData()
+        mime_data.setData(
+            self.MIME_TYPE,
+            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.setPixmap(self._drag_pixmap(payload))
+        drag.setHotSpot(QPointF(18.0, 18.0).toPoint())
+        self.dragStatusChanged.emit(
+            f"Moving {len(payload)} Media Pool item{'s' if len(payload) != 1 else ''}"
+        )
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def _drag_pixmap(self, payload: list[dict[str, str]]) -> QPixmap:
+        width, height = 286, 42
+        pixmap = QPixmap(width, height)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#7170ff"), 1.5))
+        painter.setBrush(QColor(30, 31, 35, 244))
+        painter.drawRoundedRect(1, 1, width - 3, height - 3, 7, 7)
+        current = self.currentItem()
+        label = current.text(0).splitlines()[0] if current is not None else "Media Pool item"
+        if len(label) > 28:
+            label = f"{label[:27]}…"
+        if len(payload) > 1:
+            label = f"{len(payload)} items  ·  {label}"
+        painter.setPen(QColor("#f7f8f8"))
+        painter.drawText(16, 0, width - 30, height, Qt.AlignmentFlag.AlignVCenter, label)
+        painter.end()
+        return pixmap
+
+    @staticmethod
+    def _parent_bin_id(item: QTreeWidgetItem | None) -> str | None:
+        parent = item.parent() if item is not None else None
+        if parent is None:
+            return None
+        if parent.data(0, Qt.ItemDataRole.UserRole) != "bin":
+            return None
+        parent_id = parent.data(0, Qt.ItemDataRole.UserRole + 1)
+        return str(parent_id) if parent_id else None
+
+    @staticmethod
+    def _same_kind_index(item: QTreeWidgetItem, kind: str) -> int:
+        parent = item.parent()
+        if parent is None:
+            return 0
+        index = 0
+        for child_index in range(parent.childCount()):
+            child = parent.child(child_index)
+            if child is item:
+                return index
+            if child.data(0, Qt.ItemDataRole.UserRole) == kind:
+                index += 1
+        return index
+
+    def _drop_destination(
+        self,
+        item: QTreeWidgetItem | None,
+        indicator: QAbstractItemView.DropIndicatorPosition,
+    ) -> dict[str, object]:
+        if item is None:
+            return {"bin_id": None, "kind": None, "index": None, "label": "Project root"}
+        kind = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        item_id = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if kind == "project":
+            return {"bin_id": None, "kind": None, "index": None, "label": item.text(0)}
+        if indicator == QAbstractItemView.DropIndicatorPosition.OnItem and kind == "bin":
+            return {"bin_id": str(item_id), "kind": None, "index": None, "label": item.text(0)}
+        parent_id = self._parent_bin_id(item)
+        parent = item.parent()
+        parent_label = parent.text(0) if parent is not None else "Project root"
+        if kind in {"bin", "media"}:
+            index = self._same_kind_index(item, kind)
+            if indicator == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                index += 1
+            return {"bin_id": parent_id, "kind": kind, "index": index, "label": parent_label}
+        return {"bin_id": parent_id, "kind": None, "index": None, "label": parent_label}
+
+    def _has_supported_mime(self, event) -> bool:  # type: ignore[no-untyped-def]
+        return event.mimeData().hasFormat(self.MIME_TYPE)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if not self._has_supported_mime(event):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if not self._has_supported_mime(event):
+            event.ignore()
+            return
+        super().dragMoveEvent(event)
+        point = event.position().toPoint()
+        self._drop_target_item = self.itemAt(point)
+        self._drop_indicator = self.dropIndicatorPosition()
+        destination = self._drop_destination(self._drop_target_item, self._drop_indicator)
+        status = f"Drop to move into {destination['label']}"
+        if status != self._last_drag_status:
+            self._last_drag_status = status
+            self.dragStatusChanged.emit(status)
+        self.viewport().update()
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().dragLeaveEvent(event)
+        self._clear_drop_feedback()
+
+    def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if not self._has_supported_mime(event):
+            event.ignore()
+            return
+        try:
+            payload = json.loads(bytes(event.mimeData().data(self.MIME_TYPE)).decode("utf-8"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            event.ignore()
+            self._clear_drop_feedback()
+            return
+        point = event.position().toPoint()
+        item = self.itemAt(point)
+        destination = self._drop_destination(item, self.dropIndicatorPosition())
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        self._clear_drop_feedback()
+        self.moveRequested.emit(payload, destination)
+
+    def _clear_drop_feedback(self) -> None:
+        self._drop_target_item = None
+        self._drop_indicator = QAbstractItemView.DropIndicatorPosition.OnViewport
+        self._last_drag_status = ""
+        self.dragStatusChanged.emit("")
+        self.viewport().update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().paintEvent(event)
+        item = self._drop_target_item
+        if item is None:
+            return
+        rect = self.visualItemRect(item)
+        if not rect.isValid():
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#8583ff"), 2))
+        if self._drop_indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
+            painter.setBrush(QColor(113, 112, 255, 28))
+            painter.drawRoundedRect(rect.adjusted(2, 1, -3, -2), 4, 4)
+        else:
+            y = rect.bottom() if self._drop_indicator == QAbstractItemView.DropIndicatorPosition.BelowItem else rect.top()
+            painter.drawLine(rect.left() + 2, y, rect.right() - 3, y)
+        painter.end()
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         scrollbar = self.verticalScrollBar()
         before = scrollbar.value()
@@ -2187,7 +2386,7 @@ class MainWindow(QMainWindow):
         media_header.addWidget(self.new_bin_button)
         media_layout.addLayout(media_header)
         self.media_hint = QLabel(
-            "Numbered clips auto-map. Other names open camera-slot assignment."
+            "Drag clips or folders to organize · drop on a folder to move inside."
         )
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
@@ -2197,7 +2396,8 @@ class MainWindow(QMainWindow):
         self.media_tree.setObjectName("mediaTree")
         self.media_tree.setAccessibleName("Source Media Pool")
         self.media_tree.setAccessibleDescription(
-            "Project folders contain individual source clips. Select three or five clips to add them to a timeline."
+            "Hierarchical project folders contain source clips. Drag clips or folders "
+            "to move them, or use the context menu."
         )
         self.media_tree.setHeaderHidden(True)
         self.media_tree.setIndentation(16)
@@ -2205,7 +2405,11 @@ class MainWindow(QMainWindow):
         self.media_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.media_tree.customContextMenuRequested.connect(self._media_tree_menu)
         self.media_tree.itemActivated.connect(self._media_item_activated)
-        self.media_tree.itemSelectionChanged.connect(self._update_source_status)
+        self.media_tree.itemSelectionChanged.connect(self._media_selection_changed)
+        self.media_tree.moveRequested.connect(self._move_media_tree_items)
+        self.media_tree.dragStatusChanged.connect(self._media_drag_status_changed)
+        self.media_tree.setAnimated(True)
+        self.media_tree.setMouseTracking(True)
         self.media_tree.setMinimumHeight(120)
         self.media_tree.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
@@ -3559,6 +3763,62 @@ class MainWindow(QMainWindow):
             return None, None
         return item.data(0, Qt.ItemDataRole.UserRole), item.data(0, Qt.ItemDataRole.UserRole + 1)
 
+    def _media_selection_changed(self) -> None:
+        kind, item_id = self._selected_media_item()
+        if kind == "bin" and item_id:
+            self._active_bin_id = str(item_id)
+        elif kind == "media" and item_id:
+            record = next(
+                (item for item in self.project_store.media if item.id == item_id),
+                None,
+            )
+            self._active_bin_id = record.bin_id if record is not None else None
+        elif kind == "project":
+            self._active_bin_id = None
+        self._update_source_status()
+
+    def _media_drag_status_changed(self, message: str) -> None:
+        if message:
+            self.statusBar().showMessage(message)
+        else:
+            self.statusBar().clearMessage()
+
+    def _media_tree_destination_bin(
+        self, *, default_to_first: bool = False
+    ) -> str | None:
+        kind, item_id = self._selected_media_item()
+        if kind == "bin" and item_id:
+            return str(item_id)
+        if kind == "media" and item_id:
+            record = next(
+                (item for item in self.project_store.media if item.id == item_id),
+                None,
+            )
+            return record.bin_id if record is not None else None
+        if kind == "project":
+            return None
+        if self._active_bin_id is not None:
+            return self._active_bin_id
+        if default_to_first and self.project_store.bins:
+            return self.project_store.list_bins()[0].id
+        return None
+
+    def _bin_display_path(self, bin_id: str | None) -> str:
+        if bin_id is None:
+            return self.project_store.settings.name
+        bins = {item.id: item for item in self.project_store.bins}
+        names: list[str] = []
+        current_id: str | None = bin_id
+        visited: set[str] = set()
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            current = bins.get(current_id)
+            if current is None:
+                break
+            names.append(current.name)
+            current_id = current.parent_id
+        return " / ".join(reversed(names)) or self.project_store.settings.name
+
     def _selected_timeline_item(self) -> tuple[str | None, str | None]:
         item = self.timeline_tree.currentItem()
         if item is None:
@@ -3673,9 +3933,13 @@ class MainWindow(QMainWindow):
         )
 
     def create_media_bin(self) -> None:
-        kind, selected_id = self._selected_media_item()
-        parent_id = selected_id if kind == "bin" else self._active_bin_id
-        name, accepted = QInputDialog.getText(self, "New Folder", "Folder name")
+        parent_id = self._media_tree_destination_bin()
+        destination = self._bin_display_path(parent_id)
+        name, accepted = QInputDialog.getText(
+            self,
+            "New Folder",
+            f"Folder name\nLocation: {destination}",
+        )
         if not accepted or not name.strip():
             return
         try:
@@ -3684,6 +3948,10 @@ class MainWindow(QMainWindow):
             )
             self._active_bin_id = created.id
             self._refresh_media_tree()
+            self.statusBar().showMessage(
+                f'Created “{created.name}” in {destination}',
+                7000,
+            )
         except ProjectError as error:
             self._error("New Folder", str(error))
 
@@ -3725,9 +3993,7 @@ class MainWindow(QMainWindow):
         if requested is None:
             return
         name, camera_count, add_selected = requested
-        bin_id = self._active_bin_id
-        if bin_id is None and self.project_store.bins:
-            bin_id = self.project_store.list_bins()[0].id
+        bin_id = self._media_tree_destination_bin(default_to_first=True)
         try:
             source_paths: tuple[str, ...] = ()
             plate_range = (
@@ -3767,13 +4033,175 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._error("New Timeline", str(error))
 
+    def _move_media_tree_items(self, payload, destination) -> None:  # type: ignore[no-untyped-def]
+        if not isinstance(payload, list) or not isinstance(destination, dict):
+            return
+        destination_value = destination.get("bin_id")
+        destination_bin_id = (
+            str(destination_value) if destination_value not in {None, ""} else None
+        )
+        bins_by_id = {item.id: item for item in self.project_store.bins}
+        media_by_id = {item.id: item for item in self.project_store.media}
+        if destination_bin_id is not None and destination_bin_id not in bins_by_id:
+            self._error("Move Media Pool Items", "The destination folder no longer exists.")
+            return
+
+        requested_bins: list[str] = []
+        requested_media: list[str] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            item_id = str(entry.get("id") or "")
+            if kind == "bin" and item_id in bins_by_id and item_id not in requested_bins:
+                requested_bins.append(item_id)
+            elif kind == "media" and item_id in media_by_id and item_id not in requested_media:
+                requested_media.append(item_id)
+
+        selected_bin_ids = set(requested_bins)
+
+        def has_selected_ancestor(bin_id: str) -> bool:
+            parent_id = bins_by_id[bin_id].parent_id
+            while parent_id is not None:
+                if parent_id in selected_bin_ids:
+                    return True
+                parent = bins_by_id.get(parent_id)
+                parent_id = parent.parent_id if parent is not None else None
+            return False
+
+        moving_bins = [
+            bin_id for bin_id in requested_bins if not has_selected_ancestor(bin_id)
+        ]
+
+        def bin_is_inside(bin_id: str | None, possible_parent: str) -> bool:
+            current_id = bin_id
+            visited: set[str] = set()
+            while current_id is not None and current_id not in visited:
+                if current_id == possible_parent:
+                    return True
+                visited.add(current_id)
+                current = bins_by_id.get(current_id)
+                current_id = current.parent_id if current is not None else None
+            return False
+
+        for bin_id in moving_bins:
+            if destination_bin_id == bin_id or bin_is_inside(destination_bin_id, bin_id):
+                self._error(
+                    "Move Media Pool Items",
+                    "A folder cannot be moved into itself or one of its subfolders.",
+                )
+                return
+
+        moving_media = [
+            media_id
+            for media_id in requested_media
+            if not any(
+                bin_is_inside(media_by_id[media_id].bin_id, bin_id)
+                for bin_id in moving_bins
+            )
+        ]
+        if not moving_bins and not moving_media:
+            return
+
+        insertion_kind = destination.get("kind")
+        insertion_value = destination.get("index")
+        insertion_index = insertion_value if isinstance(insertion_value, int) else None
+        try:
+            if moving_bins:
+                target_index = insertion_index if insertion_kind == "bin" else None
+                if target_index is not None:
+                    target_index -= sum(
+                        1
+                        for bin_id in moving_bins
+                        if bins_by_id[bin_id].parent_id == destination_bin_id
+                        and bins_by_id[bin_id].order < target_index
+                    )
+                    target_index = max(0, target_index)
+                for offset, bin_id in enumerate(moving_bins):
+                    self.project_store.move_bin(
+                        bin_id,
+                        destination_bin_id,
+                        None if target_index is None else target_index + offset,
+                    )
+            if moving_media:
+                target_index = insertion_index if insertion_kind == "media" else None
+                if target_index is not None:
+                    target_index -= sum(
+                        1
+                        for media_id in moving_media
+                        if media_by_id[media_id].bin_id == destination_bin_id
+                        and media_by_id[media_id].order < target_index
+                    )
+                    target_index = max(0, target_index)
+                self.project_store.move_media_many(
+                    moving_media,
+                    destination_bin_id,
+                    target_index,
+                )
+        except ProjectError as error:
+            self._error("Move Media Pool Items", str(error))
+            return
+
+        self._active_bin_id = destination_bin_id
+        self._refresh_media_tree()
+        moved_count = len(moving_bins) + len(moving_media)
+        destination_path = self._bin_display_path(destination_bin_id)
+        self.statusBar().showMessage(
+            f"Moved {moved_count} item{'s' if moved_count != 1 else ''} "
+            f"to {destination_path}",
+            8000,
+        )
+
+    def move_selected_media_tree_items(self, destination_bin_id: str | None) -> None:
+        payload = self.media_tree.selected_payload()
+        self._move_media_tree_items(
+            payload,
+            {
+                "bin_id": destination_bin_id,
+                "kind": None,
+                "index": None,
+                "label": self._bin_display_path(destination_bin_id),
+            },
+        )
+
+    def _capture_media_tree_state(
+        self,
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        selected: set[tuple[str, str]] = set()
+        expanded: set[tuple[str, str]] = set()
+        iterator = QTreeWidgetItemIterator(self.media_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            kind = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            item_id = str(item.data(0, Qt.ItemDataRole.UserRole + 1) or "")
+            key = (kind, item_id)
+            if item.isSelected():
+                selected.add(key)
+            if item.isExpanded():
+                expanded.add(key)
+            iterator += 1
+        return selected, expanded
+
     def _refresh_media_tree(self) -> None:
         if not hasattr(self, "media_tree"):
             return
-        selected_id = self._active_bin_id
+        selected_keys, expanded_keys = self._capture_media_tree_state()
+        if not selected_keys and self._active_bin_id:
+            selected_keys.add(("bin", self._active_bin_id))
+        had_expanded_state = bool(expanded_keys)
+        self.media_tree.blockSignals(True)
         self.media_tree.clear()
         root = QTreeWidgetItem([self.project_store.settings.name])
         root.setData(0, Qt.ItemDataRole.UserRole, "project")
+        root.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
+        root.setFlags(
+            (root.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+            & ~Qt.ItemFlag.ItemIsDragEnabled
+        )
+        root_font = root.font(0)
+        root_font.setBold(True)
+        root.setFont(0, root_font)
+        root.setBackground(0, QColor("#17181b"))
         self.media_tree.addTopLevelItem(root)
 
         def add_bin(parent_item: QTreeWidgetItem, parent_id: str | None) -> None:
@@ -3781,6 +4209,27 @@ class MainWindow(QMainWindow):
                 folder_item = QTreeWidgetItem([folder.name])
                 folder_item.setData(0, Qt.ItemDataRole.UserRole, "bin")
                 folder_item.setData(0, Qt.ItemDataRole.UserRole + 1, folder.id)
+                folder_item.setIcon(
+                    0,
+                    self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon),
+                )
+                folder_item.setFlags(
+                    folder_item.flags()
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                folder_font = folder_item.font(0)
+                folder_font.setBold(True)
+                folder_item.setFont(0, folder_font)
+                child_count = len(self.project_store.list_bins(folder.id))
+                media_count = len(self.project_store.list_media(folder.id))
+                folder_path = self._bin_display_path(folder.id)
+                folder_item.setToolTip(
+                    0,
+                    f"{folder_path}\n"
+                    f"{child_count} subfolder{'s' if child_count != 1 else ''} · "
+                    f"{media_count} clip{'s' if media_count != 1 else ''}",
+                )
                 parent_item.addChild(folder_item)
                 for media in self.project_store.list_media(folder.id):
                     self._append_media_tree_item(folder_item, media)
@@ -3789,17 +4238,33 @@ class MainWindow(QMainWindow):
         for media in self.project_store.list_media(None):
             self._append_media_tree_item(root, media)
         add_bin(root, None)
+        iterator = QTreeWidgetItemIterator(self.media_tree)
+        first_selected: QTreeWidgetItem | None = None
+        selected_items: list[QTreeWidgetItem] = []
+        while iterator.value() is not None:
+            item = iterator.value()
+            kind = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            item_id = str(item.data(0, Qt.ItemDataRole.UserRole + 1) or "")
+            key = (kind, item_id)
+            if key in selected_keys:
+                selected_items.append(item)
+                first_selected = first_selected or item
+                parent = item.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+            if key in expanded_keys:
+                item.setExpanded(True)
+            iterator += 1
         root.setExpanded(True)
-        self.media_tree.expandToDepth(1)
-        if selected_id:
-            iterator = QTreeWidgetItemIterator(self.media_tree)
-            while iterator.value() is not None:
-                item = iterator.value()
-                if item.data(0, Qt.ItemDataRole.UserRole + 1) == selected_id:
-                    self.media_tree.setCurrentItem(item)
-                    item.setExpanded(True)
-                    break
-                iterator += 1
+        if not had_expanded_state:
+            self.media_tree.expandToDepth(1)
+        if first_selected is not None:
+            self.media_tree.setCurrentItem(first_selected)
+            for selected_item in selected_items:
+                selected_item.setSelected(True)
+            self.media_tree.scrollToItem(first_selected)
+        self.media_tree.blockSignals(False)
         self._refresh_timeline_tree()
         self._update_plate_set_context()
 
@@ -3823,6 +4288,12 @@ class MainWindow(QMainWindow):
         item.setToolTip(0, f"{media.path}\n{cache_detail}")
         item.setData(0, Qt.ItemDataRole.UserRole, "media")
         item.setData(0, Qt.ItemDataRole.UserRole + 1, media.id)
+        item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+        item.setFlags(
+            item.flags()
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
         parent.addChild(item)
 
     def _refresh_timeline_tree(self) -> None:
@@ -3911,6 +4382,38 @@ class MainWindow(QMainWindow):
                     lambda checked=False, timeline_id=timeline.id: self.add_selected_media_to_timeline(timeline_id),
                 )
             submenu.setEnabled(bool(self.project_store.timelines))
+        movable_payload = self.media_tree.selected_payload()
+        if movable_payload:
+            menu.addSeparator()
+            move_menu = menu.addMenu("Move to Folder")
+            move_menu.addAction(
+                f"Project Root · {self.project_store.settings.name}",
+                lambda checked=False: self.move_selected_media_tree_items(None),
+            )
+
+            def add_folder_actions(parent_menu: QMenu, parent_id: str | None) -> None:
+                for folder in self.project_store.list_bins(parent_id):
+                    children = self.project_store.list_bins(folder.id)
+                    if children:
+                        folder_menu = parent_menu.addMenu(folder.name)
+                        folder_menu.addAction(
+                            "Move Here",
+                            lambda checked=False, destination=folder.id: (
+                                self.move_selected_media_tree_items(destination)
+                            ),
+                        )
+                        folder_menu.addSeparator()
+                        add_folder_actions(folder_menu, folder.id)
+                    else:
+                        parent_menu.addAction(
+                            folder.name,
+                            lambda checked=False, destination=folder.id: (
+                                self.move_selected_media_tree_items(destination)
+                            ),
+                        )
+
+            move_menu.addSeparator()
+            add_folder_actions(move_menu, None)
         if kind in {"bin", "media"} or selected_media:
             menu.addSeparator()
             menu.addAction("Remove from Project…", self.delete_selected_media_items)
@@ -5439,10 +5942,17 @@ class MainWindow(QMainWindow):
                 border-radius:0;
                 background:#0f1011;
                 padding:5px 0 2px;
+                show-decoration-selected:1;
             }
-            QTreeWidget#mediaTree::item, QTreeWidget#timelineTree::item { min-height:24px; padding:2px 4px; border:0; }
+            QTreeWidget#mediaTree::item {
+                min-height:26px;
+                padding:2px 5px;
+                border:0;
+                border-bottom:1px solid rgba(255,255,255,0.055);
+            }
+            QTreeWidget#timelineTree::item { min-height:24px; padding:2px 4px; border:0; }
+            QTreeWidget#mediaTree::item:hover { background:#1b1c20; color:#ffffff; }
             QTreeWidget#mediaTree::item:selected, QTreeWidget#timelineTree::item:selected { background:#28282c; color:#f7f8f8; }
-            QTreeWidget#mediaTree::branch { background:#0f1011; }
             QTabWidget::pane { border:0; }
             QTabBar::tab {
                 background:#0f1011;
@@ -5862,9 +6372,7 @@ class MainWindow(QMainWindow):
                 Path(path).name.lower(),
             ),
         )
-        bin_id = self._active_bin_id
-        if bin_id is None and self.project_store.bins:
-            bin_id = self.project_store.list_bins()[0].id
+        bin_id = self._media_tree_destination_bin(default_to_first=True)
         records: list[MediaRecord] = []
         next_order = len(self.project_store.list_media(bin_id))
         for path in ordered:

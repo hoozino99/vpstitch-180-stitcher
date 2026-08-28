@@ -766,6 +766,61 @@ class ProjectStore:
 
         return self._mutate(change)
 
+    def move_media_many(
+        self,
+        media_ids: Iterable[str],
+        bin_id: str | None,
+        index: int | None = None,
+    ) -> tuple[MediaRecord, ...]:
+        """Move media as one persisted operation while preserving drag order."""
+        requested = tuple(dict.fromkeys(str(media_id) for media_id in media_ids))
+        if not requested:
+            return ()
+
+        def change() -> tuple[MediaRecord, ...]:
+            if bin_id is not None and not any(item.id == bin_id for item in self._bins):
+                raise ProjectError(f"unknown media bin: {bin_id}")
+            current_by_id = {item.id: item for item in self._media}
+            missing = [media_id for media_id in requested if media_id not in current_by_id]
+            if missing:
+                raise ProjectError(f"unknown media: {missing[0]}")
+            moving = [current_by_id[media_id] for media_id in requested]
+            moving_ids = set(requested)
+            old_bin_ids = {item.bin_id for item in moving}
+            self._media = [item for item in self._media if item.id not in moving_ids]
+            for old_bin_id in old_bin_ids:
+                self._normalize_media_orders(old_bin_id)
+            siblings = self.list_media(bin_id)
+            target = (
+                len(siblings)
+                if index is None
+                else self._checked_index(index, len(siblings))
+            )
+            offset = len(moving)
+            self._media = [
+                replace(item, order=item.order + offset)
+                if item.bin_id == bin_id and item.order >= target
+                else item
+                for item in self._media
+            ]
+            moved = tuple(
+                replace(item, bin_id=bin_id, order=target + item_index)
+                for item_index, item in enumerate(moving)
+            )
+            self._media.extend(moved)
+            return moved
+
+        return self._mutate(change)
+
+    def move_media(
+        self, media_id: str, bin_id: str | None, index: int | None = None
+    ) -> MediaRecord:
+        return self.move_media_many((media_id,), bin_id, index)[0]
+
+    def reorder_media(self, media_id: str, index: int) -> MediaRecord:
+        item = self._media[self._media_index(media_id)]
+        return self.move_media(media_id, item.bin_id, index)
+
     def media_for_paths(self, paths: Iterable[str | PurePath]) -> tuple[MediaRecord, ...]:
         wanted = {str(_coerce_path(path)) for path in paths}
         return tuple(item for item in self._media if str(item.path) in wanted)

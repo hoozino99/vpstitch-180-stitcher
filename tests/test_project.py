@@ -158,6 +158,79 @@ def test_remove_media_keeps_source_file_and_normalizes_sibling_order(
     assert [item.path for item in store.list_media(folder.id)] == [paths[0], paths[2]]
 
 
+def test_move_media_many_changes_folder_and_order_in_one_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProjectStore.create(tmp_path / "project.json", name="Move Media")
+    source = store.add_bin(Bin.create("Source", bin_id="source"))
+    target = store.add_bin(Bin.create("Target", bin_id="target", order=1))
+    source_records = [
+        store.add_media(
+            MediaRecord.create(
+                tmp_path / f"P{number:02d}.mov",
+                bin_id=source.id,
+                media_id=f"p{number:02d}",
+                order=index,
+            )
+        )
+        for index, number in enumerate((1, 2, 3))
+    ]
+    existing = store.add_media(
+        MediaRecord.create(
+            tmp_path / "existing.mov",
+            bin_id=target.id,
+            media_id="existing",
+        )
+    )
+    saves = 0
+    real_save = store.save
+
+    def tracked_save() -> None:
+        nonlocal saves
+        saves += 1
+        real_save()
+
+    monkeypatch.setattr(store, "save", tracked_save)
+
+    moved = store.move_media_many(
+        (source_records[2].id, source_records[0].id),
+        target.id,
+        0,
+    )
+
+    assert saves == 1
+    assert [item.id for item in moved] == ["p03", "p01"]
+    assert [item.id for item in store.list_media(source.id)] == ["p02"]
+    assert [item.id for item in store.list_media(target.id)] == [
+        "p03",
+        "p01",
+        existing.id,
+    ]
+    assert [item.order for item in store.list_media(target.id)] == [0, 1, 2]
+
+
+def test_reorder_media_uses_final_sibling_index(tmp_path: Path) -> None:
+    store = ProjectStore.create(tmp_path / "project.json", name="Reorder Media")
+    folder = store.add_bin(Bin.create("Shoot", bin_id="shoot"))
+    for index, number in enumerate((1, 2, 3)):
+        store.add_media(
+            MediaRecord.create(
+                tmp_path / f"P{number:02d}.mov",
+                bin_id=folder.id,
+                media_id=f"p{number:02d}",
+                order=index,
+            )
+        )
+
+    store.reorder_media("p01", 2)
+
+    assert [item.id for item in store.list_media(folder.id)] == [
+        "p02",
+        "p03",
+        "p01",
+    ]
+
+
 def test_media_source_cache_fields_round_trip_and_update(tmp_path: Path) -> None:
     project_path = tmp_path / "project.json"
     store = ProjectStore.create(project_path, name="Source Cache")
