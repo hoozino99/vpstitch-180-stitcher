@@ -6957,14 +6957,20 @@ class MainWindow(QMainWindow):
 
     def _timeline_bar_changed(self, lower: int, upper: int) -> None:
         if not self._timeline_updating:
-            self._stop_playback(clear=True)
+            self._stop_playback(preserve_image=True)
             self._set_timeline_range(lower, upper)
+            self._seek_loaded_playback(
+                self.timeline_playhead.value(), show_video=False
+            )
             self._save_active_timeline()
 
     def _timeline_spin_changed(self) -> None:
         if not self._timeline_updating:
-            self._stop_playback(clear=True)
+            self._stop_playback(preserve_image=True)
             self._set_timeline_range(self.timeline_in.value(), self.timeline_out.value())
+            self._seek_loaded_playback(
+                self.timeline_playhead.value(), show_video=False
+            )
             self._save_active_timeline()
 
     def _update_playhead_time(self, frame: int) -> None:
@@ -7185,9 +7191,26 @@ class MainWindow(QMainWindow):
         else:
             current_key = None
         if current_key == self._playback_key and self._playback_path is not None:
-            self.media_player.setPosition(
-                max(0, min(self.media_player.duration(), self.media_player.position() + direction * frame_ms))
-            )
+            if self._tc_alignment:
+                lower, upper = self.timeline_bar.values()
+                frame = max(
+                    lower,
+                    min(upper - 1, self.timeline_playhead.value() + direction),
+                )
+                self._set_playhead(frame)
+                self.media_player.setPosition(
+                    max(0, int(round(frame * 1000 / max(1.0, fps))))
+                )
+            else:
+                self.media_player.setPosition(
+                    max(
+                        0,
+                        min(
+                            self.media_player.duration(),
+                            self.media_player.position() + direction * frame_ms,
+                        ),
+                    )
+                )
             self.preview_stack.setCurrentWidget(self.video_preview)
             return
         if self._tc_alignment:
@@ -7222,12 +7245,10 @@ class MainWindow(QMainWindow):
         sources = self._validate_sources()
         playback_sources = self._cached_playback_sources(sources)
         config = self._collect_config()
-        lower = self.timeline_in.value() if self._tc_alignment else 0
-        upper = (
-            self.timeline_out.value()
-            if self._tc_alignment
-            else int(config.get("video", {}).get("frames") or 0)
-        )
+        if self._tc_alignment and self._timeline_maximum > 0:
+            # Playback is baked once for the complete TC-aligned common range.
+            # Timeline IN/OUT only controls navigation and final delivery.
+            config.setdefault("video", {})["frames"] = self._timeline_maximum
         fingerprints = []
         for source in sources:
             stat = Path(source).stat()
@@ -7242,7 +7263,6 @@ class MainWindow(QMainWindow):
             "sources": fingerprints,
             "playback_sources": playback_fingerprints,
             "alignment": self._tc_alignment,
-            "range": [lower, upper],
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -7492,9 +7512,8 @@ class MainWindow(QMainWindow):
             return False
         if current_key != self._playback_key:
             return False
-        lower = self.timeline_in.value() if self._tc_alignment else 0
         fps = float(self._tc_alignment["fps"]) if self._tc_alignment else self.fps.value()
-        self.media_player.setPosition(max(0, int(round((frame - lower) * 1000 / fps))))
+        self.media_player.setPosition(max(0, int(round(frame * 1000 / fps))))
         if show_video:
             self.preview_stack.setCurrentWidget(self.video_preview)
         return True
@@ -7503,8 +7522,16 @@ class MainWindow(QMainWindow):
         if self._playback_path is None or not self._tc_alignment:
             return
         lower, upper = self.timeline_bar.values()
-        frame = lower + int(round(position_ms * float(self._tc_alignment["fps"]) / 1000))
-        self._set_playhead(max(lower, min(frame, upper - 1)))
+        frame = int(round(position_ms * float(self._tc_alignment["fps"]) / 1000))
+        if frame >= upper:
+            if (
+                self.media_player.playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState
+            ):
+                self.media_player.pause()
+            self._set_playhead(upper - 1)
+            return
+        self._set_playhead(max(lower, frame))
 
     def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -7562,17 +7589,34 @@ class MainWindow(QMainWindow):
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
             return
-        if (
-            self.media_player.duration() > 0
-            and self.media_player.position() >= self.media_player.duration() - 50
-        ):
-            self.media_player.setPosition(0)
         if self._playback_path is not None and self._playback_path.is_file():
             try:
                 current_key, _ = self._playback_signature()
             except (OSError, ValueError):
                 current_key = None
             if current_key == self._playback_key:
+                if self._tc_alignment:
+                    lower, upper = self.timeline_bar.values()
+                    fps = float(self._tc_alignment["fps"])
+                    current_frame = int(
+                        round(self.media_player.position() * fps / 1000)
+                    )
+                    at_file_end = (
+                        self.media_player.duration() > 0
+                        and self.media_player.position()
+                        >= self.media_player.duration() - 50
+                    )
+                    if current_frame < lower or current_frame >= upper or at_file_end:
+                        self.media_player.setPosition(
+                            max(0, int(round(lower * 1000 / fps)))
+                        )
+                        self._set_playhead(lower)
+                elif (
+                    self.media_player.duration() > 0
+                    and self.media_player.position()
+                    >= self.media_player.duration() - 50
+                ):
+                    self.media_player.setPosition(0)
                 self.preview_stack.setCurrentWidget(self.video_preview)
                 self.media_player.play()
                 return
@@ -8659,8 +8703,12 @@ class MainWindow(QMainWindow):
                     # decode scale/configuration written above.
                     render_sources = [str(record.path) for record in proxy_records]
                     self._append_log(f"SOURCE PROXY READ FALLBACK: {error}")
-            lower, upper = self.timeline_bar.values()
-            raw.setdefault("video", {})["frames"] = upper - lower
+            cache_frames = (
+                self._timeline_maximum
+                if self._tc_alignment and self._timeline_maximum > 0
+                else int(raw.get("video", {}).get("frames") or 1)
+            )
+            raw.setdefault("video", {})["frames"] = cache_frames
             raw["video"]["output_codec"] = "h264-proxy"
             raw.setdefault("flow", {})["enabled"] = False
             playback_config.write_text(json.dumps(raw, indent=2), encoding="utf-8")
@@ -8678,7 +8726,7 @@ class MainWindow(QMainWindow):
             "--map-cache",
             str(self._cache_dir / "playback-maps"),
             "--start-frame",
-            str(lower),
+            "0",
             "--decode-scale",
             f"{decode_scale:.9f}",
         ]

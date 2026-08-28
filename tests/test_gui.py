@@ -319,7 +319,9 @@ def test_gui_builds_small_cached_playback_proxy_config(
     assert proxy_config["output"]["width"] <= 960
     assert proxy_config["output"]["height"] <= 540
     assert proxy_config["video"]["output_codec"] == "h264-proxy"
-    assert proxy_config["video"]["frames"] == 24
+    assert proxy_config["video"]["frames"] == 48
+    arguments = captured[0][1]
+    assert arguments[arguments.index("--start-frame") + 1] == "0"
     window.close()
     app.processEvents()
 
@@ -527,6 +529,83 @@ def test_playback_signature_changes_for_viewer_without_changing_delivery(
 
     assert rec709_key != delivery_key
     assert window._collect_config() == delivery
+    window.close()
+    app.processEvents()
+
+
+def test_playback_signature_reuses_full_cache_across_trim_and_playhead_changes(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    sources = []
+    for number in range(1, 6):
+        source = tmp_path / f"P{number:02d}.mov"
+        source.touch()
+        sources.append(str(source))
+    window.source_table.set_paths(sources)
+    window._tc_alignment = {"fps": 24.0, "common_frames": 48}
+    window._timeline_maximum = 48
+    window.timeline_in.setRange(0, 47)
+    window.timeline_out.setRange(1, 48)
+    window.timeline_playhead.setRange(0, 47)
+    window._set_timeline_range(0, 48)
+    full_key, _ = window._playback_signature()
+
+    window._set_timeline_range(8, 32)
+    trimmed_key, _ = window._playback_signature()
+    window._set_playhead(20)
+    moved_key, _ = window._playback_signature()
+
+    assert full_key == trimmed_key == moved_key
+    window.close()
+    app.processEvents()
+
+
+def test_timeline_range_change_keeps_and_seeks_loaded_playback_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    proxy = tmp_path / "proxy.mp4"
+    proxy.touch()
+    window._tc_alignment = {"fps": 24.0, "common_frames": 48}
+    window._timeline_maximum = 48
+    window.timeline_in.setRange(0, 47)
+    window.timeline_out.setRange(1, 48)
+    window.timeline_playhead.setRange(0, 47)
+    window._set_timeline_range(0, 48)
+    window._set_playhead(20)
+    window._playback_path = proxy
+    window._playback_key = "same-key"
+    monkeypatch.setattr(window, "_playback_signature", lambda: ("same-key", []))
+
+    class PausedPlayer:
+        position_value = -1
+        pause_calls = 0
+
+        def blockSignals(self, _value: bool) -> None:
+            pass
+
+        def pause(self) -> None:
+            self.pause_calls += 1
+
+        def setPosition(self, value: int) -> None:
+            self.position_value = value
+
+        def stop(self) -> None:
+            pass
+
+    player = PausedPlayer()
+    window.media_player = player  # type: ignore[assignment]
+
+    window._timeline_bar_changed(8, 32)
+
+    assert window.timeline_bar.values() == (8, 32)
+    assert window._playback_path == proxy
+    assert window._playback_key == "same-key"
+    assert player.pause_calls == 1
+    assert player.position_value == 833
     window.close()
     app.processEvents()
 
@@ -1841,6 +1920,124 @@ def test_space_resumes_loaded_proxy_without_resetting_position(
 
     assert player.play_calls == 1
     assert player.position_value == 420
+    window.close()
+    app.processEvents()
+
+
+def test_loaded_proxy_seek_uses_absolute_aligned_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    proxy = tmp_path / "proxy.mp4"
+    proxy.touch()
+    window._tc_alignment = {"fps": 24.0}
+    window._playback_path = proxy
+    window._playback_key = "same-key"
+    monkeypatch.setattr(window, "_playback_signature", lambda: ("same-key", []))
+
+    class Player:
+        position_value = -1
+
+        def setPosition(self, value: int) -> None:
+            self.position_value = value
+
+        def stop(self) -> None:
+            pass
+
+    player = Player()
+    window.media_player = player  # type: ignore[assignment]
+
+    assert window._seek_loaded_playback(24, show_video=False)
+    assert player.position_value == 1000
+    window.close()
+    app.processEvents()
+
+
+def test_playback_pauses_at_active_out_without_rebuilding_cache(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    proxy = tmp_path / "proxy.mp4"
+    proxy.touch()
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window.timeline_playhead.setRange(0, 99)
+    window._set_timeline_range(10, 30)
+    window._playback_path = proxy
+
+    class PlayingPlayer:
+        pause_calls = 0
+
+        def playbackState(self):
+            return QMediaPlayer.PlaybackState.PlayingState
+
+        def pause(self) -> None:
+            self.pause_calls += 1
+
+        def stop(self) -> None:
+            pass
+
+    player = PlayingPlayer()
+    window.media_player = player  # type: ignore[assignment]
+
+    window._playback_position_changed(1250)
+
+    assert player.pause_calls == 1
+    assert window.timeline_playhead.value() == 29
+    assert window._playback_path == proxy
+    window.close()
+    app.processEvents()
+
+
+def test_replaying_active_range_restarts_at_timeline_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    proxy = tmp_path / "proxy.mp4"
+    proxy.touch()
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window.timeline_playhead.setRange(0, 99)
+    window._set_timeline_range(24, 72)
+    window._playback_path = proxy
+    window._playback_key = "same-key"
+    monkeypatch.setattr(window, "_playback_signature", lambda: ("same-key", []))
+
+    class PausedPlayer:
+        position_value = 3000
+        play_calls = 0
+
+        def playbackState(self):
+            return QMediaPlayer.PlaybackState.PausedState
+
+        def duration(self) -> int:
+            return 5000
+
+        def position(self) -> int:
+            return self.position_value
+
+        def setPosition(self, value: int) -> None:
+            self.position_value = value
+
+        def play(self) -> None:
+            self.play_calls += 1
+
+        def stop(self) -> None:
+            pass
+
+    player = PausedPlayer()
+    window.media_player = player  # type: ignore[assignment]
+
+    window.toggle_playback()
+
+    assert player.position_value == 1000
+    assert player.play_calls == 1
+    assert window.timeline_playhead.value() == 24
     window.close()
     app.processEvents()
 
