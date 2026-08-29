@@ -209,6 +209,14 @@ class LivePlaybackSession:
             max_width=max_width,
             max_height=max_height,
         )
+        # Inspector movement gets its own renderer. It shares decoded frame
+        # bundles with the normal viewer but keeps lower-resolution maps and
+        # warped layers hot, so continuous nudges never force another decode
+        # or disturb the full-quality preview renderer.
+        self.draft_renderer = InteractivePreviewRenderer(
+            max_width=min(max_width, 640),
+            max_height=min(max_height, 360),
+        )
         self.decoder: SynchronizedProxyDecoder | None = None
         self._frame_cache: OrderedDict[int, FrameBundle] = OrderedDict()
         self._frame_cache_limit = 8
@@ -216,6 +224,10 @@ class LivePlaybackSession:
             int, tuple[FrameBundle, np.ndarray]
         ] = OrderedDict()
         self._render_cache_limit = 12
+        self._draft_render_cache: OrderedDict[
+            int, tuple[FrameBundle, np.ndarray]
+        ] = OrderedDict()
+        self._draft_render_cache_limit = 2
 
     def can_reconfigure(
         self,
@@ -239,6 +251,7 @@ class LivePlaybackSession:
         # Decoded camera frames remain valid across color/geometry changes,
         # while stitched images must be regenerated with the new settings.
         self._render_cache.clear()
+        self._draft_render_cache.clear()
 
     def _remember(self, bundle: FrameBundle) -> None:
         self._frame_cache[bundle.timeline_frame] = bundle
@@ -249,13 +262,20 @@ class LivePlaybackSession:
     def has_cached_frame(self, timeline_frame: int) -> bool:
         return timeline_frame in self._frame_cache
 
-    def has_rendered_frame(self, timeline_frame: int) -> bool:
-        return timeline_frame in self._render_cache
+    def has_rendered_frame(self, timeline_frame: int, *, draft: bool = False) -> bool:
+        cache = self._draft_render_cache if draft else self._render_cache
+        return timeline_frame in cache
 
-    def render_frame(self, timeline_frame: int) -> tuple[FrameBundle, np.ndarray]:
-        rendered = self._render_cache.get(timeline_frame)
+    def render_frame(
+        self,
+        timeline_frame: int,
+        *,
+        draft: bool = False,
+    ) -> tuple[FrameBundle, np.ndarray]:
+        render_cache = self._draft_render_cache if draft else self._render_cache
+        rendered = render_cache.get(timeline_frame)
         if rendered is not None:
-            self._render_cache.move_to_end(timeline_frame)
+            render_cache.move_to_end(timeline_frame)
             return rendered
         bundle = self._frame_cache.get(timeline_frame)
         if bundle is not None:
@@ -275,16 +295,20 @@ class LivePlaybackSession:
             if bundle is None:
                 raise EOFError("synchronized source proxy reached end of stream")
             self._remember(bundle)
-        image = self.renderer.render_frames(
+        renderer = self.draft_renderer if draft else self.renderer
+        image = renderer.render_frames(
             self.config,
             bundle.frames,
             frame_token=bundle.timeline_frame,
         )
         rendered = (bundle, image)
-        self._render_cache[timeline_frame] = rendered
-        self._render_cache.move_to_end(timeline_frame)
-        while len(self._render_cache) > self._render_cache_limit:
-            self._render_cache.popitem(last=False)
+        render_cache[timeline_frame] = rendered
+        render_cache.move_to_end(timeline_frame)
+        cache_limit = (
+            self._draft_render_cache_limit if draft else self._render_cache_limit
+        )
+        while len(render_cache) > cache_limit:
+            render_cache.popitem(last=False)
         return rendered
 
     def close(self) -> None:
@@ -293,3 +317,4 @@ class LivePlaybackSession:
             self.decoder = None
         self._frame_cache.clear()
         self._render_cache.clear()
+        self._draft_render_cache.clear()

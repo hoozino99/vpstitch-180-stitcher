@@ -81,7 +81,20 @@ set_plist_string NSRemovableVolumesUsageDescription \
   "VP Stitch needs source plate and render access on external production drives."
 set_plist_string NSNetworkVolumesUsageDescription \
   "VP Stitch needs source plate and render access on network production storage."
-codesign --deep --force --sign - "dist/VP Stitch.app"
+
+# A stable Developer ID identity keeps macOS Files & Folders approval attached
+# to the app across updates. CI and local development may still fall back to
+# ad-hoc signing, which macOS can legitimately treat as a new build.
+CODESIGN_IDENTITY=${VPSTITCH_CODESIGN_IDENTITY:--}
+if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  # Hardened runtime library validation requires a real shared Team ID. Keep
+  # ad-hoc development builds unhardened so bundled Python/Qt libraries load.
+  codesign --deep --force --sign - "dist/VP Stitch.app"
+  echo "Note: ad-hoc signing; set VPSTITCH_CODESIGN_IDENTITY for persistent macOS app identity."
+else
+  codesign --deep --force --options runtime --sign "$CODESIGN_IDENTITY" \
+    "dist/VP Stitch.app"
+fi
 
 ditto -c -k --sequesterRsrc --keepParent \
   "dist/VP Stitch.app" \

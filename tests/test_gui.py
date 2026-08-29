@@ -6,11 +6,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, QProcess, Qt
+from PySide6.QtCore import QPoint, QPointF, QProcess, QSettings, Qt
 from PySide6.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
@@ -51,6 +52,8 @@ from vpstitch.gui import (
     resolved_render_output,
     suggest_camera_assignment,
     split_render_output,
+    _preferred_storage_directory,
+    _remember_storage_root,
 )
 from vpstitch.renderqueue import RenderJob, RenderQueueStore, RenderStatus
 from vpstitch.project import (
@@ -1997,6 +2000,13 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
     window.source_table.set_paths(paths)
     window.source_table.selectRow(1)
     window._source_selection_changed()
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window.timeline_playhead.setRange(0, 99)
+    window.timeline_bar.set_frame_range(100, 0, 100, 42)
+    window._set_playhead(42)
     preview_updates: list[str] = []
     monkeypatch.setattr(window, "stop_playback", lambda: None)
     monkeypatch.setattr(
@@ -2019,6 +2029,7 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
     assert window._plate_move_mode is True
     assert window.preview._move_overlay_active is True
     assert window.preview._move_overlay_label == "MOVE  P02"
+    assert window.timeline_playhead.value() == 42
     assert window.preview.current_pixmap() is not None
     assert window.preview.current_pixmap().size() == playback_frame.size()
     assert "Shift+Arrow fine" in window.shortcut_hint.text()
@@ -2045,6 +2056,45 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
     app.processEvents()
     assert window._plate_move_mode is False
     assert window.preview._move_overlay_active is False
+    assert preview_updates[-1] == "Plate move confirmed"
+    window.close()
+    app.processEvents()
+
+
+def test_storage_roots_are_remembered_without_duplicate_nested_prompts(
+    tmp_path: Path,
+) -> None:
+    settings = QSettings(str(tmp_path / "storage.ini"), QSettings.Format.IniFormat)
+    production = tmp_path / "Production"
+    nested = production / "Shoot_A" / "plates"
+
+    _remember_storage_root(settings, production)
+    _remember_storage_root(settings, nested)
+
+    assert settings.value("storage/authorizedRoots") == [str(production)]
+    assert (
+        _preferred_storage_directory(settings, "storage/lastImportDir", tmp_path)
+        == str(production)
+    )
+
+
+def test_move_mode_displays_completed_draft_while_newer_request_is_pending() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._plate_move_mode = True
+    window._live_playback_revision = 9
+    window._set_playhead(0)
+    image = np.full((48, 96, 3), 32768, dtype=np.uint16)
+
+    window._live_proxy_frame_finished(
+        8,
+        (0, image, "Plate fine-tune applied", 0.04, True),
+        "",
+    )
+    app.processEvents()
+
+    assert window.preview.current_pixmap() is not None
+    assert "MOVE DRAFT" in window.preview_note.text()
     window.close()
     app.processEvents()
 

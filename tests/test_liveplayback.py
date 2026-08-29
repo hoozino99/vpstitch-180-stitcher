@@ -272,6 +272,57 @@ def test_live_session_reuses_decoded_frame_across_setting_changes(
     assert len(_FakeDecoder.instances) == 3
 
 
+def test_live_session_move_draft_reuses_decoded_frame_and_separate_renderer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _FakeDecoder.instances.clear()
+    _FakeDecoder.fail_enabled = False
+    config = RigConfig(
+        cameras=_cameras(3),
+        output=Output(width=64, height=24, tile_width=64, tile_height=24),
+        color=Color(integer_dither=False),
+    )
+    sources = [str(tmp_path / f"P0{index}.mp4") for index in range(1, 4)]
+    plan = AlignedFramePlan(24.0, (0, 0, 0), (20, 20, 20), 20)
+    session = LivePlaybackSession(
+        sources,
+        config,
+        plan,
+        decoder_factory=_FakeDecoder,
+        max_width=64,
+        max_height=24,
+    )
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        session.renderer,
+        "render_frames",
+        lambda _config, frames, *, frame_token: (
+            calls.append(("full", frame_token)) or frames[0]
+        ),
+    )
+    monkeypatch.setattr(
+        session.draft_renderer,
+        "render_frames",
+        lambda _config, frames, *, frame_token: (
+            calls.append(("draft", frame_token)) or frames[0]
+        ),
+    )
+
+    session.render_frame(6)
+    decoder_positions = tuple(decoder.frame for decoder in _FakeDecoder.instances)
+    changed = replace(
+        config,
+        cameras=(replace(config.cameras[0], yaw_deg=-0.05), *config.cameras[1:]),
+    )
+    session.reconfigure(changed)
+    session.render_frame(6, draft=True)
+
+    assert calls == [("full", 6), ("draft", 6)]
+    assert tuple(decoder.frame for decoder in _FakeDecoder.instances) == decoder_positions
+    assert session.has_rendered_frame(6, draft=True)
+    assert len(_FakeDecoder.instances) == 3
+
+
 @pytest.mark.parametrize("camera_count", [3, 5])
 def test_real_source_proxies_decode_and_render_synchronized_bundles(
     tmp_path: Path,

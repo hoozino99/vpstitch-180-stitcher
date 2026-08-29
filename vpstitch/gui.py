@@ -460,6 +460,58 @@ def _user_data_root() -> Path:
     return Path(location) if location else Path.home() / "Library" / "Application Support" / "VP-LAB" / APP_NAME
 
 
+_STORAGE_ROOTS_KEY = "storage/authorizedRoots"
+_STORAGE_SETUP_KEY = "storage/setupComplete"
+
+
+def _application_settings() -> QSettings:
+    """Keep automated UI tests out of the operator's real macOS preferences."""
+    test_id = os.environ.get("PYTEST_CURRENT_TEST", "").strip()
+    if test_id:
+        settings_root = Path.cwd() / ".pytest-tmp" / "qsettings"
+        settings_root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(test_id.encode("utf-8")).hexdigest()[:16]
+        return QSettings(
+            str(settings_root / f"{digest}.ini"),
+            QSettings.Format.IniFormat,
+        )
+    return QSettings("VP-LAB", APP_NAME)
+
+
+def _setting_paths(settings: QSettings, key: str) -> list[str]:
+    value = settings.value(key, [])
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [str(path) for path in value if str(path)]
+    return []
+
+
+def _remember_storage_root(settings: QSettings, path: str | Path) -> Path:
+    """Remember an operator-selected directory without probing protected storage."""
+    root = Path(path).expanduser().resolve(strict=False)
+    roots = [Path(value).expanduser().resolve(strict=False) for value in _setting_paths(settings, _STORAGE_ROOTS_KEY)]
+    if any(root == existing or root.is_relative_to(existing) for existing in roots):
+        return root
+    roots = [existing for existing in roots if not existing.is_relative_to(root)]
+    roots.append(root)
+    settings.setValue(_STORAGE_ROOTS_KEY, [str(value) for value in roots])
+    settings.sync()
+    return root
+
+
+def _preferred_storage_directory(
+    settings: QSettings,
+    key: str,
+    fallback: str | Path,
+) -> str:
+    remembered = str(settings.value(key, "") or "").strip()
+    if remembered:
+        return remembered
+    roots = _setting_paths(settings, _STORAGE_ROOTS_KEY)
+    return roots[-1] if roots else str(fallback)
+
+
 def preview_dimensions(
     width: int,
     height: int,
@@ -2045,6 +2097,102 @@ class SourceTable(QTableWidget):
                 raise ValueError(f"Camera {row + 1} orientation/offset is invalid") from error
 
 
+class StorageAccessDialog(QDialog):
+    """One place to grant and remember production storage roots on macOS."""
+
+    def __init__(self, parent: QWidget | None = None, *, first_run: bool = False) -> None:
+        super().__init__(parent)
+        self.settings = _application_settings()
+        self.setWindowTitle("VP Stitch · Storage Access")
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+
+        heading = QLabel("ONE-TIME STORAGE ACCESS" if first_run else "STORAGE ACCESS")
+        heading.setProperty("sectionTitle", True)
+        layout.addWidget(heading)
+        note = QLabel(
+            "Choose the highest production folder that contains your plates, projects, "
+            "and renders. VP Stitch remembers it and native macOS file panels reuse that "
+            "approval. Add another root only for a separate drive or network volume."
+        )
+        note.setWordWrap(True)
+        note.setProperty("muted", True)
+        layout.addWidget(note)
+
+        self.roots = QTreeWidget()
+        self.roots.setHeaderLabels(["AUTHORIZED PRODUCTION ROOT"])
+        self.roots.setRootIsDecorated(False)
+        self.roots.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.roots.setMinimumHeight(150)
+        layout.addWidget(self.roots)
+
+        actions = QHBoxLayout()
+        add_button = QPushButton("ADD ROOT…")
+        add_button.setObjectName("primaryButton")
+        remove_button = QPushButton("FORGET SELECTED")
+        close_button = QPushButton(
+            "CONTINUE" if first_run else "DONE"
+        )
+        add_button.clicked.connect(self._add_root)
+        remove_button.clicked.connect(self._remove_selected)
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(add_button)
+        actions.addWidget(remove_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+
+        detail = QLabel(
+            "A rebuilt ad-hoc development app may be asked again by macOS. A stable "
+            "Developer ID signature preserves the app identity across updates."
+        )
+        detail.setWordWrap(True)
+        detail.setProperty("muted", True)
+        layout.addWidget(detail)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.roots.clear()
+        for path in _setting_paths(self.settings, _STORAGE_ROOTS_KEY):
+            item = QTreeWidgetItem([path])
+            item.setToolTip(0, path)
+            self.roots.addTopLevelItem(item)
+
+    def _add_root(self) -> None:
+        initial = _preferred_storage_directory(
+            self.settings,
+            "storage/lastRoot",
+            Path.home(),
+        )
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Choose production root",
+            initial,
+        )
+        if not selected:
+            return
+        root = _remember_storage_root(self.settings, selected)
+        self.settings.setValue("storage/lastRoot", str(root))
+        self.settings.sync()
+        self._refresh()
+
+    def _remove_selected(self) -> None:
+        item = self.roots.currentItem()
+        if item is None:
+            return
+        selected = item.text(0)
+        roots = [
+            path
+            for path in _setting_paths(self.settings, _STORAGE_ROOTS_KEY)
+            if path != selected
+        ]
+        self.settings.setValue(_STORAGE_ROOTS_KEY, roots)
+        self.settings.sync()
+        self._refresh()
+
+
 class ProjectManagerDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2072,7 +2220,7 @@ class ProjectManagerDialog(QDialog):
             """
         )
         self.project_path: Path | None = None
-        self.settings = QSettings("VP-LAB", APP_NAME)
+        self.settings = _application_settings()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
@@ -2135,12 +2283,10 @@ class ProjectManagerDialog(QDialog):
             paths.insert(0, last)
         for value in paths:
             path = Path(value)
-            if not path.is_file():
-                continue
-            try:
-                name = ProjectStore.load(path, autosave=False).settings.name
-            except ProjectError:
-                continue
+            # Do not probe protected folders while the launcher is merely
+            # listing recent projects. Access happens only after the operator
+            # explicitly opens one.
+            name = path.parent.name or path.stem
             item = QTreeWidgetItem([name, str(path.parent)])
             item.setData(0, Qt.ItemDataRole.UserRole, str(path))
             self.projects.addTopLevelItem(item)
@@ -2151,6 +2297,8 @@ class ProjectManagerDialog(QDialog):
         values = [str(path), *[item for item in self._recent_paths() if item != str(path)]]
         self.settings.setValue("lastProject", str(path))
         self.settings.setValue("recentProjects", values[:12])
+        self.settings.setValue("storage/lastProjectDir", str(path.parent))
+        _remember_storage_root(self.settings, path.parent)
         self.settings.sync()
 
     def create_project(self) -> None:
@@ -2160,14 +2308,12 @@ class ProjectManagerDialog(QDialog):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
         name = QLineEdit("Untitled Project")
+        default_projects = _user_data_root() / "projects"
         location = QLineEdit(
-            str(
-                Path(
-                    QStandardPaths.writableLocation(
-                        QStandardPaths.StandardLocation.DocumentsLocation
-                    )
-                )
-                / "VP Stitch Projects"
+            _preferred_storage_directory(
+                self.settings,
+                "storage/lastProjectDir",
+                default_projects,
             )
         )
         browse = QPushButton("…")
@@ -2177,12 +2323,19 @@ class ProjectManagerDialog(QDialog):
         location_layout.setContentsMargins(0, 0, 0, 0)
         location_layout.addWidget(location)
         location_layout.addWidget(browse)
-        browse.clicked.connect(
-            lambda: location.setText(
-                QFileDialog.getExistingDirectory(dialog, "Project location", location.text())
-                or location.text()
+        def browse_project_location() -> None:
+            selected = QFileDialog.getExistingDirectory(
+                dialog,
+                "Project location",
+                location.text(),
             )
-        )
+            if selected:
+                location.setText(selected)
+                self.settings.setValue("storage/lastProjectDir", selected)
+                _remember_storage_root(self.settings, selected)
+                self.settings.sync()
+
+        browse.clicked.connect(browse_project_location)
         width = QSpinBox()
         width.setRange(640, MAX_CANVAS_WIDTH)
         width.setValue(20_000)
@@ -2338,7 +2491,11 @@ class ProjectManagerDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open VP Stitch Project",
-            str(Path.home()),
+            _preferred_storage_directory(
+                self.settings,
+                "storage/lastProjectDir",
+                _user_data_root() / "projects",
+            ),
             "VP Stitch project (project.json *.vpstitch);;JSON (*.json)",
         )
         if not path:
@@ -2372,7 +2529,7 @@ class MainWindow(QMainWindow):
         self.resize(1600, 960)
         self.setMinimumSize(1180, 720)
         self.setAcceptDrops(True)
-        self.settings = QSettings("VP-LAB", APP_NAME)
+        self.settings = _application_settings()
         self.runtime_root = _runtime_root()
         self.project_root = self.runtime_root if getattr(sys, "frozen", False) else Path.cwd()
         self.user_data_root = _user_data_root() if getattr(sys, "frozen", False) else self.project_root / ".vpstitch-ui"
@@ -2435,7 +2592,7 @@ class MainWindow(QMainWindow):
         self._live_playback_session: LivePlaybackSession | None = None
         self._live_playback_key: str | None = None
         self._live_playback_revision = 0
-        self._live_playback_pending: tuple[int, str, bool, int] | None = None
+        self._live_playback_pending: tuple[int, str, bool, int, bool] | None = None
         self._live_playing = False
         self._live_direction = 1
         self._live_close_pending = False
@@ -3222,6 +3379,7 @@ class MainWindow(QMainWindow):
         file_menu = bar.addMenu("File")
         action(file_menu, "New Project…", self.new_project)
         action(file_menu, "Open Project…", self.open_project)
+        action(file_menu, "Storage Access…", self.manage_storage_access)
         file_menu.addSeparator()
         action(file_menu, "Import Media…", self.choose_videos)
         self.save_project_action = standard_action(
@@ -4442,15 +4600,25 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open VP Stitch Project",
-            str(self.user_data_root / "projects"),
+            _preferred_storage_directory(
+                self.settings,
+                "storage/lastProjectDir",
+                self.user_data_root / "projects",
+            ),
             "VP Stitch project (project.json *.vpstitch);;JSON (*.json)",
         )
         if not path:
             return
         try:
             self._switch_project(ProjectStore.load(path))
+            self.settings.setValue("storage/lastProjectDir", str(Path(path).parent))
+            _remember_storage_root(self.settings, Path(path).parent)
+            self.settings.sync()
         except ProjectError as error:
             self._error("Open Project", str(error))
+
+    def manage_storage_access(self) -> None:
+        StorageAccessDialog(self).exec()
 
     def _switch_project(self, store: ProjectStore) -> None:
         self._save_active_timeline()
@@ -5841,10 +6009,18 @@ class MainWindow(QMainWindow):
             selected = QFileDialog.getExistingDirectory(
                 dialog,
                 "Select render folder",
-                folder.text() or str(self._output_root),
+                folder.text()
+                or _preferred_storage_directory(
+                    self.settings,
+                    "storage/lastRenderDir",
+                    self._output_root,
+                ),
             )
             if selected:
                 folder.setText(selected)
+                self.settings.setValue("storage/lastRenderDir", selected)
+                _remember_storage_root(self.settings, selected)
+                self.settings.sync()
 
         browse.clicked.connect(browse_folder)
         folder.textChanged.connect(refresh)
@@ -6237,7 +6413,9 @@ class MainWindow(QMainWindow):
                 return
             self._selected_camera_row = row
             self._load_plate_controls(row)
-            self.stop_playback()
+            preserved_frame = self.timeline_playhead.value()
+            self._stop_playback(preserve_image=True)
+            self._set_playhead(preserved_frame)
             if (
                 self._latest_playback_frame is not None
                 and not self._latest_playback_frame.isNull()
@@ -6259,6 +6437,7 @@ class MainWindow(QMainWindow):
             )
             self.preview.setFocus()
             return
+        was_enabled = self._plate_move_mode
         self._plate_move_mode = False
         self.preview.set_move_overlay(False)
         if hasattr(self, "plate_move_action"):
@@ -6269,6 +6448,10 @@ class MainWindow(QMainWindow):
             "Space Play/Pause  ·  J/K/L Transport  ·  M Move Plate  ·  P Full Screen"
         )
         self.statusBar().showMessage("Plate move mode off", 3000)
+        if was_enabled:
+            # Confirm the exact high-resolution viewer result after the fast
+            # movement renderer has kept up with the operator's nudges.
+            self._schedule_live_preview("Plate move confirmed", immediate=True)
 
     def _toggle_plate_move_mode(self) -> None:
         self._set_plate_move_mode(not self._plate_move_mode)
@@ -6402,7 +6585,10 @@ class MainWindow(QMainWindow):
         self._invalidate_plate_preview()
 
     def _invalidate_plate_preview(self) -> None:
-        self._schedule_live_preview("Plate fine-tune applied")
+        self._schedule_live_preview(
+            "Plate fine-tune applied",
+            immediate=self._plate_move_mode,
+        )
 
     def _reset_selected_plate(self) -> None:
         cameras = self.config_data.get("cameras")
@@ -7605,13 +7791,14 @@ class MainWindow(QMainWindow):
             dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
             dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
             dialog.setNameFilter(VIDEO_FILTER)
-            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
             self._import_dialog = dialog
-        initial_dir = str(self.settings.value("lastImportDir", ""))
-        if not Path(initial_dir).is_dir():
-            initial_dir = QStandardPaths.writableLocation(
+        initial_dir = _preferred_storage_directory(
+            self.settings,
+            "lastImportDir",
+            QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.DownloadLocation
-            )
+            ),
+        )
         if initial_dir:
             self._import_dialog.setDirectory(initial_dir)
         if self._import_dialog.exec() != QDialog.DialogCode.Accepted:
@@ -7620,7 +7807,10 @@ class MainWindow(QMainWindow):
         files = self._import_dialog.selectedFiles()
         self._import_dialog.hide()
         if files:
-            self.settings.setValue("lastImportDir", str(Path(files[0]).parent))
+            import_root = Path(files[0]).parent
+            self.settings.setValue("lastImportDir", str(import_root))
+            _remember_storage_root(self.settings, import_root)
+            self.settings.sync()
             try:
                 added = self.import_media_paths(
                     files,
@@ -8139,6 +8329,7 @@ class MainWindow(QMainWindow):
         *,
         playing: bool = False,
         direction: int = 1,
+        draft: bool = False,
     ) -> bool:
         if self._closing or not self._tc_alignment:
             return False
@@ -8158,6 +8349,7 @@ class MainWindow(QMainWindow):
                 message,
                 playing,
                 self._live_direction,
+                draft,
             )
             return True
         old_session: LivePlaybackSession | None = None
@@ -8194,14 +8386,20 @@ class MainWindow(QMainWindow):
         def render_live_frame() -> object:
             if old_session is not None:
                 old_session.close()
-            bundle, image = session.render_frame(frame)
-            return bundle.timeline_frame, image, message, time.monotonic() - started
+            bundle, image = session.render_frame(frame, draft=draft)
+            return (
+                bundle.timeline_frame,
+                image,
+                message,
+                time.monotonic() - started,
+                draft,
+            )
 
         future = self._live_playback_executor.submit(render_live_frame)
         self._live_playback_future = future
         activity = (
             "reusing stitched memory frame"
-            if session.has_rendered_frame(frame)
+            if session.has_rendered_frame(frame, draft=draft)
             else "applying settings to memory frame"
             if session.has_cached_frame(frame)
             else "decoding frame in background"
@@ -8234,20 +8432,45 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._live_playback_future = None
         current = revision == self._live_playback_revision and not self._closing
-        if current and not error and isinstance(payload, tuple) and len(payload) == 4:
-            frame, image, message, elapsed = payload
+        valid_payload = (
+            not error
+            and isinstance(payload, tuple)
+            and len(payload) in {4, 5}
+        )
+        if valid_payload:
+            frame, image, message, elapsed = payload[:4]
+            draft = bool(payload[4]) if len(payload) == 5 else False
+            progressive_move = (
+                draft
+                and self._plate_move_mode
+                and not self._closing
+                and int(frame) == self.timeline_playhead.value()
+            )
+        else:
+            frame = image = message = elapsed = None
+            draft = False
+            progressive_move = False
+        if (current or progressive_move) and valid_payload:
             if isinstance(image, np.ndarray):
                 self.preview.set_array(image)
                 self.preview_stack.setCurrentWidget(self.preview)
-                self._set_playhead(int(frame))
+                if current:
+                    self._set_playhead(int(frame))
                 self._preview_ready = True
                 pixmap = self.preview.current_pixmap()
                 if pixmap is not None and self._fullscreen_live_label is not None:
                     self._fullscreen_live_label.set_source(pixmap)
+                active_renderer = (
+                    self._live_playback_session.draft_renderer
+                    if draft and self._live_playback_session is not None
+                    else self._live_playback_session.renderer
+                    if self._live_playback_session is not None
+                    else None
+                )
                 backend = (
                     "GPU/OpenCL"
-                    if self._live_playback_session is not None
-                    and self._live_playback_session.renderer.hardware_accelerated
+                    if active_renderer is not None
+                    and active_renderer.hardware_accelerated
                     else "CPU fallback"
                 )
                 live_size = (
@@ -8257,9 +8480,10 @@ class MainWindow(QMainWindow):
                     else "adaptive"
                 )
                 self.preview_note.setText(
-                    f"{message} · LIVE DRAFT {live_size} · {backend}"
+                    f"{message} · "
+                    f"{'MOVE DRAFT' if draft else 'LIVE DRAFT'} {live_size} · {backend}"
                 )
-                if self._live_playing:
+                if current and self._live_playing:
                     lower, upper = self.timeline_bar.values()
                     next_frame = int(frame) + self._live_direction
                     if lower <= next_frame < upper:
@@ -8294,6 +8518,7 @@ class MainWindow(QMainWindow):
                 pending[1],
                 playing=pending[2],
                 direction=pending[3],
+                draft=pending[4],
             )
         elif self._live_close_pending:
             self._close_live_playback_session()
@@ -9010,10 +9235,11 @@ class MainWindow(QMainWindow):
             self._pending_playback_request = False
             self._playback_autostart = False
             self.process.kill()
-        # The current proxy remains on disk while the inspector is moving. Its
-        # signature is marked stale so playback cannot silently show old stitch
-        # values, but no media is re-decoded merely to update a still preview.
-        self._stop_playback(preserve_image=True)
+        # Entering move mode already pauses playback. Repeating this operation
+        # on every key repeat needlessly tears down viewer state and makes the
+        # UI feel blocked while the in-memory renderer is working.
+        if not self._plate_move_mode:
+            self._stop_playback(preserve_image=True)
         self._playback_key = None
         self._live_preview_revision += 1
         self._live_preview_message = message
@@ -9023,7 +9249,7 @@ class MainWindow(QMainWindow):
         else:
             self.preview_note.setText(f"{message} · updating draft…")
         self._live_preview_timer.start(0 if immediate else 40)
-        if self._tc_alignment:
+        if self._tc_alignment and not self._plate_move_mode:
             # Rebuild only after the controls have been idle for a moment. This
             # keeps slider/drag feedback interactive while ensuring Space does
             # not remain on the slower frame-by-frame fallback indefinitely.
@@ -9121,11 +9347,15 @@ class MainWindow(QMainWindow):
         self._live_preview_pending = False
         revision = self._live_preview_revision
         message = self._live_preview_message
-        self._save_active_timeline()
+        # The mutable config is authoritative during movement. Persist once
+        # movement ends, rather than serializing the project on every nudge.
+        if not self._plate_move_mode:
+            self._save_active_timeline()
         current_frame = self.timeline_playhead.value() if self._tc_alignment else 0
         if self._tc_alignment and self._request_live_proxy_frame(
             current_frame,
             message,
+            draft=self._plate_move_mode,
         ):
             return
         if self._tc_alignment and self._reference_frame_index != current_frame:
@@ -11204,7 +11434,10 @@ class MainWindow(QMainWindow):
 
 
 def _configure_application_attributes() -> None:
-    if sys.platform == "darwin":
+    if (
+        sys.platform == "darwin"
+        and os.environ.get("VPSTITCH_NON_NATIVE_DIALOGS") == "1"
+    ):
         QCoreApplication.setAttribute(
             Qt.ApplicationAttribute.AA_DontUseNativeDialogs,
             True,
@@ -11218,6 +11451,14 @@ def main() -> int:
         _stabilize_macos_accessibility_bridge()
         app.setApplicationName(APP_NAME)
         app.setOrganizationName("VP-LAB")
+        settings = _application_settings()
+        if (
+            sys.platform == "darwin"
+            and not settings.value(_STORAGE_SETUP_KEY, False, type=bool)
+        ):
+            StorageAccessDialog(first_run=True).exec()
+            settings.setValue(_STORAGE_SETUP_KEY, True)
+            settings.sync()
         launcher = ProjectManagerDialog()
         if launcher.exec() != QDialog.DialogCode.Accepted or launcher.project_path is None:
             return 0
