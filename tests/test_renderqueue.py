@@ -51,6 +51,33 @@ def test_job_round_trip_keeps_snapshots_ranges_and_paths(tmp_path: Path) -> None
     assert json.loads(queue_path.read_text(encoding="utf-8"))["version"] == 1
 
 
+def test_completed_render_duration_persists_and_validates(tmp_path: Path) -> None:
+    queue_path = tmp_path / "render-queue.json"
+    store = RenderQueueStore(queue_path)
+    job = store.add(make_job("duration"))
+    store.update(
+        job.id,
+        status=RenderStatus.DONE,
+        elapsed_seconds=3_661.4,
+    )
+
+    loaded = RenderQueueStore.load(queue_path).jobs[0]
+    assert loaded.status is RenderStatus.DONE
+    assert loaded.elapsed_seconds == pytest.approx(3_661.4)
+    assert json.loads(queue_path.read_text(encoding="utf-8"))["jobs"][0][
+        "elapsed_seconds"
+    ] == pytest.approx(3_661.4)
+
+    with pytest.raises(RenderQueueError, match="elapsed_seconds"):
+        RenderJob.create(
+            name="invalid duration",
+            source_paths=["P01.mov"],
+            config_snapshot={},
+            output_path="invalid.mov",
+            elapsed_seconds=float("inf"),
+        )
+
+
 def test_job_snapshot_is_detached_from_later_nested_config_changes() -> None:
     config = {
         "cameras": [

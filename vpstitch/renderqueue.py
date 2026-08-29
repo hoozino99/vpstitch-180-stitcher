@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import tempfile
@@ -93,6 +94,7 @@ class RenderJob:
     out_frame: int | None = None
     status: RenderStatus = RenderStatus.QUEUED
     error: str | None = None
+    elapsed_seconds: float | None = None
 
     def __post_init__(self) -> None:
         job_id = str(self.id).strip()
@@ -123,6 +125,18 @@ class RenderJob:
             raise RenderQueueError(f"invalid render status: {self.status!r}") from exc
 
         error = None if self.error is None else str(self.error)
+        elapsed_seconds = self.elapsed_seconds
+        if elapsed_seconds is not None:
+            if isinstance(elapsed_seconds, bool):
+                raise RenderQueueError("elapsed_seconds must be a non-negative number")
+            try:
+                elapsed_seconds = float(elapsed_seconds)
+            except (TypeError, ValueError) as exc:
+                raise RenderQueueError(
+                    "elapsed_seconds must be a non-negative number"
+                ) from exc
+            if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0.0:
+                raise RenderQueueError("elapsed_seconds must be a non-negative number")
         alignment_path = (
             None if self.tc_alignment_path is None else _coerce_path(self.tc_alignment_path)
         )
@@ -143,6 +157,7 @@ class RenderJob:
         object.__setattr__(self, "output_path", output)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "error", error)
+        object.__setattr__(self, "elapsed_seconds", elapsed_seconds)
 
     @classmethod
     def create(
@@ -158,6 +173,7 @@ class RenderJob:
         out_frame: int | None = None,
         status: RenderStatus | str = RenderStatus.QUEUED,
         error: str | None = None,
+        elapsed_seconds: float | None = None,
         job_id: str | None = None,
     ) -> RenderJob:
         return cls(
@@ -176,6 +192,7 @@ class RenderJob:
             out_frame=out_frame,
             status=RenderStatus(status),
             error=error,
+            elapsed_seconds=elapsed_seconds,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -199,6 +216,7 @@ class RenderJob:
             "output_path": _path_to_json(self.output_path),
             "status": self.status.value,
             "error": self.error,
+            "elapsed_seconds": self.elapsed_seconds,
         }
 
     @property
@@ -252,6 +270,7 @@ class RenderJob:
                 out_frame=payload.get("out_frame"),
                 status=RenderStatus(payload.get("status", RenderStatus.QUEUED.value)),
                 error=payload.get("error"),
+                elapsed_seconds=payload.get("elapsed_seconds"),
             )
         except KeyError as exc:
             raise RenderQueueError(f"render job is missing field: {exc.args[0]}") from exc

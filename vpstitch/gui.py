@@ -494,13 +494,14 @@ def robust_render_seconds_per_frame(
     samples: list[float],
     previous: float | None = None,
 ) -> float | None:
-    """Return a stable frame-time estimate without hiding sustained slowdown."""
+    """Estimate recent sustained throughput while rejecting isolated stalls."""
     values = np.asarray(
         [value for value in samples if np.isfinite(value) and value > 0.0],
         dtype=np.float64,
     )
-    if values.size < 2:
+    if values.size == 0:
         return previous
+    values = values[-15:]
     median = float(np.median(values))
     deviation = np.abs(values - median)
     mad = float(np.median(deviation))
@@ -508,13 +509,23 @@ def robust_render_seconds_per_frame(
     inliers = values[deviation <= tolerance]
     if inliers.size == 0:
         inliers = values
-    center = median * 0.65 + float(np.mean(inliers)) * 0.35
+    robust_center = median * 0.55 + float(np.mean(inliers)) * 0.45
+    recent = values[-min(5, values.size) :]
+    recent_center = float(np.median(recent))
+    center = robust_center * 0.35 + recent_center * 0.65
     if previous is None or not np.isfinite(previous) or previous <= 0.0:
         return center
-    # Follow real thermal/I/O changes, but prevent one irregular frame from
-    # making a long render jump by many minutes in either direction.
-    bounded = float(np.clip(center, previous * 0.8, previous * 1.25))
-    return previous * 0.82 + bounded * 0.18
+    # Median/MAD removes one-off stalls. Once three recent samples agree on a
+    # speed change, follow it quickly enough that ETA remains useful after a
+    # thermal, codec, or I/O transition.
+    recent_three = values[-3:]
+    sustained_change = recent_three.size == 3 and (
+        bool(np.all(recent_three > previous * 1.08))
+        or bool(np.all(recent_three < previous * 0.92))
+    )
+    bounded = float(np.clip(center, previous * 0.5, previous * 2.0))
+    weight = 0.75 if sustained_change else 0.5
+    return previous * (1.0 - weight) + bounded * weight
 
 
 def render_progress_text(
@@ -538,7 +549,12 @@ def render_queue_status_text(
     map_progress: tuple[int, int] | None = None,
 ) -> str:
     if status is RenderStatus.DONE:
-        return "100% · DONE"
+        duration = (
+            ""
+            if elapsed_seconds is None
+            else f" · {format_render_duration(elapsed_seconds)}"
+        )
+        return "100% · DONE" + duration
     if status is not RenderStatus.RENDERING or progress is None:
         return status.value.upper()
     done, total, eta_seconds = progress
@@ -555,6 +571,8 @@ def render_queue_status_text(
         return "STARTING" + elapsed
     bounded = min(max(0, int(done)), int(total))
     percent = 100.0 * bounded / total
+    if bounded >= total:
+        return "100% · FINALIZING" + elapsed
     if eta_seconds is None:
         return f"{percent:.1f}% · EST" + elapsed
     return f"{percent:.1f}% · {format_render_duration(eta_seconds)} LEFT" + elapsed
@@ -2401,9 +2419,10 @@ class MainWindow(QMainWindow):
         self._render_progress_last_done = 0
         self._render_seconds_per_frame: float | None = None
         self._render_frame_samples: list[float] = []
-        self._render_eta_warmup_remaining = 3
+        self._render_eta_warmup_remaining = 1
         self._render_progress_total = 0
         self._render_map_progress: tuple[int, int] | None = None
+        self._last_render_elapsed_seconds: float | None = None
         self._render_progress_timer = QTimer(self)
         self._render_progress_timer.setInterval(1000)
         self._render_progress_timer.timeout.connect(self._refresh_render_clock)
@@ -9821,7 +9840,7 @@ class MainWindow(QMainWindow):
                     elapsed_seconds=(
                         self._render_elapsed_seconds()
                         if job.id == self._queue_current_id
-                        else None
+                        else job.elapsed_seconds
                     ),
                     phase=self._process_phase if job.id == self._queue_current_id else "",
                     map_progress=(
@@ -9866,10 +9885,21 @@ class MainWindow(QMainWindow):
                         RenderStatus.FAILED: "#e37d83",
                     }
                     item.setForeground(QColor(colors[job.status]))
-                    item.setToolTip(
-                        job.error
-                        or f"Output: {job.output_path}\nCompleted frames and estimated remaining render time"
-                    )
+                    if job.error:
+                        tooltip = job.error
+                    elif job.status is RenderStatus.DONE:
+                        tooltip = f"Output: {job.output_path}"
+                        if job.elapsed_seconds is not None:
+                            tooltip += (
+                                "\nCompleted in "
+                                + format_render_duration(job.elapsed_seconds)
+                            )
+                    else:
+                        tooltip = (
+                            f"Output: {job.output_path}\n"
+                            "Completed frames and estimated remaining render time"
+                        )
+                    item.setToolTip(tooltip)
                 self.queue_table.setItem(row, column, item)
             if job.id == selected_id:
                 selected_row = row
@@ -10081,7 +10111,10 @@ class MainWindow(QMainWindow):
             f"Queue settings locked: {job.snapshot_digest} · {job.name}"
         )
         self.render_queue.update(
-            job.id, status=RenderStatus.RENDERING, error=None
+            job.id,
+            status=RenderStatus.RENDERING,
+            error=None,
+            elapsed_seconds=None,
         )
         self._refresh_queue_table()
         arguments = [
@@ -10106,7 +10139,10 @@ class MainWindow(QMainWindow):
             if progress is not None:
                 self._queue_progress[job.id] = (progress[1], progress[1], 0.0)
             self.render_queue.update(
-                job.id, status=RenderStatus.DONE, error=None
+                job.id,
+                status=RenderStatus.DONE,
+                error=None,
+                elapsed_seconds=self._last_render_elapsed_seconds,
             )
             self._queue_current_id = None
             self._refresh_queue_table()
@@ -10148,7 +10184,10 @@ class MainWindow(QMainWindow):
             return
         self._queue_running = False
         job = self.render_queue.update(
-            job.id, status=RenderStatus.QUEUED, error=None
+            job.id,
+            status=RenderStatus.QUEUED,
+            error=None,
+            elapsed_seconds=None,
         )
         self._start_queue_job(job)
 
@@ -10253,10 +10292,16 @@ class MainWindow(QMainWindow):
 
         def render_complete() -> None:
             self._commit_render_staging(staging, output_path)
+            elapsed = self._last_render_elapsed_seconds
+            duration = (
+                ""
+                if elapsed is None
+                else f"\n\nRender time: {format_render_duration(elapsed)}"
+            )
             self._show_message(
                 QMessageBox.Icon.Information,
                 "Render complete",
-                f"Output written to:\n{output}",
+                f"Output written to:\n{output}{duration}",
             )
 
         self._run_cli(
@@ -10417,7 +10462,7 @@ class MainWindow(QMainWindow):
                     self._render_progress_last_done = 0
                     self._render_seconds_per_frame = None
                     self._render_frame_samples.clear()
-                    self._render_eta_warmup_remaining = 3
+                    self._render_eta_warmup_remaining = 1
                     self._render_map_progress = None
                 self._process_phase = next_phase
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
@@ -10474,8 +10519,8 @@ class MainWindow(QMainWindow):
             )
             if self._render_eta_warmup_remaining > 0:
                 # Initial frames upload fixed Metal maps, allocate the reusable
-                # frame buffer, and warm GPU/VM pages. None represent steady
-                # rendering, so wait for two post-warmup samples before ETA.
+                # frame buffer, and warm GPU/VM pages. Skip that cold frame,
+                # then begin ETA from the first steady inter-frame interval.
                 self._render_eta_warmup_remaining = max(
                     0,
                     self._render_eta_warmup_remaining
@@ -10515,9 +10560,10 @@ class MainWindow(QMainWindow):
         self._render_progress_last_done = 0
         self._render_seconds_per_frame = None
         self._render_frame_samples.clear()
-        self._render_eta_warmup_remaining = 3
+        self._render_eta_warmup_remaining = 1
         self._render_progress_total = max(0, int(total_frames))
         self._render_map_progress = None
+        self._last_render_elapsed_seconds = None
         self._render_progress_timer.start()
         self._refresh_render_clock()
 
@@ -10528,7 +10574,7 @@ class MainWindow(QMainWindow):
         self._render_progress_last_done = 0
         self._render_seconds_per_frame = None
         self._render_frame_samples.clear()
-        self._render_eta_warmup_remaining = 3
+        self._render_eta_warmup_remaining = 1
         self._render_progress_total = 0
         self._render_map_progress = None
 
@@ -10571,6 +10617,10 @@ class MainWindow(QMainWindow):
         elif done <= 0:
             self.task_label.setText(
                 f"STARTING RENDER · {format_render_duration(elapsed)} ELAPSED"
+            )
+        elif total > 0 and done >= total:
+            self.task_label.setText(
+                f"FINALIZING · {format_render_duration(elapsed)} ELAPSED"
             )
         else:
             self.task_label.setText(
@@ -10622,6 +10672,7 @@ class MainWindow(QMainWindow):
         process = self.process
         task = self._process_task_name or self.task_label.text()
         render_elapsed = self._render_elapsed_seconds()
+        self._last_render_elapsed_seconds = render_elapsed
         cancelled_for_interaction = bool(
             task == "BUILD PLAYBACK PROXY"
             and self._playback_cache_cancelled_for_interaction

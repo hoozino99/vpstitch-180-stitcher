@@ -219,6 +219,16 @@ def test_render_progress_formats_percent_and_eta_compactly() -> None:
         map_progress=(1, 4),
     ) == "MAPS 25.0% · 00:12 RUN"
     assert render_queue_status_text(RenderStatus.DONE, (4, 4, 0)) == "100% · DONE"
+    assert render_queue_status_text(
+        RenderStatus.DONE,
+        (4, 4, 0),
+        elapsed_seconds=3_661,
+    ) == "100% · DONE · 01:01:01"
+    assert render_queue_status_text(
+        RenderStatus.RENDERING,
+        (4, 4, 0),
+        elapsed_seconds=70,
+    ) == "100% · FINALIZING · 01:10 RUN"
 
 
 def test_render_eta_uses_robust_center_and_limits_single_sample_jump() -> None:
@@ -229,10 +239,10 @@ def test_render_eta_uses_robust_center_and_limits_single_sample_jump() -> None:
 
     updated = robust_render_seconds_per_frame([2.0, 2.1], estimate)
     assert updated is not None
-    assert updated < estimate * 1.05
+    assert 1.55 < updated < 1.70
 
 
-def test_render_eta_excludes_initial_metal_warmup_frames(
+def test_render_eta_excludes_cold_frame_then_converges_to_recent_rate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -247,13 +257,13 @@ def test_render_eta_excludes_initial_metal_warmup_frames(
     window._update_render_progress(1, 100)
     assert window._render_seconds_per_frame is None
     window._update_render_progress(2, 100)
-    assert window._render_seconds_per_frame is None
+    assert window._render_seconds_per_frame == pytest.approx(1.2, abs=0.01)
     window._update_render_progress(3, 100)
-    assert window._render_seconds_per_frame is None
+    assert window._render_seconds_per_frame is not None
+    assert window._render_seconds_per_frame < 1.2
     window._update_render_progress(4, 100)
-    assert window._render_seconds_per_frame is None
     window._update_render_progress(5, 100)
-    assert window._render_seconds_per_frame == pytest.approx(0.275, abs=0.01)
+    assert window._render_seconds_per_frame == pytest.approx(0.56, abs=0.08)
 
     window.close()
     app.processEvents()
@@ -880,6 +890,7 @@ def test_gui_render_all_processes_timeline_snapshots_sequentially(
         output = arguments[arguments.index("--output") + 1]
         started.append((task, output))
         Path(output).write_bytes(b"rendered")
+        window._last_render_elapsed_seconds = 12.5 + len(started)
         if success:
             success()
 
@@ -897,6 +908,9 @@ def test_gui_render_all_processes_timeline_snapshots_sequentially(
     assert (tmp_path / "take-1.mov").read_bytes() == b"rendered"
     assert (tmp_path / "take-2.mov").read_bytes() == b"rendered"
     assert all(job.status is RenderStatus.DONE for job in window.render_queue.jobs)
+    assert [job.elapsed_seconds for job in window.render_queue.jobs] == [13.5, 14.5]
+    assert window.queue_table.item(0, 3).text() == "100% · DONE · 00:14"
+    assert "Completed in 00:14" in window.queue_table.item(0, 3).toolTip()
     assert window._queue_running is False
     window.close()
     app.processEvents()
