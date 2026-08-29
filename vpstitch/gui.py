@@ -812,12 +812,27 @@ class _InteractivePreviewSignals(QObject):
 _PREVIEW_KEY_COMMANDS = {
     Qt.Key.Key_P: "fullscreen",
     Qt.Key.Key_Space: "play-pause",
+    Qt.Key.Key_M: "plate-move",
     Qt.Key.Key_J: "reverse",
     Qt.Key.Key_K: "stop",
     Qt.Key.Key_L: "forward",
     Qt.Key.Key_Left: "step-back",
     Qt.Key.Key_Right: "step-forward",
+    Qt.Key.Key_Up: "move-up",
+    Qt.Key.Key_Down: "move-down",
 }
+
+
+def _preview_key_command(event) -> str | None:  # type: ignore[no-untyped-def]
+    command = _PREVIEW_KEY_COMMANDS.get(event.key())
+    if not command or not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        return command
+    return {
+        "step-back": "move-fine-left",
+        "step-forward": "move-fine-right",
+        "move-up": "move-fine-up",
+        "move-down": "move-fine-down",
+    }.get(command, command)
 
 
 class PlaybackVideoWidget(QVideoWidget):
@@ -835,7 +850,7 @@ class PlaybackVideoWidget(QVideoWidget):
         if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
             self.setFullScreen(False)
             return
-        command = _PREVIEW_KEY_COMMANDS.get(event.key())
+        command = _preview_key_command(event)
         if command:
             self.commandRequested.emit(command)
             return
@@ -936,6 +951,8 @@ class PreviewView(QGraphicsView):
         super().__init__()
         self.setScene(QGraphicsScene(self))
         self._item: QGraphicsPixmapItem | None = None
+        self._move_overlay_active = False
+        self._move_overlay_label = ""
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setBackgroundBrush(QColor("#08090a"))
@@ -953,7 +970,7 @@ class PreviewView(QGraphicsView):
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        command = _PREVIEW_KEY_COMMANDS.get(event.key())
+        command = _preview_key_command(event)
         if command:
             self.commandRequested.emit(command)
             return
@@ -966,12 +983,51 @@ class PreviewView(QGraphicsView):
             self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def set_array(self, array: np.ndarray) -> None:
-        pixmap = QPixmap.fromImage(_display_image(array))
+        self.set_image(_display_image(array))
+
+    def set_image(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
         self.scene().clear()
         self._item = self.scene().addPixmap(pixmap)
         self.scene().setSceneRect(self._item.boundingRect())
         self._empty.hide()
         self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_move_overlay(self, active: bool, label: str = "") -> None:
+        self._move_overlay_active = bool(active)
+        self._move_overlay_label = label
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect) -> None:  # type: ignore[no-untyped-def]
+        super().drawForeground(painter, rect)
+        if not self._move_overlay_active or self._item is None:
+            return
+        center = self.mapFromScene(self._item.sceneBoundingRect().center())
+        x = center.x()
+        y = center.y()
+        painter.save()
+        painter.resetTransform()
+        shadow = QPen(QColor(5, 7, 10, 210), 5.0)
+        shadow.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(shadow)
+        painter.drawLine(x - 22, y, x + 22, y)
+        painter.drawLine(x, y - 22, x, y + 22)
+        painter.drawEllipse(QPointF(x, y), 10.0, 10.0)
+        accent = QPen(QColor("#b7adff"), 1.6)
+        accent.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(accent)
+        painter.drawLine(x - 22, y, x - 7, y)
+        painter.drawLine(x + 7, y, x + 22, y)
+        painter.drawLine(x, y - 22, x, y - 7)
+        painter.drawLine(x, y + 7, x, y + 22)
+        painter.drawEllipse(QPointF(x, y), 10.0, 10.0)
+        painter.setPen(QColor("#d9d5ff"))
+        label_font = QFont(self.font())
+        label_font.setPointSizeF(9.0)
+        label_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(label_font)
+        painter.drawText(x + 16, y - 14, self._move_overlay_label)
+        painter.restore()
 
     def current_pixmap(self) -> QPixmap | None:
         if self._item is None:
@@ -2332,6 +2388,8 @@ class MainWindow(QMainWindow):
         self._loading_config = False
         self._loading_plate_controls = False
         self._selected_camera_row = 0
+        self._plate_move_mode = False
+        self._latest_playback_frame: QImage | None = None
         self._plate_reset_cameras: list[dict[str, object]] = []
         self._import_dialog: QFileDialog | None = None
         self._message_box: QMessageBox | None = None
@@ -2773,6 +2831,9 @@ class MainWindow(QMainWindow):
         self.preview_stack.addWidget(self.video_preview)
         self.media_player = QMediaPlayer(self)
         self.media_player.setVideoOutput(self.video_preview)
+        self.video_preview.videoSink().videoFrameChanged.connect(
+            self._capture_playback_frame
+        )
         self.media_player.positionChanged.connect(self._playback_position_changed)
         self.media_player.playbackStateChanged.connect(self._playback_state_changed)
         self.media_player.errorOccurred.connect(self._playback_error)
@@ -2921,6 +2982,12 @@ class MainWindow(QMainWindow):
             ("L", "forward"),
             (Qt.Key.Key_Left, "step-back"),
             (Qt.Key.Key_Right, "step-forward"),
+            (Qt.Key.Key_Up, "move-up"),
+            (Qt.Key.Key_Down, "move-down"),
+            ("Shift+Left", "move-fine-left"),
+            ("Shift+Right", "move-fine-right"),
+            ("Shift+Up", "move-fine-up"),
+            ("Shift+Down", "move-fine-down"),
         ):
             # Keep transport available after clicking inspectors, the task log,
             # or the timeline. The handler below still protects editable fields
@@ -2935,12 +3002,12 @@ class MainWindow(QMainWindow):
                 lambda selected=command: self._handle_preview_shortcut(selected)
             )
             self.preview_shortcuts.append(shortcut)
-        shortcut_hint = QLabel(
-            "Space Play/Pause  ·  J/K/L Transport  ·  ←/→ Frame  ·  P Full Screen"
+        self.shortcut_hint = QLabel(
+            "Space Play/Pause  ·  J/K/L Transport  ·  M Move Plate  ·  P Full Screen"
         )
-        shortcut_hint.setProperty("muted", True)
-        shortcut_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        timing_layout.addWidget(shortcut_hint)
+        self.shortcut_hint.setProperty("muted", True)
+        self.shortcut_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        timing_layout.addWidget(self.shortcut_hint)
 
         action_bar = QFrame()
         action_bar.setObjectName("actionBar")
@@ -3245,6 +3312,17 @@ class MainWindow(QMainWindow):
         self.fullscreen_action.setShortcutContext(
             Qt.ShortcutContext.ApplicationShortcut
         )
+        self.plate_move_action = action(
+            playback_menu,
+            "Move Selected Plate",
+            lambda: self._handle_preview_shortcut("plate-move"),
+        )
+        self.plate_move_action.setCheckable(True)
+        self.plate_move_action.setShortcut(QKeySequence(Qt.Key.Key_M))
+        self.plate_move_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        playback_menu.addSeparator()
         action(playback_menu, "Play / Pause    Space", self.toggle_playback)
         action(playback_menu, "Reverse    J", lambda: self._handle_preview_command("reverse"))
         action(playback_menu, "Stop    K", lambda: self._handle_preview_command("stop"))
@@ -6125,11 +6203,108 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= self.source_table.camera_count():
             self._set_plate_controls_enabled(False)
             self.plate_inspector_title.setText("SELECT A TIMELINE PLATE")
+            if self._plate_move_mode:
+                self._set_plate_move_mode(False)
             return
         self._selected_camera_row = row
         self._load_plate_controls(row)
+        if self._plate_move_mode:
+            self.preview.set_move_overlay(True, self._plate_move_label(row))
         if hasattr(self, "_plate_settings_index"):
             self.settings_tabs.setCurrentIndex(self._plate_settings_index)
+
+    def _plate_move_label(self, row: int | None = None) -> str:
+        selected = self._selected_camera_row if row is None else row
+        number = (
+            self._plate_numbers[selected]
+            if self._plate_numbers and 0 <= selected < len(self._plate_numbers)
+            else selected + 1
+        )
+        return f"MOVE  P{number:02d}"
+
+    def _set_plate_move_mode(self, enabled: bool) -> None:
+        if enabled:
+            row = self.source_table.currentRow()
+            if row < 0:
+                row = self._selected_camera_row
+            paths = self.source_table.paths()
+            if not 0 <= row < len(paths) or not paths[row]:
+                self.statusBar().showMessage(
+                    "Select an assigned plate in the active timeline first",
+                    5000,
+                )
+                return
+            self._selected_camera_row = row
+            self._load_plate_controls(row)
+            self.stop_playback()
+            if (
+                self._latest_playback_frame is not None
+                and not self._latest_playback_frame.isNull()
+            ):
+                self.preview.set_image(self._latest_playback_frame)
+            self.preview_stack.setCurrentWidget(self.preview)
+            self._plate_move_mode = True
+            self.preview.set_move_overlay(True, self._plate_move_label(row))
+            if hasattr(self, "plate_move_action"):
+                self.plate_move_action.blockSignals(True)
+                self.plate_move_action.setChecked(True)
+                self.plate_move_action.blockSignals(False)
+            self.shortcut_hint.setText(
+                "MOVE MODE  ·  Arrow keys move plate  ·  Shift+Arrow fine  ·  M Exit"
+            )
+            self.statusBar().showMessage(
+                f"{self._plate_move_label(row)} · arrows 0.05° · Shift 0.005°",
+                6000,
+            )
+            self.preview.setFocus()
+            return
+        self._plate_move_mode = False
+        self.preview.set_move_overlay(False)
+        if hasattr(self, "plate_move_action"):
+            self.plate_move_action.blockSignals(True)
+            self.plate_move_action.setChecked(False)
+            self.plate_move_action.blockSignals(False)
+        self.shortcut_hint.setText(
+            "Space Play/Pause  ·  J/K/L Transport  ·  M Move Plate  ·  P Full Screen"
+        )
+        self.statusBar().showMessage("Plate move mode off", 3000)
+
+    def _toggle_plate_move_mode(self) -> None:
+        self._set_plate_move_mode(not self._plate_move_mode)
+
+    def _capture_playback_frame(self, frame) -> None:  # type: ignore[no-untyped-def]
+        image = frame.toImage()
+        if not image.isNull():
+            self._latest_playback_frame = image.copy()
+
+    def _nudge_selected_plate(
+        self,
+        horizontal: int,
+        vertical: int,
+        *,
+        fine: bool = False,
+    ) -> None:
+        if not self._plate_move_mode:
+            return
+        step = 0.005 if fine else 0.05
+        self._loading_plate_controls = True
+        try:
+            if horizontal:
+                self.plate_position_x.setValue(
+                    self.plate_position_x.value() + horizontal * step
+                )
+            if vertical:
+                self.plate_position_y.setValue(
+                    self.plate_position_y.value() + vertical * step
+                )
+        finally:
+            self._loading_plate_controls = False
+        self._plate_control_changed()
+        self.statusBar().showMessage(
+            f"{self._plate_move_label()}  ·  X {self.plate_position_x.value():.3f}°"
+            f"  Y {self.plate_position_y.value():.3f}°",
+            2500,
+        )
 
     def _load_plate_controls(self, row: int) -> None:
         cameras = self.config_data.get("cameras")
@@ -7597,6 +7772,8 @@ class MainWindow(QMainWindow):
     def _handle_preview_command(self, command: str) -> None:
         if command == "fullscreen":
             self.toggle_preview_fullscreen()
+        elif command == "plate-move":
+            self._toggle_plate_move_mode()
         elif command == "play-pause":
             self.toggle_playback()
         elif command == "reverse":
@@ -7606,11 +7783,56 @@ class MainWindow(QMainWindow):
         elif command == "forward":
             self.play_forward()
         elif command == "step-back":
-            self.step_playback(-1)
+            if self._plate_move_mode:
+                self._nudge_selected_plate(-1, 0)
+            else:
+                self.step_playback(-1)
         elif command == "step-forward":
-            self.step_playback(1)
+            if self._plate_move_mode:
+                self._nudge_selected_plate(1, 0)
+            else:
+                self.step_playback(1)
+        elif command == "move-up":
+            self._nudge_selected_plate(0, 1)
+        elif command == "move-down":
+            self._nudge_selected_plate(0, -1)
+        elif command == "move-fine-left":
+            if self._plate_move_mode:
+                self._nudge_selected_plate(-1, 0, fine=True)
+            else:
+                self.step_playback(-1)
+        elif command == "move-fine-right":
+            if self._plate_move_mode:
+                self._nudge_selected_plate(1, 0, fine=True)
+            else:
+                self.step_playback(1)
+        elif command == "move-fine-up":
+            self._nudge_selected_plate(0, 1, fine=True)
+        elif command == "move-fine-down":
+            self._nudge_selected_plate(0, -1, fine=True)
 
     def _handle_preview_shortcut(self, command: str) -> None:
+        plate_commands = {
+            "plate-move",
+            "step-back",
+            "step-forward",
+            "move-up",
+            "move-down",
+            "move-fine-left",
+            "move-fine-right",
+            "move-fine-up",
+            "move-fine-down",
+        }
+        if command in plate_commands and (
+            command == "plate-move" or self._plate_move_mode
+        ):
+            focus = QApplication.focusWidget()
+            if not isinstance(
+                focus,
+                (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit),
+            ):
+                self._handle_preview_command(command)
+            return
         if command == "fullscreen" or not self._playback_focus_uses_space():
             self._handle_preview_command(command)
 
@@ -8160,6 +8382,7 @@ class MainWindow(QMainWindow):
                 self.media_player.setSource(QUrl())
             self._playback_path = None
             self._playback_key = None
+            self._latest_playback_frame = None
         if can_block:
             self.media_player.blockSignals(False)
         if preserved_frame is not None:
@@ -9494,13 +9717,17 @@ class MainWindow(QMainWindow):
         *,
         autoplay: bool,
     ) -> None:
+        requested_frame = self.timeline_playhead.value()
         self._playback_autostart = False
         self._playback_path = path
         self._playback_key = playback_key
         self.media_player.setSource(QUrl.fromLocalFile(str(path)))
-        self._seek_loaded_playback(
-            self.timeline_playhead.value(), show_video=autoplay
-        )
+        # QMediaPlayer emits positionChanged(0) while replacing its source.
+        # Keep the user's paused timeline frame authoritative, then seek the
+        # freshly loaded cache back to that exact frame.
+        if self._tc_alignment:
+            self._set_playhead(requested_frame)
+        self._seek_loaded_playback(requested_frame, show_video=autoplay)
         if not autoplay:
             self.preview_stack.setCurrentWidget(self.preview)
         self.preview_note.setText("Playback cached · Space to play / pause")

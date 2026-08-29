@@ -11,7 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, QProcess, Qt
-from PySide6.QtGui import QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -1982,6 +1982,71 @@ def test_preview_transport_shortcuts_route_from_preview(
     app.processEvents()
 
 
+def test_plate_move_mode_toggles_and_nudges_selected_plate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
+    paths = [str(tmp_path / f"P{number:02d}.mov") for number in range(1, 6)]
+    for path in paths:
+        Path(path).touch()
+    window.source_table.set_paths(paths)
+    window.source_table.selectRow(1)
+    window._source_selection_changed()
+    preview_updates: list[str] = []
+    monkeypatch.setattr(window, "stop_playback", lambda: None)
+    monkeypatch.setattr(
+        window,
+        "_schedule_live_preview",
+        lambda message, **_kwargs: preview_updates.append(message),
+    )
+    playback_frame = QImage(96, 54, QImage.Format.Format_RGB888)
+    playback_frame.fill(QColor("#20252c"))
+    window._capture_playback_frame(SimpleNamespace(toImage=lambda: playback_frame))
+    window.show()
+    app.processEvents()
+
+    original_x = window.plate_position_x.value()
+    original_y = window.plate_position_y.value()
+    window.source_table.setFocus()
+    QTest.keyClick(window, Qt.Key.Key_M)
+    app.processEvents()
+
+    assert window._plate_move_mode is True
+    assert window.preview._move_overlay_active is True
+    assert window.preview._move_overlay_label == "MOVE  P02"
+    assert window.preview.current_pixmap() is not None
+    assert window.preview.current_pixmap().size() == playback_frame.size()
+    assert "Shift+Arrow fine" in window.shortcut_hint.text()
+
+    QTest.keyClick(window.preview.viewport(), Qt.Key.Key_Right)
+    QTest.keyClick(
+        window.preview.viewport(),
+        Qt.Key.Key_Up,
+        Qt.KeyboardModifier.ShiftModifier,
+    )
+    app.processEvents()
+
+    assert window.plate_position_x.value() == pytest.approx(original_x + 0.05)
+    assert window.plate_position_y.value() == pytest.approx(original_y + 0.005)
+    assert window.config_data["cameras"][1]["yaw_deg"] == pytest.approx(
+        original_x + 0.05
+    )
+    assert window.config_data["cameras"][1]["pitch_deg"] == pytest.approx(
+        original_y + 0.005
+    )
+    assert preview_updates == ["Plate fine-tune applied", "Plate fine-tune applied"]
+
+    QTest.keyClick(window.preview.viewport(), Qt.Key.Key_M)
+    app.processEvents()
+    assert window._plate_move_mode is False
+    assert window.preview._move_overlay_active is False
+    window.close()
+    app.processEvents()
+
+
 def test_fullscreen_shortcut_is_window_wide_and_transport_respects_focus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2241,6 +2306,50 @@ def test_stopping_playback_for_fine_tune_preserves_selected_frame() -> None:
     window._stop_playback(clear=True)
 
     assert window.timeline_playhead.value() == 42
+    window.close()
+    app.processEvents()
+
+
+def test_reloading_stale_playback_cache_preserves_move_mode_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._tc_alignment = {"fps": 24.0}
+    window._timeline_maximum = 100
+    window.timeline_in.setRange(0, 99)
+    window.timeline_out.setRange(1, 100)
+    window.timeline_playhead.setRange(0, 99)
+    window.timeline_bar.set_frame_range(100, 0, 100, 42)
+    window._set_playhead(42)
+    proxy = tmp_path / "updated-move-mode-proxy.mp4"
+    proxy.touch()
+
+    class ResettingSourcePlayer:
+        position_value = 0
+
+        def setSource(self, _source) -> None:  # type: ignore[no-untyped-def]
+            window._set_playhead(0)
+
+        def setPosition(self, value: int) -> None:
+            self.position_value = value
+
+        def play(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    player = ResettingSourcePlayer()
+    window.media_player = player  # type: ignore[assignment]
+    monkeypatch.setattr(window, "_playback_signature", lambda: ("updated", []))
+    monkeypatch.setattr(window, "_save_active_timeline", lambda: True)
+
+    window._load_playback(proxy, "updated", autoplay=False)
+
+    assert window.timeline_playhead.value() == 42
+    assert player.position_value == 1750
     window.close()
     app.processEvents()
 
