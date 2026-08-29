@@ -70,6 +70,43 @@ def test_count_frames_uses_validated_nb_frames_without_decode(
     assert probe.frame_count == 240
 
 
+def test_probe_processes_never_inherit_gui_cli_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(ffmpegio, "ffmpeg_executable", lambda: "ffmpeg")
+    monkeypatch.setattr(ffmpegio, "ffprobe_executable", lambda: "ffprobe")
+    seen: list[str] = []
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        seen.append(command[0])
+        if command[0] == "ffmpeg":
+            return subprocess.CompletedProcess(command, 1, b"", FFMPEG_PROBE_TEXT)
+        return subprocess.CompletedProcess(command, 0, _ffprobe_payload(), b"")
+
+    monkeypatch.setattr(ffmpegio.subprocess, "run", fake_run)
+
+    ffmpegio.probe_video(tmp_path / "take.mov")
+
+    assert seen == ["ffmpeg", "ffprobe"]
+
+
+def test_probe_timeout_reports_macos_source_folder_permission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(ffmpegio, "ffmpeg_executable", lambda: "ffmpeg")
+
+    def timeout(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired("ffmpeg", ffmpegio.PROBE_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(ffmpegio.subprocess, "run", timeout)
+
+    with pytest.raises(PermissionError, match="Privacy & Security"):
+        ffmpegio.probe_video(tmp_path / "take.mov")
+
+
 def test_count_frames_uses_integral_duration_when_nb_frames_is_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

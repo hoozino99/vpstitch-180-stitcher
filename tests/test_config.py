@@ -130,6 +130,7 @@ def test_accepts_hdr_display_view_and_camera_match_gains(tmp_path: Path) -> None
         "view": "ACES 2.0 - HDR 1000 nits (Rec.2020)",
         "match_enabled": True,
         "match_reference": source["cameras"][0]["name"],
+        "match_space": "ACEScg",
         "match_strength": 0.8,
     }
     path = tmp_path / "hdr-match.json"
@@ -140,6 +141,7 @@ def test_accepts_hdr_display_view_and_camera_match_gains(tmp_path: Path) -> None
     assert config.color.output_mode == "display_view"
     assert config.color.display == "Rec.2100-PQ - Display"
     assert config.color.match_enabled is True
+    assert config.color.match_space == "ACEScg"
     assert config.cameras[0].color_gain == (1.02, 0.99, 1.01)
     assert config.cameras[0].color_match_confidence == 0.94
 

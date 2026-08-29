@@ -67,6 +67,67 @@ def load_ocio_config(identifier: str):
     return ocio.Config.CreateFromFile(identifier)
 
 
+def color_match_space(config: object, working_space: str) -> str:
+    """Return the OCIO scene-linear space used for camera matching."""
+    scene_linear = config.getColorSpace("scene_linear")
+    if scene_linear is None:
+        return working_space
+    return str(scene_linear.getName())
+
+
+def build_input_transform(
+    config: object,
+    camera_space: str,
+    working_space: str,
+    gain: tuple[float, float, float],
+    strength: float,
+    match_space: str | None = None,
+):
+    """Build camera -> scene-linear match -> working-space as one OCIO graph."""
+    import PyOpenColorIO as ocio
+
+    # Configs created before scene-linear matching stored gains in the project
+    # working space. Keeping that default preserves existing projects and
+    # already-enqueued render snapshots exactly; new matches persist ACEScg (or
+    # the config's scene_linear role) explicitly.
+    match_space = match_space or working_space
+    effective = np.exp(
+        np.log(np.clip(np.asarray(gain, dtype=np.float64), 1.0e-6, None))
+        * float(strength)
+    )
+    matrix = ocio.MatrixTransform()
+    matrix.setMatrix(
+        [
+            float(effective[0]),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            float(effective[1]),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            float(effective[2]),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+    )
+    transform = ocio.GroupTransform()
+    transform.appendTransform(
+        ocio.ColorSpaceTransform(src=camera_space, dst=match_space)
+    )
+    transform.appendTransform(matrix)
+    if match_space != working_space:
+        transform.appendTransform(
+            ocio.ColorSpaceTransform(src=match_space, dst=working_space)
+        )
+    return transform
+
+
 class ColorPipeline:
     """Applies optional OCIO transforms without introducing 8-bit buffers."""
 
@@ -83,6 +144,9 @@ class ColorPipeline:
         if len(self._camera_gains) != len(camera_spaces):
             raise ValueError("camera gain count must match camera color-space count")
         self._input_processors: list[object | None] = [None] * len(camera_spaces)
+        self._matched_input_processors: list[object | None] = [None] * len(
+            camera_spaces
+        )
         self._output_processor: object | None = None
         if settings.mode == "ocio":
             import PyOpenColorIO as ocio
@@ -95,6 +159,22 @@ class ColorPipeline:
                     ).getDefaultCPUProcessor()
                     for space in camera_spaces
                 ]
+                if settings.match_enabled:
+                    self._matched_input_processors = [
+                        config.getProcessor(
+                            build_input_transform(
+                                config,
+                                str(space),
+                                str(settings.working_space),
+                                gain,
+                                float(settings.match_strength),
+                                settings.match_space,
+                            )
+                        ).getDefaultCPUProcessor()
+                        for space, gain in zip(
+                            camera_spaces, self._camera_gains, strict=True
+                        )
+                    ]
                 if settings.output_mode == "display_view":
                     transform = ocio.DisplayViewTransform(
                         src=str(settings.working_space),
@@ -134,7 +214,10 @@ class ColorPipeline:
             return image
         import PyOpenColorIO as ocio
 
-        contiguous = np.ascontiguousarray(image, dtype=np.float32)
+        # OCIO applies in place. Keep the decoder/reference buffer immutable so
+        # a second preview or comparison never color-transforms an already
+        # transformed source frame.
+        contiguous = np.array(image, dtype=np.float32, copy=True, order="C")
         height, width, channels = contiguous.shape
         apply_rgb = getattr(processor, "applyRGB", None)
         workers = min(
@@ -175,17 +258,14 @@ class ColorPipeline:
         apply_match: bool = True,
         worker_count: int | None = None,
     ) -> np.ndarray:
-        working = self._apply(
-            self._input_processors[camera_index],
+        processor = self._input_processors[camera_index]
+        if apply_match and self.settings.match_enabled:
+            processor = self._matched_input_processors[camera_index]
+        return self._apply(
+            processor,
             self.to_float(image),
             worker_count=worker_count,
         )
-        if not apply_match or not self.settings.match_enabled:
-            return working
-        gain = np.asarray(self._camera_gains[camera_index], dtype=np.float32)
-        strength = float(self.settings.match_strength)
-        effective = np.exp(np.log(np.clip(gain, 1e-6, None)) * strength)
-        return np.asarray(working, dtype=np.float32) * effective.reshape(1, 1, 3)
 
     def working_to_output(self, image: np.ndarray) -> np.ndarray:
         return self._apply(self._output_processor, image)

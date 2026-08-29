@@ -10,7 +10,7 @@ import weakref
 
 import numpy as np
 
-from .color import load_ocio_config
+from .color import build_input_transform, load_ocio_config
 from .config import Color
 
 
@@ -261,8 +261,22 @@ def _output_gpu_processor(settings: Color):
     ).getDefaultGPUProcessor()
 
 
-def _input_gpu_processor(settings: Color, camera_space: str):
+def _input_gpu_processor(
+    settings: Color,
+    camera_space: str,
+    gain: tuple[float, float, float],
+):
     config = load_ocio_config(str(settings.ocio_config))
+    if settings.match_enabled:
+        transform = build_input_transform(
+            config,
+            camera_space,
+            str(settings.working_space),
+            gain,
+            float(settings.match_strength),
+            settings.match_space,
+        )
+        return config.getProcessor(transform).getDefaultGPUProcessor()
     return config.getProcessor(
         camera_space, str(settings.working_space)
     ).getDefaultGPUProcessor()
@@ -294,6 +308,7 @@ def _pack_texture(texture) -> MetalTexture:  # type: ignore[no-untyped-def]
 def build_metal_input_program(
     settings: Color,
     camera_space: str | None,
+    gain: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> MetalInputProgram:
     if settings.mode != "ocio":
         raise MetalBackendError("Metal input rendering requires OCIO mode")
@@ -301,7 +316,7 @@ def build_metal_input_program(
         raise MetalBackendError("Metal camera input color space is missing")
     import PyOpenColorIO as ocio
 
-    processor = _input_gpu_processor(settings, camera_space)
+    processor = _input_gpu_processor(settings, camera_space, gain)
     descriptor = ocio.GpuShaderDesc.CreateShaderDesc()
     descriptor.setLanguage(ocio.GpuLanguage.GPU_LANGUAGE_MSL_2_0)
     descriptor.setFunctionName("ocio_input_transform")
@@ -367,7 +382,6 @@ kernel void {METAL_INPUT_KERNEL_NAME}(
     ) * (1.0f / 65535.0f);
     vp_input_ocio_ocio_input_transform ocio{constructor_suffix};
     float3 working = ocio.ocio_input_transform(float4(encoded, 1.0f)).rgb;
-    working *= float3(params.gainR, params.gainG, params.gainB);
     output[offset] = working.x;
     output[offset + 1u] = working.y;
     output[offset + 2u] = working.z;
@@ -661,12 +675,11 @@ class MetalStitchBackend:
                 int(texture.linear),
             ):
                 raise MetalBackendError(self.last_error())
-        strength = float(settings.match_strength) if settings.match_enabled else 0.0
         self._camera_gains: list[tuple[float, float, float]] = []
         for camera, (space, gain) in enumerate(
             zip(camera_spaces, camera_gains, strict=True)
         ):
-            input_program = build_metal_input_program(settings, space)
+            input_program = build_metal_input_program(settings, space, gain)
             if not self._library.vpstitch_metal_set_input_pipeline(
                 self._context,
                 camera,
@@ -688,11 +701,7 @@ class MetalStitchBackend:
                     int(texture.linear),
                 ):
                     raise MetalBackendError(self.last_error())
-            values = np.asarray(gain, dtype=np.float32)
-            effective = np.exp(np.log(np.clip(values, 1e-6, None)) * strength)
-            self._camera_gains.append(
-                (float(effective[0]), float(effective[1]), float(effective[2]))
-            )
+            self._camera_gains.append((1.0, 1.0, 1.0))
         self._source_dimensions: list[tuple[int, int]] = []
 
     def last_error(self) -> str:

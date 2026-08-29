@@ -30,8 +30,7 @@ from .calibration import CalibrationError, calibrate_checkerboard
 from .rigcalibration import calibrate_rig_rotation, write_calibrated_config
 from .resources import estimate_resources
 from .renderflow import FrameBundleReader, should_prefetch_decode
-from .color import load_ocio_config
-from .color import ColorPipeline
+from .color import ColorPipeline, color_match_space, load_ocio_config
 from .colormatch import ACESCG_LUMA_WEIGHTS, solve_color_match
 from .geometry import Tile, camera_map, remap_camera
 from .timecode import align_by_timecode
@@ -674,8 +673,16 @@ def _match_color(args: argparse.Namespace) -> None:
             "reference camera must be one of: " + ", ".join(names)
         )
     reference_index = names.index(args.reference_camera)
+    ocio_config = load_ocio_config(str(config.color.ocio_config))
+    match_space = color_match_space(ocio_config, str(config.color.working_space))
     pipeline = ColorPipeline(
-        replace(config.color, match_enabled=False),
+        replace(
+            config.color,
+            working_space=match_space,
+            output_mode="colorspace",
+            output_space=match_space,
+            match_enabled=False,
+        ),
         [camera.colorspace for camera in config.cameras],
         [camera.color_gain for camera in config.cameras],
     )
@@ -703,14 +710,17 @@ def _match_color(args: argparse.Namespace) -> None:
         gain_limits=(args.minimum_gain, args.maximum_gain),
         luma_weights=(
             ACESCG_LUMA_WEIGHTS
-            if config.color.working_space.casefold() == "acescg"
+            if match_space.casefold() == "acescg"
             else (0.2126, 0.7152, 0.0722)
         ),
         min_overlap_pixels=args.minimum_overlap,
+        preserve_luminance=config.color.preserve_luminance,
     )
     payload = {
         "reference_camera": args.reference_camera,
         "working_space": config.color.working_space,
+        "match_space": match_space,
+        "preserve_luminance": config.color.preserve_luminance,
         "cameras": [
             {
                 "name": camera.name,

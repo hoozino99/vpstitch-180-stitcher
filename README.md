@@ -272,6 +272,12 @@ Apple Silicon과 Intel Mac용 `.dmg` 및 `.zip`이 생성됩니다. 압축을 �
 Control-click하여 **열기**를 선택하거나, 시스템 설정의 **개인정보 보호 및
 보안**에서 실행을 허용하십시오.
 
+Downloads, Documents, 외장 디스크 또는 네트워크 볼륨의 원본 플레이트를 처음 열 때는
+macOS 파일 접근 요청에서 **허용**을 선택하십시오. 이전에 거부했다면 **시스템 설정 →
+개인정보 보호 및 보안 → 파일 및 폴더 → VP Stitch**에서 해당 위치를 켜야 합니다.
+권한 때문에 FFmpeg가 소스를 열지 못하면 앱은 무한 대기하지 않고 15초 안에 이 설정을
+안내하는 오류를 표시합니다.
+
 앱은 최근 프로젝트 목록 같은 전역 설정을 다음 사용자 폴더에 저장합니다.
 
 ```text
@@ -486,6 +492,7 @@ OCIO 출력이 ACEScg 같은 scene-linear 공간이라면 `exr-half-sequence`를
     "view": "ACES 2.0 - HDR 1000 nits (Rec.2020)",
     "match_enabled": true,
     "match_reference": "cam0",
+    "match_space": "ACEScg",
     "match_strength": 1.0,
     "integer_dither": true
   }
@@ -506,9 +513,11 @@ macOS/Windows 패키지 내부의 실제 `.ocio` 파일로 해석합니다. 따�
 `Camera Rec.709 → ACEScg → Gamma 2.4 Encoded Rec.709` 작업 설정을 채웁니다.
 프로젝트의 실제 입력 인코딩과 납품 색공간에 맞게 이름을 변경할 수 있습니다.
 
-`CAMERA MATCH`는 입력을 ACEScg 같은 scene-linear 작업공간으로 변환한 뒤 카메라 중첩부의
-색도 차이만 robust하게 계산합니다. 기준 카메라는 gain 1.0으로 고정하고 나머지 카메라의
-RGB gain은 밝기가 변하지 않도록 정규화합니다. 따라서 같은 매치값을 Rec.2100 PQ 1000 nit,
+`CAMERA MATCH`는 입력을 OCIO의 `scene_linear` 역할(기본 ACEScg)로 변환한 뒤 카메라
+중첩부의 색도 차이만 robust하게 계산합니다. 넓은 실제 seam은 픽셀 수와 신뢰도만큼 더
+강하게 반영하고, 가장자리의 좁은 우연 겹침은 전체 매치값을 끌어당기지 않습니다. 기준
+카메라는 gain 1.0으로 고정하고 나머지 카메라의 RGB gain은 밝기가 변하지 않도록
+정규화합니다. 따라서 같은 매치값을 Rec.2100 PQ 1000 nit,
 P3-D65 PQ 1000 nit, Rec.709 또는 V-Log 납품에 재사용할 수 있습니다. 단, 입력 컬러스페이스나
 Working Space를 바꾸면 기존 매치값은 자동으로 해제되며 새 Quick Preview에서 다시 MATCH해야
 합니다. 카메라별 노출 차이까지 자동 보정하지는 않습니다.

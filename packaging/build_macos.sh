@@ -60,6 +60,27 @@ COMMON_ARGS="\
 
 cp "dist/vpstitch-cli/vpstitch-cli" "dist/VP Stitch.app/Contents/MacOS/vpstitch-cli"
 chmod +x "dist/VP Stitch.app/Contents/MacOS/vpstitch-cli"
+
+PLIST="dist/VP Stitch.app/Contents/Info.plist"
+set_plist_string() {
+  key=$1
+  value=$2
+  if /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :$key $value" "$PLIST"
+  else
+    /usr/libexec/PlistBuddy -c "Add :$key string $value" "$PLIST"
+  fi
+}
+set_plist_string NSDownloadsFolderUsageDescription \
+  "VP Stitch needs source plate access for previews, stitching, and final renders."
+set_plist_string NSDocumentsFolderUsageDescription \
+  "VP Stitch needs project, cache, source plate, and render access."
+set_plist_string NSDesktopFolderUsageDescription \
+  "VP Stitch needs access when a project, source plate, or render is stored on the Desktop."
+set_plist_string NSRemovableVolumesUsageDescription \
+  "VP Stitch needs source plate and render access on external production drives."
+set_plist_string NSNetworkVolumesUsageDescription \
+  "VP Stitch needs source plate and render access on network production storage."
 codesign --deep --force --sign - "dist/VP Stitch.app"
 
 ditto -c -k --sequesterRsrc --keepParent \

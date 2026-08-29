@@ -17,6 +17,9 @@ import numpy as np
 from .config import Camera, Color, Video
 
 
+PROBE_TIMEOUT_SECONDS = 15
+
+
 class _BoundedPipeReader:
     """Drain a subprocess pipe continuously while retaining only recent text."""
 
@@ -321,11 +324,13 @@ def _enhance_probe_with_ffprobe(
                 "json",
                 str(path),
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return base, None
     if process.returncode:
         return base, None
@@ -416,6 +421,7 @@ def _count_video_frames(path: str | Path) -> int:
             "pipe:1",
             "-nostats",
         ],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -429,12 +435,20 @@ def _count_video_frames(path: str | Path) -> int:
 
 
 def probe_video(path: str | Path, *, count_frames: bool = False) -> VideoProbe:
-    process = subprocess.run(
-        [ffmpeg_executable(), "-hide_banner", "-i", str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        process = subprocess.run(
+            [ffmpeg_executable(), "-hide_banner", "-i", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PermissionError(
+            f"timed out opening {path}; on macOS, allow VP Stitch access to "
+            "the source folder in Privacy & Security > Files and Folders"
+        ) from error
     base = parse_probe_output(path, process.stderr.decode("utf-8", errors="replace"))
     result, metadata_frame_count = _enhance_probe_with_ffprobe(path, base)
     if count_frames and metadata_frame_count is not None:

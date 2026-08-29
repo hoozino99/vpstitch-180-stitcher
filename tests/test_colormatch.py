@@ -67,6 +67,26 @@ def test_gains_preserve_luminance_and_respect_strength_and_limits() -> None:
     )
 
 
+def test_optional_exposure_match_is_only_enabled_when_luminance_is_not_preserved() -> None:
+    base = _scene()
+    drifted = base / 1.08
+    mask = np.ones(base.shape[:2])
+
+    chroma_only = solve_color_match(
+        [base, drifted], [mask, mask], 0, min_overlap_pixels=128
+    )
+    exposure_and_chroma = solve_color_match(
+        [base, drifted],
+        [mask, mask],
+        0,
+        preserve_luminance=False,
+        min_overlap_pixels=128,
+    )
+
+    np.testing.assert_allclose(chroma_only.gains[1], 1.0, atol=1.0e-12)
+    np.testing.assert_allclose(exposure_and_chroma.gains[1], 1.08, rtol=1.0e-5)
+
+
 @pytest.mark.parametrize("camera_count", [3, 5])
 def test_propagates_match_through_adjacent_camera_chain(camera_count: int) -> None:
     height = 40
@@ -120,6 +140,37 @@ def test_insufficient_overlap_leaves_disconnected_camera_at_identity() -> None:
     assert result.diagnostics.connected == (True, True, False)
     np.testing.assert_allclose(result.gains[2], 1.0, atol=0.0)
     assert result.confidence[2] == 0.0
+
+
+def test_narrow_conflicting_shortcut_cannot_pull_two_full_seams_off_match() -> None:
+    height, width = 40, 140
+    base = _scene(height, width)
+    corrections = [
+        _normalized_gain((1.0, 1.0, 1.0)),
+        _normalized_gain((0.98, 1.01, 0.99)),
+        _normalized_gain((0.96, 1.02, 1.01)),
+    ]
+    images = [base / correction for correction in corrections]
+    masks = [np.zeros((height, width), dtype=np.float64) for _ in range(3)]
+    masks[0][:, :70] = 1.0
+    masks[1][:, 40:110] = 1.0
+    masks[2][:, 80:] = 1.0
+
+    # A tiny non-adjacent sliver sees unrelated content. It is valid enough to
+    # form an edge, but carries far less evidence than either real seam.
+    masks[0][:, 80:82] = 1.0
+    images[0] = images[0].copy()
+    images[0][:, 80:82] *= np.array([1.12, 0.92, 1.08])
+
+    result = solve_color_match(
+        images, masks, 0, min_overlap_pixels=64, gain_limits=(0.8, 1.2)
+    )
+
+    assert any(
+        edge.camera_a == 0 and edge.camera_b == 2
+        for edge in result.diagnostics.overlaps
+    )
+    np.testing.assert_allclose(result.gains, corrections, rtol=0.012, atol=0.004)
 
 
 def test_identical_cameras_return_identity_deterministically() -> None:

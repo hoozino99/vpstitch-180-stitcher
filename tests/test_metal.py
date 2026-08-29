@@ -22,15 +22,18 @@ from vpstitch.metal import (
 )
 
 
-def _p3_pq_color(*, color_match: bool = False) -> Color:
+def _p3_pq_color(
+    *, color_match: bool = False, working_space: str = "ACEScg"
+) -> Color:
     return Color(
         mode="ocio",
         ocio_config=BUNDLED_ACES_STUDIO_ID,
-        working_space="ACEScg",
+        working_space=working_space,
         output_mode="display_view",
         display="ST2084-P3-D65 - Display",
         view="ACES 2.0 - HDR 1000 nits (P3 D65)",
         match_enabled=color_match,
+        match_space="ACEScg" if color_match else None,
         match_strength=0.7,
         integer_dither=False,
     )
@@ -46,7 +49,8 @@ def test_metal_input_program_supports_textureless_camera_transform() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Metal requires macOS")
-def test_metal_input_color_match_matches_cpu_pipeline() -> None:
+@pytest.mark.parametrize("working_space", ["ACEScg", "ACEScct"])
+def test_metal_input_color_match_matches_cpu_pipeline(working_space: str) -> None:
     pytest.importorskip("PyOpenColorIO")
     library = (
         Path(__file__).resolve().parents[1]
@@ -57,7 +61,7 @@ def test_metal_input_color_match_matches_cpu_pipeline() -> None:
     if not library.is_file():
         pytest.skip("Metal test library is not built")
 
-    settings = _p3_pq_color(color_match=True)
+    settings = _p3_pq_color(color_match=True, working_space=working_space)
     gain = (1.02, 0.98, 1.01)
     source = np.random.default_rng(7).integers(
         0, 65536, (32, 48, 3), dtype=np.uint16

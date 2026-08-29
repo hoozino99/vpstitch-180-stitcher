@@ -36,7 +36,7 @@ def test_display_view_pipeline_builds_and_processes_hdr_pixels() -> None:
     assert not np.allclose(output, original)
 
 
-def test_camera_match_gain_is_applied_in_working_space_with_strength() -> None:
+def test_camera_match_gain_is_applied_in_scene_linear_space_with_strength() -> None:
     source = np.array([[[0.1, 0.2, 0.3]]], dtype=np.float32)
     base_settings = Color(
         mode="ocio",
@@ -61,6 +61,36 @@ def test_camera_match_gain_is_applied_in_working_space_with_strength() -> None:
 
     expected_gain = np.sqrt(np.array([1.08, 0.96, 1.02], dtype=np.float32))
     np.testing.assert_allclose(matched, base * expected_gain, rtol=1e-5, atol=1e-7)
+    np.testing.assert_array_equal(source, np.array([[[0.1, 0.2, 0.3]]], np.float32))
+
+
+def test_camera_match_stays_scene_linear_when_working_space_is_log() -> None:
+    source = np.array([[[0.1, 0.2, 0.3]]], dtype=np.float32)
+    gain = np.array([1.08, 0.96, 1.02], dtype=np.float32)
+    settings = Color(
+        mode="ocio",
+        ocio_config=BUNDLED_ACES_STUDIO_ID,
+        working_space="ACEScct",
+        output_space="Gamma 2.4 Encoded Rec.709",
+        match_enabled=True,
+        match_space="ACEScg",
+        match_strength=0.5,
+    )
+    actual = ColorPipeline(settings, ["Camera Rec.709"], [tuple(gain)]).input_to_working(
+        0, source
+    )
+
+    config = load_ocio_config(BUNDLED_ACES_STUDIO_ID)
+    linear = source.copy()
+    config.getProcessor("Camera Rec.709", "ACEScg").getDefaultCPUProcessor().applyRGB(
+        linear
+    )
+    linear *= np.sqrt(gain).reshape(1, 1, 3)
+    config.getProcessor("ACEScg", "ACEScct").getDefaultCPUProcessor().applyRGB(
+        linear
+    )
+
+    np.testing.assert_allclose(actual, linear, rtol=2e-5, atol=2e-7)
 
 
 def test_parallel_ocio_output_is_bit_identical_to_single_thread(monkeypatch) -> None:

@@ -103,6 +103,7 @@ class Color:
     view: str | None = None
     match_enabled: bool = False
     match_reference: str | None = None
+    match_space: str | None = None
     match_strength: float = 1.0
     preserve_luminance: bool = True
     integer_dither: bool = True

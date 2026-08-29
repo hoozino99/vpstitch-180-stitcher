@@ -4159,6 +4159,7 @@ class MainWindow(QMainWindow):
             color = {"mode": "passthrough"}
             config["color"] = color
         color["match_enabled"] = False
+        color.pop("match_space", None)
         cameras = config.get("cameras")
         if not isinstance(cameras, list):
             return
@@ -7129,6 +7130,8 @@ class MainWindow(QMainWindow):
                 "max_displacement_px": self.flow_max.value(),
             }
         )
+        previous_color = raw.get("color")
+        previous_color = previous_color if isinstance(previous_color, dict) else {}
         mode = str(self.color_mode.currentData())
         if mode == "passthrough":
             raw["color"] = {
@@ -7167,6 +7170,9 @@ class MainWindow(QMainWindow):
                 "integer_dither": self.integer_dither.isChecked(),
                 "dither_seed": int(raw.get("color", {}).get("dither_seed", 7349)),
             }
+            match_space = str(previous_color.get("match_space", "")).strip()
+            if self.color_match_enabled.isChecked() and match_space:
+                raw["color"]["match_space"] = match_space
             if output_mode == "display_view":
                 raw["color"].update(
                     {
@@ -8925,6 +8931,13 @@ class MainWindow(QMainWindow):
                 cameras = self.config_data.get("cameras")
                 if not isinstance(cameras, list) or len(solved) != len(cameras):
                     raise ValueError("Color-match report does not match this rig")
+                color = self.config_data.setdefault("color", {})
+                if not isinstance(color, dict):
+                    raise ValueError("Color settings are invalid")
+                match_space = str(payload.get("match_space", "")).strip()
+                if not match_space:
+                    raise ValueError("Color-match report is missing its match space")
+                color["match_space"] = match_space
                 connected = 0
                 confidences: list[float] = []
                 for camera in cameras:

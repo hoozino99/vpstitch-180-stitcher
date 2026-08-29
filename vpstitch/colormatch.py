@@ -94,9 +94,11 @@ def _conservative_gain(
     strength: float,
     limits: tuple[float, float],
     weights: np.ndarray,
+    preserve_luminance: bool,
 ) -> np.ndarray:
     gain = np.exp(log_gain * strength)
-    gain /= float(np.dot(weights, gain))
+    if preserve_luminance:
+        gain /= float(np.dot(weights, gain))
 
     low, high = limits
     direction = gain - 1.0
@@ -122,6 +124,7 @@ def _estimate_overlap(
     max_samples: int,
     outlier_sigma: float,
     weights: np.ndarray,
+    preserve_luminance: bool,
 ) -> tuple[int, int, np.ndarray, float, float] | None:
     valid = (
         np.isfinite(mask_a)
@@ -152,9 +155,12 @@ def _estimate_overlap(
 
     flat_a = image_a.reshape(-1, 3)[flat_indices]
     flat_b = image_b.reshape(-1, 3)[flat_indices]
-    lum_a = flat_a @ weights
-    lum_b = flat_b @ weights
-    log_ratios = np.log((flat_a / lum_a[:, None]) / (flat_b / lum_b[:, None]))
+    if preserve_luminance:
+        lum_a = flat_a @ weights
+        lum_b = flat_b @ weights
+        log_ratios = np.log((flat_a / lum_a[:, None]) / (flat_b / lum_b[:, None]))
+    else:
+        log_ratios = np.log(flat_a / flat_b)
 
     center = np.median(log_ratios, axis=0)
     distances = np.linalg.norm(log_ratios - center, axis=1)
@@ -169,7 +175,8 @@ def _estimate_overlap(
     accepted = log_ratios[inliers]
     relative_log_gain = np.median(accepted, axis=0)
     relative_gain = np.exp(relative_log_gain)
-    relative_gain /= float(np.dot(weights, relative_gain))
+    if preserve_luminance:
+        relative_gain /= float(np.dot(weights, relative_gain))
     relative_log_gain = np.log(relative_gain)
 
     residuals = accepted - relative_log_gain
@@ -184,7 +191,7 @@ def _estimate_overlap(
 def _reference_connectivity(
     camera_count: int,
     reference_index: int,
-    edges: Sequence[tuple[int, int, np.ndarray, float]],
+    edges: Sequence[tuple[int, int, np.ndarray, float, int]],
 ) -> tuple[np.ndarray, np.ndarray]:
     connected = np.zeros(camera_count, dtype=bool)
     confidence = np.zeros(camera_count, dtype=np.float64)
@@ -194,7 +201,7 @@ def _reference_connectivity(
     changed = True
     while changed:
         changed = False
-        for camera_a, camera_b, _, edge_confidence in edges:
+        for camera_a, camera_b, _, edge_confidence, _ in edges:
             if connected[camera_a]:
                 path_confidence = confidence[camera_a] * edge_confidence
                 if path_confidence > confidence[camera_b]:
@@ -224,6 +231,7 @@ def solve_color_match(
     min_overlap_pixels: int = 256,
     max_samples: int = 100_000,
     outlier_sigma: float = 3.5,
+    preserve_luminance: bool = True,
 ) -> ColorMatchResult:
     """Estimate static, luminance-neutral RGB gains from aligned overlaps.
 
@@ -254,7 +262,7 @@ def solve_color_match(
     camera_count = len(checked_images)
     overlaps: list[OverlapDiagnostic] = []
     rejected: list[tuple[int, int, int]] = []
-    edges: list[tuple[int, int, np.ndarray, float]] = []
+    edges: list[tuple[int, int, np.ndarray, float, int]] = []
 
     for camera_a in range(camera_count):
         for camera_b in range(camera_a + 1, camera_count):
@@ -279,12 +287,13 @@ def solve_color_match(
                 max_samples=max_samples,
                 outlier_sigma=outlier_sigma,
                 weights=weights,
+                preserve_luminance=preserve_luminance,
             )
             if estimate is None:
                 rejected.append((camera_a, camera_b, raw_overlap))
                 continue
             candidate_count, used_count, delta, confidence, rms = estimate
-            edges.append((camera_a, camera_b, delta, confidence))
+            edges.append((camera_a, camera_b, delta, confidence, used_count))
             overlaps.append(
                 OverlapDiagnostic(
                     camera_a=camera_a,
@@ -314,8 +323,16 @@ def solve_color_match(
     if unknown_cameras and usable_edges:
         matrix = np.zeros((len(usable_edges), len(unknown_cameras)), dtype=np.float64)
         targets = np.zeros((len(usable_edges), 3), dtype=np.float64)
-        for row, (camera_a, camera_b, delta, confidence) in enumerate(usable_edges):
-            row_weight = np.sqrt(max(confidence, 1.0e-6))
+        largest_overlap = max(edge[4] for edge in usable_edges)
+        for row, (camera_a, camera_b, delta, confidence, used_count) in enumerate(
+            usable_edges
+        ):
+            # A narrow accidental overlap must not pull as hard as a seam with
+            # tens of thousands of agreeing pixels. Normalizing by the largest
+            # edge keeps the least-squares matrix well scaled while preserving
+            # the relative statistical weight.
+            sample_weight = used_count / float(largest_overlap)
+            row_weight = np.sqrt(max(confidence * sample_weight, 1.0e-9))
             if camera_a != reference_index:
                 matrix[row, unknown_columns[camera_a]] = -row_weight
             if camera_b != reference_index:
@@ -328,7 +345,11 @@ def solve_color_match(
     gains = np.ones((camera_count, 3), dtype=np.float64)
     for camera in unknown_cameras:
         gains[camera] = _conservative_gain(
-            solved_log_gains[camera], strength, gain_limits, weights
+            solved_log_gains[camera],
+            strength,
+            gain_limits,
+            weights,
+            preserve_luminance,
         )
     gains[reference_index] = 1.0
 

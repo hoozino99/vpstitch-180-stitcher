@@ -1611,6 +1611,7 @@ def test_queued_render_uses_locked_full_resolution_fine_tune_after_ui_changes(
     window.source_table.selectRow(0)
     window._source_selection_changed()
     window.apply_aces_preset()
+    window.config_data["color"]["match_space"] = "ACEScg"
     for camera in window.config_data["cameras"]:
         camera["color_gain"] = [1.03, 1.0, 0.97]
         camera["color_match_confidence"] = 0.92
@@ -1643,6 +1644,7 @@ def test_queued_render_uses_locked_full_resolution_fine_tune_after_ui_changes(
     assert locked["cameras"][0]["feather_right_deg"] == 5.5
     assert locked["cameras"][0]["color_gain"] == [1.03, 1.0, 0.97]
     assert locked["color"]["match_enabled"] is True
+    assert locked["color"]["match_space"] == "ACEScg"
     assert locked["color"]["match_strength"] == 0.8
     assert locked["video"]["fps"] == pytest.approx(24_000 / 1_001)
     assert locked["_vpstitch"]["source_fps"] == pytest.approx(24_000 / 1_001)
@@ -3492,6 +3494,7 @@ def test_clear_color_match_snapshot_preserves_reference_and_strength() -> None:
             "mode": "ocio",
             "match_enabled": True,
             "match_reference": "cam0",
+            "match_space": "ACEScg",
             "match_strength": 0.75,
         },
     }
@@ -3499,5 +3502,6 @@ def test_clear_color_match_snapshot_preserves_reference_and_strength() -> None:
     assert config["color"]["match_enabled"] is False
     assert config["color"]["match_reference"] == "cam0"
     assert config["color"]["match_strength"] == pytest.approx(0.75)
+    assert "match_space" not in config["color"]
     assert config["cameras"][0]["color_gain"] == [1.0, 1.0, 1.0]
     assert "color_match_confidence" not in config["cameras"][0]
