@@ -60,7 +60,11 @@ def _camera(width: int, height: int) -> Camera:
     [
         ("ffv1-16", ".mkv", 2000, 0),
         ("prores-hq", ".mov", 800, 512),
-        ("prores-4444", ".mov", 1800, 512),
+        # FFmpeg's platform ProRes implementations quantize the same 12-bit
+        # ramp differently. Bit-depth metadata plus bounded reconstruction
+        # error are the authoritative checks; 1400 levels catches an 8-bit
+        # regression without rejecting the macOS runner's valid output.
+        ("prores-4444", ".mov", 1400, 512),
     ],
 )
 def test_high_bit_depth_video_roundtrip(

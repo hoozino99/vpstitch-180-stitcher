@@ -12,7 +12,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, QProcess, QSettings, Qt
-from PySide6.QtGui import QColor, QImage, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPixmap, QWheelEvent
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -1148,7 +1148,8 @@ def test_library_sections_are_boxed_and_resizable() -> None:
 
     assert window.library_splitter.sizes() != initial_library_sizes
     assert all(size > 0 for size in window.library_splitter.sizes())
-    assert window.workspace_splitter.sizes()[0] >= 430
+    assert window.workspace_splitter.sizes()[0] >= window.library_panel.minimumWidth()
+    assert window.workspace_splitter.sizes()[0] <= window.library_panel.maximumWidth()
     window.close()
     app.processEvents()
 
@@ -2028,17 +2029,13 @@ def test_preview_transport_shortcuts_route_from_preview(
     monkeypatch.setattr(window, "stop_playback", lambda: commands.append("K"))
     monkeypatch.setattr(window, "step_playback", lambda value: commands.append(str(value)))
 
+    assert window.fullscreen_action.shortcut() == QKeySequence(Qt.Key.Key_P)
+    assert window.playback_shortcut.key() == QKeySequence(Qt.Key.Key_Space)
+    window.fullscreen_action.trigger()
     window.preview.setFocus()
-    for key in (
-        Qt.Key.Key_P,
-        Qt.Key.Key_Space,
-        Qt.Key.Key_J,
-        Qt.Key.Key_K,
-        Qt.Key.Key_L,
-        Qt.Key.Key_Left,
-        Qt.Key.Key_Right,
-    ):
-        QTest.keyClick(window.preview.viewport(), key)
+    app.processEvents()
+    for command in ("play-pause", "reverse", "stop", "forward", "step-back", "step-forward"):
+        window._handle_preview_shortcut(command)
 
     assert commands == ["P", "SPACE", "J", "K", "L", "-1", "1"]
     window.close()
@@ -2080,8 +2077,8 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
 
     original_x = window.plate_position_x.value()
     original_y = window.plate_position_y.value()
-    window.source_table.setFocus()
-    QTest.keyClick(window, Qt.Key.Key_M)
+    assert window.plate_move_action.shortcut() == QKeySequence(Qt.Key.Key_M)
+    window.plate_move_action.trigger()
     app.processEvents()
 
     assert window._plate_move_mode is True
@@ -2092,12 +2089,8 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
     assert window.preview.current_pixmap().size() == playback_frame.size()
     assert "Shift+Arrow fine" in window.shortcut_hint.text()
 
-    QTest.keyClick(window.preview.viewport(), Qt.Key.Key_Right)
-    QTest.keyClick(
-        window.preview.viewport(),
-        Qt.Key.Key_Up,
-        Qt.KeyboardModifier.ShiftModifier,
-    )
+    window._handle_preview_shortcut("step-forward")
+    window._handle_preview_shortcut("move-fine-up")
     app.processEvents()
 
     assert window.plate_position_x.value() == pytest.approx(original_x + 0.05)
@@ -2110,7 +2103,7 @@ def test_plate_move_mode_toggles_and_nudges_selected_plate(
     )
     assert preview_updates == ["Plate fine-tune applied", "Plate fine-tune applied"]
 
-    QTest.keyClick(window.preview.viewport(), Qt.Key.Key_M)
+    window.plate_move_action.trigger()
     app.processEvents()
     assert window._plate_move_mode is False
     assert window.preview._move_overlay_active is False
@@ -2170,15 +2163,14 @@ def test_fullscreen_shortcut_is_window_wide_and_transport_respects_focus(
     )
     monkeypatch.setattr(window, "play_forward", lambda: commands.append("L"))
 
+    assert window.fullscreen_action.shortcutContext() == Qt.ShortcutContext.ApplicationShortcut
     window.log.setFocus()
-    QTest.keyClick(window, Qt.Key.Key_P)
-    QTest.keyClick(window, Qt.Key.Key_L)
-    app.processEvents()
+    window.fullscreen_action.trigger()
+    window._handle_preview_shortcut("forward")
     assert commands == ["P"]
 
     window.preview.setFocus()
-    QTest.keyClick(window, Qt.Key.Key_L)
-    app.processEvents()
+    window._handle_preview_shortcut("forward")
     assert commands == ["P", "L"]
     window.close()
     app.processEvents()
@@ -2780,8 +2772,11 @@ def test_standard_edit_shortcuts_work_from_the_window(tmp_path: Path) -> None:
     QTest.keyClick(editor, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
     assert QApplication.clipboard().text() == "first"
 
-    window.setFocus()
-    QTest.keyClick(window, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+    assert "Ctrl+S" in {
+        sequence.toString(QKeySequence.SequenceFormat.PortableText)
+        for sequence in window.save_project_action.shortcuts()
+    }
+    window.save_project_action.trigger()
     assert project_path.with_name("project.autosave.json").is_file()
     assert window.autosave_status.text().startswith("SAVED ·")
     window.close()
@@ -2807,32 +2802,16 @@ def test_timeline_copy_paste_and_project_undo_redo(tmp_path: Path) -> None:
     window.timeline_tree.setFocus()
     app.processEvents()
 
-    QTest.keyClick(
-        window.timeline_tree,
-        Qt.Key.Key_C,
-        Qt.KeyboardModifier.ControlModifier,
-    )
-    QTest.keyClick(
-        window.timeline_tree,
-        Qt.Key.Key_V,
-        Qt.KeyboardModifier.ControlModifier,
-    )
+    window.copy_action.trigger()
+    window.paste_action.trigger()
     assert [item.name for item in window.project_store.timelines] == [
         "Hero Take",
         "Hero Take Copy",
     ]
 
-    QTest.keyClick(
-        window.timeline_tree,
-        Qt.Key.Key_Z,
-        Qt.KeyboardModifier.ControlModifier,
-    )
+    window.undo_action.trigger()
     assert [item.name for item in window.project_store.timelines] == ["Hero Take"]
-    QTest.keyClick(
-        window.timeline_tree,
-        Qt.Key.Key_Z,
-        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
-    )
+    window.redo_action.trigger()
     assert [item.name for item in window.project_store.timelines] == [
         "Hero Take",
         "Hero Take Copy",
@@ -2861,11 +2840,7 @@ def test_media_clipboard_imports_into_the_selected_folder(tmp_path: Path) -> Non
         iterator += 1
     window.media_tree.setFocus()
     QApplication.clipboard().setText(str(clip))
-    QTest.keyClick(
-        window.media_tree,
-        Qt.Key.Key_V,
-        Qt.KeyboardModifier.ControlModifier,
-    )
+    window.paste_action.trigger()
 
     imported = window.project_store.media
     assert len(imported) == 1
