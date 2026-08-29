@@ -50,6 +50,7 @@ from vpstitch.gui import (
     render_queue_status_text,
     render_progress_text,
     resolved_render_output,
+    stabilize_render_eta_deadline,
     suggest_camera_assignment,
     split_render_output,
     _preferred_storage_directory,
@@ -242,7 +243,28 @@ def test_render_eta_uses_robust_center_and_limits_single_sample_jump() -> None:
 
     updated = robust_render_seconds_per_frame([2.0, 2.1], estimate)
     assert updated is not None
-    assert 1.55 < updated < 1.70
+    assert 1.25 < updated < 1.35
+
+
+def test_render_eta_deadline_slews_without_visible_five_second_rebounds() -> None:
+    deadline = 200.0
+    previous_at = 0.0
+    previous_remaining = 200.0
+    targets = [208.0, 192.0, 240.0, 190.0, 230.0, 195.0]
+
+    for now, target in enumerate(targets, start=1):
+        deadline = stabilize_render_eta_deadline(
+            deadline,
+            target,
+            float(now),
+            previous_at,
+        )
+        assert deadline is not None
+        remaining = deadline - now
+        assert remaining <= previous_remaining
+        assert previous_remaining - remaining <= 2.0
+        previous_remaining = remaining
+        previous_at = float(now)
 
 
 def test_render_eta_excludes_cold_frame_then_converges_to_recent_rate(
@@ -264,9 +286,45 @@ def test_render_eta_excludes_cold_frame_then_converges_to_recent_rate(
     window._update_render_progress(3, 100)
     assert window._render_seconds_per_frame is not None
     assert window._render_seconds_per_frame < 1.2
+    assert window._render_eta_target_deadline is None
     window._update_render_progress(4, 100)
+    assert window._render_eta_target_deadline is not None
     window._update_render_progress(5, 100)
     assert window._render_seconds_per_frame == pytest.approx(0.56, abs=0.08)
+
+    window.close()
+    app.processEvents()
+
+
+def test_render_eta_stays_monotonic_and_accurate_under_frame_jitter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    project_path = tmp_path / "Stable ETA" / "project.json"
+    ProjectStore.create(project_path, name="Stable ETA")
+    window = MainWindow(project_path)
+    intervals = [1.0, 1.18, 0.84, 1.12, 0.91, 1.15, 0.86, 1.04, 0.95, 1.08] * 2
+    ticks = [4.0]
+    for interval in intervals:
+        ticks.append(ticks[-1] + interval)
+    tick_iterator = iter(ticks)
+    monkeypatch.setattr("vpstitch.gui.time.monotonic", lambda: next(tick_iterator))
+    window._render_progress_last_at = 0.0
+    displayed: list[float] = []
+
+    for done, now in enumerate(ticks, start=1):
+        window._update_render_progress(done, 100)
+        if window._render_eta_display_deadline is not None:
+            displayed.append(window._render_eta_display_deadline - now)
+
+    assert window._render_seconds_per_frame == pytest.approx(1.0, abs=0.08)
+    assert window._render_eta_target_deadline is not None
+    raw_remaining = window._render_eta_target_deadline - ticks[-1]
+    assert raw_remaining == pytest.approx(79.0, abs=6.0)
+    changes = np.diff(displayed)
+    assert np.max(changes) <= 0.01
+    assert np.min(changes) >= -2.2
 
     window.close()
     app.processEvents()

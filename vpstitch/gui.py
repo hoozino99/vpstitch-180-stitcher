@@ -546,14 +546,14 @@ def robust_render_seconds_per_frame(
     samples: list[float],
     previous: float | None = None,
 ) -> float | None:
-    """Estimate recent sustained throughput while rejecting isolated stalls."""
+    """Estimate sustained throughput without amplifying per-frame jitter."""
     values = np.asarray(
         [value for value in samples if np.isfinite(value) and value > 0.0],
         dtype=np.float64,
     )
     if values.size == 0:
         return previous
-    values = values[-15:]
+    values = values[-31:]
     median = float(np.median(values))
     deviation = np.abs(values - median)
     mad = float(np.median(deviation))
@@ -561,23 +561,58 @@ def robust_render_seconds_per_frame(
     inliers = values[deviation <= tolerance]
     if inliers.size == 0:
         inliers = values
-    robust_center = median * 0.55 + float(np.mean(inliers)) * 0.45
-    recent = values[-min(5, values.size) :]
+    robust_center = median * 0.75 + float(np.mean(inliers)) * 0.25
+    recent = values[-min(7, values.size) :]
     recent_center = float(np.median(recent))
-    center = robust_center * 0.35 + recent_center * 0.65
+    center = robust_center * 0.75 + recent_center * 0.25
     if previous is None or not np.isfinite(previous) or previous <= 0.0:
         return center
-    # Median/MAD removes one-off stalls. Once three recent samples agree on a
-    # speed change, follow it quickly enough that ETA remains useful after a
-    # thermal, codec, or I/O transition.
-    recent_three = values[-3:]
-    sustained_change = recent_three.size == 3 and (
-        bool(np.all(recent_three > previous * 1.08))
-        or bool(np.all(recent_three < previous * 0.92))
+    # Median/MAD removes one-off stalls. Require five agreeing samples before
+    # treating a thermal, codec, or I/O change as a new sustained rate.
+    recent_five = values[-5:]
+    sustained_change = recent_five.size == 5 and (
+        bool(np.all(recent_five > previous * 1.10))
+        or bool(np.all(recent_five < previous * 0.90))
     )
-    bounded = float(np.clip(center, previous * 0.5, previous * 2.0))
-    weight = 0.75 if sustained_change else 0.5
+    bounded = float(np.clip(center, previous * 0.67, previous * 1.5))
+    noise = mad / max(median, 1.0e-9)
+    weight = (
+        0.30
+        if sustained_change
+        else float(np.clip(0.16 / (1.0 + 8.0 * noise), 0.06, 0.16))
+    )
     return previous * (1.0 - weight) + bounded * weight
+
+
+def stabilize_render_eta_deadline(
+    current_deadline: float | None,
+    target_deadline: float | None,
+    now: float,
+    previous_update_at: float | None,
+) -> float | None:
+    """Slew a displayed finish time toward measured throughput without jumps."""
+    if target_deadline is None or not np.isfinite(target_deadline):
+        return current_deadline
+    if current_deadline is None or not np.isfinite(current_deadline):
+        return float(target_deadline)
+    elapsed = max(
+        0.0,
+        now - (previous_update_at if previous_update_at is not None else now),
+    )
+    if elapsed <= 0.0:
+        return float(current_deadline)
+    difference = float(target_deadline - current_deadline)
+    remaining = max(0.0, current_deadline - now)
+    deadband = max(1.0, min(4.0, remaining * 0.01))
+    if abs(difference) <= deadband:
+        return float(current_deadline)
+    severe = abs(difference) > max(12.0, remaining * 0.12)
+    # Even for a real throughput transition, move the completion deadline by
+    # less than one second per wall-clock second. The visible countdown can
+    # slow down while it converges, but it cannot jump back and forth by 5 s.
+    max_correction = elapsed * (0.75 if severe else 0.35)
+    correction = float(np.clip(difference, -max_correction, max_correction))
+    return float(current_deadline + correction)
 
 
 def render_progress_text(
@@ -2635,6 +2670,11 @@ class MainWindow(QMainWindow):
         self._render_seconds_per_frame: float | None = None
         self._render_frame_samples: list[float] = []
         self._render_eta_warmup_remaining = 1
+        self._render_eta_steady_at: float | None = None
+        self._render_eta_steady_done = 0
+        self._render_eta_target_deadline: float | None = None
+        self._render_eta_display_deadline: float | None = None
+        self._render_eta_display_updated_at: float | None = None
         self._render_progress_total = 0
         self._render_map_progress: tuple[int, int] | None = None
         self._last_render_elapsed_seconds: float | None = None
@@ -10933,6 +10973,11 @@ class MainWindow(QMainWindow):
                     self._render_seconds_per_frame = None
                     self._render_frame_samples.clear()
                     self._render_eta_warmup_remaining = 1
+                    self._render_eta_steady_at = None
+                    self._render_eta_steady_done = 0
+                    self._render_eta_target_deadline = None
+                    self._render_eta_display_deadline = None
+                    self._render_eta_display_updated_at = None
                     self._render_map_progress = None
                 self._process_phase = next_phase
             match = re.search(r"tiles\s+(\d+)/(\d+)", line)
@@ -10996,20 +11041,44 @@ class MainWindow(QMainWindow):
                     self._render_eta_warmup_remaining
                     - (done - self._render_progress_last_done),
                 )
+                if self._render_eta_warmup_remaining == 0:
+                    self._render_eta_steady_at = now
+                    self._render_eta_steady_done = done
             elif np.isfinite(sample) and sample > 0.0:
                 self._render_frame_samples.append(float(sample))
-                del self._render_frame_samples[:-21]
-                self._render_seconds_per_frame = robust_render_seconds_per_frame(
+                del self._render_frame_samples[:-31]
+                recent_rate = robust_render_seconds_per_frame(
                     self._render_frame_samples,
                     self._render_seconds_per_frame,
                 )
+                if (
+                    recent_rate is not None
+                    and self._render_eta_steady_at is not None
+                    and done > self._render_eta_steady_done
+                ):
+                    cumulative_rate = (now - self._render_eta_steady_at) / (
+                        done - self._render_eta_steady_done
+                    )
+                    cumulative_weight = min(
+                        0.82,
+                        0.70 + 0.005 * len(self._render_frame_samples),
+                    )
+                    self._render_seconds_per_frame = (
+                        cumulative_rate * cumulative_weight
+                        + recent_rate * (1.0 - cumulative_weight)
+                    )
+                else:
+                    self._render_seconds_per_frame = recent_rate
             self._render_progress_last_at = now
             self._render_progress_last_done = done
-        eta = (
-            None
-            if self._render_seconds_per_frame is None
-            else self._render_seconds_per_frame * max(0, total - done)
-        )
+        if (
+            self._render_seconds_per_frame is not None
+            and len(self._render_frame_samples) >= 3
+        ):
+            self._render_eta_target_deadline = now + (
+                self._render_seconds_per_frame * max(0, total - done)
+            )
+        eta = self._display_render_eta(now)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(done)
         if self._queue_current_id is not None:
@@ -11031,6 +11100,11 @@ class MainWindow(QMainWindow):
         self._render_seconds_per_frame = None
         self._render_frame_samples.clear()
         self._render_eta_warmup_remaining = 1
+        self._render_eta_steady_at = None
+        self._render_eta_steady_done = 0
+        self._render_eta_target_deadline = None
+        self._render_eta_display_deadline = None
+        self._render_eta_display_updated_at = None
         self._render_progress_total = max(0, int(total_frames))
         self._render_map_progress = None
         self._last_render_elapsed_seconds = None
@@ -11045,36 +11119,55 @@ class MainWindow(QMainWindow):
         self._render_seconds_per_frame = None
         self._render_frame_samples.clear()
         self._render_eta_warmup_remaining = 1
+        self._render_eta_steady_at = None
+        self._render_eta_steady_done = 0
+        self._render_eta_target_deadline = None
+        self._render_eta_display_deadline = None
+        self._render_eta_display_updated_at = None
         self._render_progress_total = 0
         self._render_map_progress = None
 
-    def _render_elapsed_seconds(self) -> float | None:
+    def _render_elapsed_seconds(self, now: float | None = None) -> float | None:
         if self._render_progress_started_at is None:
             return None
-        return max(0.0, time.monotonic() - self._render_progress_started_at)
+        return max(
+            0.0,
+            (time.monotonic() if now is None else now) - self._render_progress_started_at,
+        )
+
+    def _display_render_eta(self, now: float) -> float | None:
+        self._render_eta_display_deadline = stabilize_render_eta_deadline(
+            self._render_eta_display_deadline,
+            self._render_eta_target_deadline,
+            now,
+            self._render_eta_display_updated_at,
+        )
+        self._render_eta_display_updated_at = now
+        if self._render_eta_display_deadline is None:
+            return None
+        return max(0.0, self._render_eta_display_deadline - now)
 
     def _refresh_render_clock(self) -> None:
-        elapsed = self._render_elapsed_seconds()
+        now = time.monotonic()
+        elapsed = self._render_elapsed_seconds(now)
         if elapsed is None:
             self._render_progress_timer.stop()
             return
+        eta = self._display_render_eta(now)
         if self._queue_current_id is not None:
-            progress = self._queue_progress.get(self._queue_current_id)
+            current = self._queue_progress.get(self._queue_current_id)
+            if current is None:
+                progress = None
+            else:
+                progress = (current[0], current[1], eta)
+                self._queue_progress[self._queue_current_id] = progress
         else:
-            eta = (
-                None
-                if self._render_seconds_per_frame is None
-                else self._render_seconds_per_frame
-                * max(0, self._render_progress_total - self._render_progress_last_done)
-            )
             progress = (
                 self._render_progress_last_done,
                 self._render_progress_total,
                 eta,
             )
         done, total, eta = progress or (0, self._render_progress_total, None)
-        if eta is not None and self._render_progress_last_at is not None:
-            eta = max(0.0, eta - (time.monotonic() - self._render_progress_last_at))
         if self._process_phase == "projection-cache":
             if self._render_map_progress is None:
                 stage = "PREPARING MAPS"
