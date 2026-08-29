@@ -10,6 +10,7 @@ from dataclasses import asdict
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from .config import (
@@ -673,6 +674,7 @@ def _match_color(args: argparse.Namespace) -> None:
             "reference camera must be one of: " + ", ".join(names)
         )
     reference_index = names.index(args.reference_camera)
+    analysis_config, analysis_scale = _color_match_analysis_config(config)
     ocio_config = load_ocio_config(str(config.color.ocio_config))
     match_space = color_match_space(ocio_config, str(config.color.working_space))
     pipeline = ColorPipeline(
@@ -686,20 +688,36 @@ def _match_color(args: argparse.Namespace) -> None:
         [camera.colorspace for camera in config.cameras],
         [camera.color_gain for camera in config.cameras],
     )
-    tile = Tile(0, 0, config.output.width, config.output.height)
+    tile = Tile(
+        0,
+        0,
+        analysis_config.output.width,
+        analysis_config.output.height,
+    )
     warped: list[np.ndarray] = []
     masks: list[np.ndarray] = []
-    for index, (camera, image_path) in enumerate(
-        zip(config.cameras, args.images, strict=True)
+    for index, (source_camera, camera, image_path) in enumerate(
+        zip(config.cameras, analysis_config.cameras, args.images, strict=True)
     ):
         image = read_image(image_path)
-        if image.shape[:2] != (camera.height, camera.width):
+        if image.shape[:2] != (source_camera.height, source_camera.width):
             raise ConfigError(
-                f"{camera.name} reference expects {camera.width}x{camera.height}, "
+                f"{camera.name} reference expects "
+                f"{source_camera.width}x{source_camera.height}, "
                 f"got {image.shape[1]}x{image.shape[0]}"
             )
+        if analysis_scale < 1.0:
+            image = cv2.resize(
+                image,
+                (camera.width, camera.height),
+                interpolation=cv2.INTER_AREA,
+            )
         working = pipeline.input_to_working(index, image, apply_match=False)
-        map_x, map_y, valid, _ = camera_map(camera, tile, config.output)
+        map_x, map_y, valid, _ = camera_map(
+            camera,
+            tile,
+            analysis_config.output,
+        )
         warped.append(remap_camera(working, map_x, map_y))
         masks.append(valid.astype(np.float32))
     result = solve_color_match(
@@ -713,13 +731,21 @@ def _match_color(args: argparse.Namespace) -> None:
             if match_space.casefold() == "acescg"
             else (0.2126, 0.7152, 0.0722)
         ),
-        min_overlap_pixels=args.minimum_overlap,
+        min_overlap_pixels=max(
+            64,
+            int(round(args.minimum_overlap * analysis_scale * analysis_scale)),
+        ),
         preserve_luminance=config.color.preserve_luminance,
     )
     payload = {
         "reference_camera": args.reference_camera,
         "working_space": config.color.working_space,
         "match_space": match_space,
+        "analysis_scale": analysis_scale,
+        "analysis_canvas": [
+            analysis_config.output.width,
+            analysis_config.output.height,
+        ],
         "preserve_luminance": config.color.preserve_luminance,
         "cameras": [
             {
@@ -743,6 +769,68 @@ def _match_color(args: argparse.Namespace) -> None:
         temporary = Path(handle.name)
     temporary.replace(destination)
     print(json.dumps(payload, indent=2))
+
+
+def _color_match_analysis_config(
+    config: RigConfig,
+    *,
+    max_width: int = 1280,
+    max_height: int = 720,
+) -> tuple[RigConfig, float]:
+    """Scale representative-frame matching without changing its geometry.
+
+    Camera matching estimates three global gains from thousands of overlap
+    samples. Running that solve on the full Quick Preview only adds map, OCIO,
+    and remap cost; it does not add useful temporal or spatial detail.
+    """
+    scale = min(
+        1.0,
+        max_width / max(1, config.output.width),
+        max_height / max(1, config.output.height),
+    )
+    if scale >= 1.0:
+        return config, 1.0
+
+    output = replace(
+        config.output,
+        width=max(1, int(round(config.output.width * scale))),
+        height=max(1, int(round(config.output.height * scale))),
+        tile_width=max(
+            1,
+            min(
+                int(round(config.output.tile_width * scale)),
+                max(1, int(round(config.output.width * scale))),
+            ),
+        ),
+        tile_height=max(
+            1,
+            min(
+                int(round(config.output.tile_height * scale)),
+                max(1, int(round(config.output.height * scale))),
+            ),
+        ),
+    )
+    cameras = tuple(
+        replace(
+            camera,
+            width=max(1, int(round(camera.width * scale))),
+            height=max(1, int(round(camera.height * scale))),
+            lens=replace(
+                camera.lens,
+                fx=camera.lens.fx * scale,
+                fy=camera.lens.fy * scale,
+                cx=camera.lens.cx * scale,
+                cy=camera.lens.cy * scale,
+                circle_radius=(
+                    None
+                    if camera.lens.circle_radius is None
+                    else camera.lens.circle_radius * scale
+                ),
+            ),
+        )
+        for camera in config.cameras
+    )
+    return replace(config, cameras=cameras, output=output), scale
 
 
 def build_parser() -> argparse.ArgumentParser:

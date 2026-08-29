@@ -235,6 +235,39 @@ def test_render_progress_formats_percent_and_eta_compactly() -> None:
     ) == "100% · FINALIZING · 01:10 RUN"
 
 
+def test_playback_cache_tile_updates_do_not_overwrite_overall_progress() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._process_task_name = "BUILD PLAYBACK PROXY"
+    window._playback_cache_total_frames = 100
+    window.progress.setRange(0, 100)
+    window.progress.setValue(0)
+
+    window.process = SimpleNamespace(
+        readAllStandardOutput=lambda: b"progress frames 0/100\n"
+    )  # type: ignore[assignment]
+    window._read_process()
+    assert window.progress.value() == 0
+
+    window.process = SimpleNamespace(
+        readAllStandardOutput=lambda: b"frame 1\ntiles 4/4\n"
+    )  # type: ignore[assignment]
+    window._read_process()
+    assert window.progress.value() == 0
+    assert window.task_label.text() == "CACHE 0/100 · CURRENT FRAME 1 · TILE 4/4"
+
+    window.process = SimpleNamespace(
+        readAllStandardOutput=lambda: b"progress frames 1/100\n"
+    )  # type: ignore[assignment]
+    window._read_process()
+    assert window.progress.value() == 1
+    assert window.progress.maximum() == 100
+
+    window.process = None
+    window.close()
+    app.processEvents()
+
+
 def test_render_eta_uses_robust_center_and_limits_single_sample_jump() -> None:
     estimate = robust_render_seconds_per_frame(
         [1.20, 1.18, 1.22, 8.0, 1.19, 1.21]

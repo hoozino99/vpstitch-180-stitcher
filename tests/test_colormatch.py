@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from vpstitch.cli import _color_match_analysis_config
 from vpstitch.colormatch import DEFAULT_LUMA_WEIGHTS, solve_color_match
+from vpstitch.config import load_config
 
 
 def _scene(height: int = 48, width: int = 120) -> np.ndarray:
@@ -22,6 +24,23 @@ def _normalized_gain(values: tuple[float, float, float]) -> np.ndarray:
     weights = np.asarray(DEFAULT_LUMA_WEIGHTS)
     gain = np.asarray(values, dtype=np.float64)
     return gain / np.dot(weights, gain)
+
+
+def test_color_match_analysis_scales_camera_geometry_with_canvas() -> None:
+    config = load_config("configs/drive_5cam_180.prores-hq.json")
+
+    scaled, scale = _color_match_analysis_config(config)
+
+    assert scaled.output.width == 1280
+    assert scaled.output.height == round(config.output.height * scale)
+    assert scale == pytest.approx(1280 / config.output.width)
+    for source, camera in zip(config.cameras, scaled.cameras, strict=True):
+        assert camera.width == round(source.width * scale)
+        assert camera.height == round(source.height * scale)
+        assert camera.lens.fx == pytest.approx(source.lens.fx * scale)
+        assert camera.lens.fy == pytest.approx(source.lens.fy * scale)
+        assert camera.lens.cx == pytest.approx(source.lens.cx * scale)
+        assert camera.lens.cy == pytest.approx(source.lens.cy * scale)
 
 
 def test_recovers_magenta_and_cyan_drift_with_outlier_rejection() -> None:

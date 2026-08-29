@@ -2683,6 +2683,9 @@ class MainWindow(QMainWindow):
         self._render_progress_timer.timeout.connect(self._refresh_render_clock)
         self._process_output_buffer = ""
         self._process_phase = ""
+        self._process_frame_number: int | None = None
+        self._process_frame_progress: tuple[int, int] | None = None
+        self._playback_cache_total_frames = 0
         self._active_timeline_id: str | None = None
         self._active_bin_id: str | None = None
         self._loading_timeline = False
@@ -9155,7 +9158,6 @@ class MainWindow(QMainWindow):
         self.color_match_enabled.setChecked(False)
         self.color_match_enabled.blockSignals(False)
         self.color_match_status.setText("Camera match reset")
-        self._stop_playback(clear=True)
         self._save_active_timeline()
         self._restitch_color_reference("Camera match reset")
 
@@ -9229,7 +9231,6 @@ class MainWindow(QMainWindow):
                 self.color_match_status.setText(
                     f"{reference_label} reference · {connected}/{len(cameras)} connected · {average:.0%} confidence"
                 )
-                self._stop_playback(clear=True)
                 self._save_active_timeline()
                 self._restitch_color_reference("Camera match applied")
             except Exception as error:
@@ -9255,13 +9256,18 @@ class MainWindow(QMainWindow):
         )
 
     def _restitch_color_reference(self, message: str) -> None:
-        self._schedule_live_preview(message, immediate=True)
+        self._schedule_live_preview(
+            message,
+            immediate=True,
+            cache_delay_ms=2500,
+        )
 
     def _schedule_live_preview(
         self,
         message: str,
         *,
         immediate: bool = False,
+        cache_delay_ms: int = 1400,
     ) -> None:
         """Debounce inspector changes and update the in-memory draft frame."""
         if self._loading_config or self._closing or not self.config_data:
@@ -9293,7 +9299,7 @@ class MainWindow(QMainWindow):
             # Rebuild only after the controls have been idle for a moment. This
             # keeps slider/drag feedback interactive while ensuring Space does
             # not remain on the slower frame-by-frame fallback indefinitely.
-            self._request_playback_warmup(delay_ms=700)
+            self._request_playback_warmup(delay_ms=cache_delay_ms)
 
     def _sync_cached_preview_config(self) -> tuple[list[str], Path]:
         reference = self._last_reference_dir
@@ -9841,6 +9847,7 @@ class MainWindow(QMainWindow):
         )
         self._playback_autostart = autoplay
         self._auto_cache_in_progress = True
+        self._playback_cache_total_frames = cache_frames
 
         def playback_failed() -> None:
             self._playback_autostart = False
@@ -10848,6 +10855,8 @@ class MainWindow(QMainWindow):
         self._process_task_name = task
         self._process_output_buffer = ""
         self._process_phase = ""
+        self._process_frame_number = None
+        self._process_frame_progress = None
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(self._working_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -10858,7 +10867,11 @@ class MainWindow(QMainWindow):
         self.status_pill.setText(task)
         self.cancel_button.setVisible(True)
         self._set_busy_ui(True)
-        self.progress.setRange(0, 0)
+        if task == "BUILD PLAYBACK PROXY" and self._playback_cache_total_frames > 0:
+            self.progress.setRange(0, self._playback_cache_total_frames)
+            self.progress.setValue(0)
+        else:
+            self.progress.setRange(0, 0)
         self._append_log("\n▶ " + task)
         self._append_log("  vpstitch " + " ".join(f'"{arg}"' if " " in arg else arg for arg in arguments))
         if getattr(sys, "frozen", False):
@@ -10871,6 +10884,9 @@ class MainWindow(QMainWindow):
                 self._process_failure = None
                 self._process_interactive = False
                 self._process_task_name = ""
+                self._process_frame_number = None
+                self._process_frame_progress = None
+                self._playback_cache_total_frames = 0
                 self._set_busy_ui(False)
                 self._end_render_progress()
                 self._error("Packaged CLI missing", f"Expected bundled helper at:\n{cli_program}")
@@ -10897,6 +10913,9 @@ class MainWindow(QMainWindow):
             self._process_failure = None
             self._process_interactive = False
             self._process_task_name = ""
+            self._process_frame_number = None
+            self._process_frame_progress = None
+            self._playback_cache_total_frames = 0
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             self.task_label.setText("FAILED")
@@ -10989,6 +11008,7 @@ class MainWindow(QMainWindow):
             frame = re.search(r"frame\s+(\d+)", line)
             if frame:
                 frame_value = frame.group(1)
+                self._process_frame_number = int(frame_value)
             progress_only = re.fullmatch(
                 r"\s*(?:phase\s+[a-z-]+|tiles\s+\d+/\d+|frame\s+\d+|progress\s+frames\s+\d+/\d+)\s*",
                 line,
@@ -11007,14 +11027,53 @@ class MainWindow(QMainWindow):
                     self._refresh_render_clock()
                 else:
                     self.task_label.setText(f"PREPARING MAPS {done}/{total}")
-            elif frame_progress is None and self._queue_current_id is None:
+            elif self._process_task_name == "BUILD PLAYBACK PROXY":
+                current = (
+                    "?"
+                    if self._process_frame_number is None
+                    else str(self._process_frame_number)
+                )
+                overall = self._process_frame_progress
+                prefix = (
+                    f"CACHE {overall[0]}/{overall[1]}"
+                    if overall is not None
+                    else "CACHE PREPARING"
+                )
+                self.task_label.setText(
+                    f"{prefix} · CURRENT FRAME {current} · TILE {done}/{total}"
+                )
+            elif (
+                self._render_progress_started_at is not None
+                or self._queue_current_id is not None
+                or self._process_phase == "render"
+            ):
+                # Tile progress is per-frame detail. Keep it text-only so the
+                # overall frame bar never fills and snaps back for every frame.
+                current = (
+                    "?"
+                    if self._process_frame_number is None
+                    else str(self._process_frame_number)
+                )
+                if self._render_progress_started_at is None:
+                    self.task_label.setText(
+                        f"FRAME {current} · TILE {done}/{total}"
+                    )
+            elif frame_progress is None:
                 self.progress.setRange(0, total)
                 self.progress.setValue(done)
         if frame_progress is not None:
-            self._update_render_progress(*frame_progress)
+            self._process_frame_progress = frame_progress
+            if self._process_task_name == "BUILD PLAYBACK PROXY":
+                done, total = frame_progress
+                self.progress.setRange(0, max(1, total))
+                self.progress.setValue(min(max(0, done), max(1, total)))
+                self.task_label.setText(f"CACHE {done}/{total} · OVERALL")
+            else:
+                self._update_render_progress(*frame_progress)
         if (
             frame_value is not None
             and frame_progress is None
+            and progress_value is None
             and self._render_progress_started_at is None
         ):
             prefix = "CACHE" if self._process_task_name == "BUILD PLAYBACK PROXY" else "FRAME"
@@ -11245,6 +11304,9 @@ class MainWindow(QMainWindow):
         self._process_failure = None
         self._process_interactive = False
         self._process_task_name = ""
+        self._process_frame_number = None
+        self._process_frame_progress = None
+        self._playback_cache_total_frames = 0
         self._end_render_progress()
         try:
             process.readyReadStandardOutput.disconnect(self._read_process)
