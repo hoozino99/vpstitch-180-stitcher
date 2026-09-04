@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import vpstitch.gui as gui_module
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, QProcess, QSettings, Qt
@@ -42,6 +44,7 @@ from vpstitch.gui import (
     ScrubbableDoubleSpinBox,
     TrimRangeBar,
     format_render_duration,
+    file_manager_reveal_command,
     live_playback_limits,
     order_camera_plates,
     plate_number,
@@ -612,6 +615,7 @@ def test_viewer_monitor_is_preview_only_and_keeps_hdr_delivery_locked(
 ) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
+    assert "raw delivery signal" in window.viewer_status.text()
     window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
     window.color_mode.setCurrentIndex(window.color_mode.findData("ocio"))
     window.ocio_config.setText("vpstitch://aces-studio-v4.0.0")
@@ -639,14 +643,61 @@ def test_viewer_monitor_is_preview_only_and_keeps_hdr_delivery_locked(
 
     assert delivery["color"]["display"] == "Rec.2100-PQ - Display"
     assert delivery["video"]["color_trc"] == "smpte2084"
-    assert viewer["color"]["display"] == "sRGB - Display"
-    assert viewer["color"]["view"] == "ACES 2.0 - SDR 100 nits (Rec.709)"
-    assert viewer["video"]["color_trc"] == "bt709"
+    assert viewer["color"] == delivery["color"]
+    assert viewer["video"]["color_trc"] == "smpte2084"
     assert "viewer_monitor" not in delivery
     assert [
         window.viewer_monitor.itemText(index)
         for index in range(window.viewer_monitor.count())
-    ] == ["Standard Rec.709", "Match delivery target"]
+    ] == [
+        "Standard Rec.709",
+        "Rec.709 · ACES tone map",
+        "Match delivery target",
+    ]
+
+    window.viewer_monitor.setCurrentIndex(
+        window.viewer_monitor.findData("sdr-rec709-aces")
+    )
+    aces_preview = window._apply_viewer_transform(delivery)
+    assert aces_preview["color"]["display"] == "sRGB - Display"
+    assert aces_preview["color"]["view"] == "ACES 2.0 - SDR 100 nits (Rec.709)"
+    assert aces_preview["video"]["color_trc"] == "bt709"
+    assert window._collect_config() == delivery
+    window.close()
+    app.processEvents()
+
+
+def test_standard_rec709_viewer_preserves_log_delivery_signal() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
+    window.color_mode.setCurrentIndex(window.color_mode.findData("ocio"))
+    window.ocio_config.setText("vpstitch://aces-studio-v4.0.0")
+    assert window._reload_ocio_spaces(quiet=True)
+    window.output_mode.setCurrentIndex(window.output_mode.findData("colorspace"))
+    window.output_space.setCurrentIndex(
+        window.output_space.findText("V-Log V-Gamut")
+    )
+    window.viewer_monitor.setCurrentIndex(
+        window.viewer_monitor.findData("sdr-rec709")
+    )
+    delivery = window._collect_config()
+
+    viewer = window._apply_viewer_transform(delivery)
+
+    assert delivery["color"]["output_mode"] == "colorspace"
+    assert delivery["color"]["output_space"] == "V-Log V-Gamut"
+    assert viewer["color"] == delivery["color"]
+    assert "color_trc" not in viewer["video"]
+
+    window.viewer_monitor.setCurrentIndex(
+        window.viewer_monitor.findData("sdr-rec709-aces")
+    )
+    normalized = window._apply_viewer_transform(delivery)
+    assert normalized["color"]["output_mode"] == "display_view"
+    assert normalized["color"]["display"] == "sRGB - Display"
+    assert normalized["video"]["color_trc"] == "bt709"
+    assert window._collect_config() == delivery
     window.close()
     app.processEvents()
 
@@ -983,6 +1034,8 @@ def test_gui_render_all_processes_timeline_snapshots_sequentially(
     def run_cli(task, arguments, success=None, failure=None):
         output = arguments[arguments.index("--output") + 1]
         started.append((task, output))
+        assert Path(output).is_file()
+        assert Path(output).stat().st_size == 0
         Path(output).write_bytes(b"rendered")
         window._last_render_elapsed_seconds = 12.5 + len(started)
         if success:
@@ -998,7 +1051,10 @@ def test_gui_render_all_processes_timeline_snapshots_sequentially(
         "QUEUE · Take 1",
         "QUEUE · Take 2",
     ]
-    assert all(".vpstitch-part-" in Path(output).name for _task, output in started)
+    assert [Path(output).name for _task, output in started] == [
+        "take-1.rendering.mov",
+        "take-2.rendering.mov",
+    ]
     assert (tmp_path / "take-1.mov").read_bytes() == b"rendered"
     assert (tmp_path / "take-2.mov").read_bytes() == b"rendered"
     assert all(job.status is RenderStatus.DONE for job in window.render_queue.jobs)
@@ -1010,15 +1066,178 @@ def test_gui_render_all_processes_timeline_snapshots_sequentially(
     app.processEvents()
 
 
+def test_failed_queue_render_removes_visible_in_progress_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.render_queue = RenderQueueStore(tmp_path / "render-queue.json")
+    source = tmp_path / "P01.mov"
+    source.touch()
+    config = json.loads(Path("configs/five_cam_180.sample.json").read_text())
+    config["cameras"] = config["cameras"][:1]
+    output = tmp_path / "failed.mov"
+    job = window.render_queue.add(
+        RenderJob.create(
+            name="Failed Take",
+            source_paths=[source],
+            config_snapshot=config,
+            output_path=output,
+            out_frame=1,
+        )
+    )
+    staging = window._render_staging_path(output, "prores-hq")
+
+    def fail_cli(task, arguments, success=None, failure=None):
+        assert Path(arguments[arguments.index("--output") + 1]) == staging
+        assert staging.is_file()
+        if failure:
+            failure()
+
+    monkeypatch.setattr(window, "_run_cli", fail_cli)
+    window._refresh_queue_table()
+    window.queue_table.selectRow(0)
+
+    window.render_selected_queue_job()
+
+    assert not staging.exists()
+    assert window.render_queue.jobs[0].id == job.id
+    assert window.render_queue.jobs[0].status is RenderStatus.FAILED
+    window.close()
+    app.processEvents()
+
+
 def test_render_staging_commits_only_complete_output(tmp_path: Path) -> None:
     output = tmp_path / "master.mov"
-    staging = MainWindow._render_staging_path(output, "prores-hq", "test")
+    staging = MainWindow._render_staging_path(output, "prores-hq")
     staging.write_bytes(b"complete master")
 
     MainWindow._commit_render_staging(staging, output)
 
     assert output.read_bytes() == b"complete master"
     assert not staging.exists()
+
+
+def test_render_staging_is_visible_before_encoder_starts(tmp_path: Path) -> None:
+    output = tmp_path / "master.mov"
+    staging = MainWindow._render_staging_path(output, "prores-hq")
+
+    MainWindow._create_render_staging(staging, "prores-hq")
+
+    assert staging.name == "master.rendering.mov"
+    assert staging.is_file()
+    assert staging.stat().st_size == 0
+
+
+def test_file_manager_reveal_commands_select_files_and_open_missing_parent(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "master.mov"
+    output.write_bytes(b"complete")
+
+    assert file_manager_reveal_command(output, platform="darwin") == (
+        "open",
+        ["-R", str(output)],
+    )
+    assert file_manager_reveal_command(output, platform="win32") == (
+        "explorer.exe",
+        ["/select,", str(output)],
+    )
+    assert file_manager_reveal_command(
+        tmp_path / "missing.mov", platform="darwin"
+    ) == ("open", [str(tmp_path)])
+
+
+def test_render_queue_open_output_prefers_final_then_in_progress_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.render_queue = RenderQueueStore(tmp_path / "render-queue.json")
+    source = tmp_path / "P01.mov"
+    source.touch()
+    output = tmp_path / "master.mov"
+    job = window.render_queue.add(
+        RenderJob.create(
+            name="Take 1",
+            source_paths=[source],
+            config_snapshot={"video": {"output_codec": "prores-hq"}},
+            output_path=output,
+        )
+    )
+    revealed: list[Path] = []
+    monkeypatch.setattr(
+        gui_module,
+        "reveal_in_file_manager",
+        lambda path: revealed.append(Path(path)) or True,
+    )
+    window._refresh_queue_table()
+    window.queue_table.selectRow(0)
+    staging = window._render_staging_path(output, "prores-hq")
+    window._create_render_staging(staging, "prores-hq")
+
+    window.open_selected_queue_output()
+    output.write_bytes(b"complete")
+    window.open_selected_queue_output()
+
+    assert job.id == window.render_queue.jobs[0].id
+    assert revealed == [staging, output]
+    window.close()
+    app.processEvents()
+
+
+def test_render_queue_context_menu_exposes_native_output_reveal_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.render_queue = RenderQueueStore(tmp_path / "render-queue.json")
+    source = tmp_path / "P01.mov"
+    source.touch()
+    window.render_queue.add(
+        RenderJob.create(
+            name="Take 1",
+            source_paths=[source],
+            config_snapshot={"video": {"output_codec": "prores-hq"}},
+            output_path=tmp_path / "master.mov",
+        )
+    )
+    labels: list[str] = []
+
+    class MenuAction:
+        def setEnabled(self, _enabled: bool) -> None:
+            return
+
+    class Menu:
+        def __init__(self, _parent) -> None:
+            return
+
+        def addAction(self, label, _callback):
+            labels.append(label)
+            return MenuAction()
+
+        def addSeparator(self) -> None:
+            return
+
+        def exec(self, _position) -> None:
+            return
+
+    monkeypatch.setattr(gui_module, "QMenu", Menu)
+    window._refresh_queue_table()
+    window.queue_table.selectRow(0)
+
+    window._queue_table_menu(QPoint(-1, -1))
+
+    expected = (
+        "Open in Finder"
+        if gui_module.sys.platform == "darwin"
+        else "Open in File Explorer"
+        if gui_module.sys.platform == "win32"
+        else "Open Containing Folder"
+    )
+    assert expected in labels
+    window.close()
+    app.processEvents()
 
 
 def test_gui_master_outputs_are_limited_to_10_or_12_bit() -> None:
@@ -3111,6 +3330,51 @@ def test_plate_adjustment_debounces_automatic_playback_cache_rebuild() -> None:
     assert window._playback_key is None
     window._live_preview_timer.stop()
     window._playback_warmup_timer.stop()
+    window.close()
+    app.processEvents()
+
+
+def test_color_match_uses_live_frames_without_rebuilding_full_playback_cache() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_config(Path("configs/drive_5cam_180.prores-hq.json"))
+    window._tc_alignment = {"fps": 24.0}
+    window.color_mode.setCurrentIndex(window.color_mode.findData("ocio"))
+    window.color_match_enabled.blockSignals(True)
+    window.color_match_enabled.setChecked(True)
+    window.color_match_enabled.blockSignals(False)
+
+    window._request_playback_warmup(autoplay=True)
+
+    assert window._auto_cache_requested is False
+    assert window._pending_playback_request is False
+    assert window._playback_warmup_timer.isActive() is False
+
+    class CacheProcess:
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = CacheProcess()
+    window.process = process  # type: ignore[assignment]
+    window._process_task_name = "BUILD PLAYBACK PROXY"
+    window._auto_cache_requested = True
+    window._pending_playback_request = True
+    window._playback_autostart = True
+    window._playback_warmup_timer.start(10_000)
+    window._restitch_color_reference("Camera match applied")
+
+    assert process.killed is True
+    assert window._playback_cache_cancelled_for_interaction is True
+    assert window._live_preview_pending is True
+    assert window._playback_key is None
+    assert window._auto_cache_requested is False
+    assert window._pending_playback_request is False
+    assert window._playback_autostart is False
+    assert window._playback_warmup_timer.isActive() is False
+    window.process = None
+    window._live_preview_timer.stop()
     window.close()
     app.processEvents()
 

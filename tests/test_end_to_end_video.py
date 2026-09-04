@@ -190,6 +190,8 @@ def test_five_video_cli_roundtrip_is_16bit_and_smooth(
         encoding="utf-8",
     )
     output_path = tmp_path / "stitched.mkv"
+    # The GUI exposes an empty `.rendering` shell before the encoder starts.
+    output_path.touch()
     arguments = [
         "vpstitch",
         "stitch-video",

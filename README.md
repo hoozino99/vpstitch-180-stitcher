@@ -1,5 +1,20 @@
 # VPStitch
 
+3대 또는 5대 카메라 플레이트를 TC 기준으로 정렬하고, 대표 프레임에서 계산한 리그 보정을
+타임라인 전체에 재사용해 180° 파노라마를 만드는 macOS/Windows 스티칭 앱입니다.
+
+## 다운로드
+
+최신 설치 파일은 [GitHub Releases](https://github.com/hoozino99/vpstitch-180-stitcher/releases/latest)에서 받을 수 있습니다.
+
+- Apple Silicon Mac(M1 이상): `VP-Stitch-macOS-arm64.dmg`
+- Intel Mac: `VP-Stitch-macOS-x86_64.dmg`
+- Windows 10/11 x64: `VP-Stitch-Windows-x64.zip`
+
+`v0.1.1`은 SDR 모니터에서 HDR/Log 납품 신호를 정확히 구분하는 Viewer 모드, Render Queue의
+Finder/Explorer 열기, 렌더 시작 즉시 보이는 `.rendering` 진행 파일과 완료 시 원자적 확정을
+포함합니다. 설치 파일에는 Python, FFmpeg, OpenColorIO와 ACES Studio Config가 포함됩니다.
+
 ## Desktop GUI
 
 Windows에서는 `VP Stitch GUI.bat`를 더블클릭하거나 PowerShell에서 실행합니다.
@@ -265,9 +280,12 @@ Control-click하여 열기를 선택합니다. 터미널에서 직접 실행할 
 
 ### 다운로드해서 바로 실행하는 macOS 앱
 
-GitHub의 **Actions → macOS app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면
-Apple Silicon과 Intel Mac용 `.dmg` 및 `.zip`이 생성됩니다. 압축을 풀고
-`VP Stitch.app`을 Applications 폴더로 드래그한 뒤 더블클릭하면 됩니다.
+[Latest Release](https://github.com/hoozino99/vpstitch-180-stitcher/releases/latest)에서
+Mac 칩에 맞는 `.dmg`을 받습니다. Apple 메뉴의 **이 Mac에 관하여**에서 칩이 `Apple M1` 이상이면
+`arm64`, 프로세서가 Intel이면 `x86_64` 파일을 선택합니다. DMG를 열고 `VP Stitch.app`을
+Applications 폴더로 드래그한 뒤 실행합니다. `.zip`은 DMG를 사용할 수 없을 때의 대체 패키지입니다.
+GitHub의 **Actions → macOS app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면 같은 파일을
+새로 빌드할 수 있습니다.
 처음 실행할 때 macOS가 개발자를 확인할 수 없다고 표시하면 앱을
 Control-click하여 **열기**를 선택하거나, 시스템 설정의 **개인정보 보호 및
 보안**에서 실행을 허용하십시오.
@@ -298,11 +316,12 @@ macOS 파일 접근 요청에서 **허용**을 선택하십시오. 이전에 거
 
 ### 다운로드해서 바로 실행하는 Windows 앱
 
-GitHub의 **Actions → Windows app** 워크플로를 수동 실행하거나 `v*` 태그를 만들면
-`VP-Stitch-Windows-*.zip`이 생성됩니다. 압축을 푼 폴더 안의 `VP Stitch.exe`를
+[Latest Release](https://github.com/hoozino99/vpstitch-180-stitcher/releases/latest)에서
+`VP-Stitch-Windows-x64.zip`을 받아 압축을 푼 뒤 폴더 안의 `VP Stitch.exe`를
 실행하면 되며 Python, FFmpeg, OpenColorIO를 따로 설치할 필요가 없습니다. Windows
 배포 ZIP은 아직 코드 서명되지 않았으므로 SmartScreen이 표시되면 파일 출처를 확인한
-후 실행을 허용하십시오.
+후 실행을 허용하십시오. GitHub의 **Actions → Windows app** 워크플로를 수동 실행하거나
+`v*` 태그를 만들면 같은 ZIP을 새로 빌드할 수 있습니다.
 
 macOS/Linux에서 CLI를 직접 사용할 때는 Windows 예시의
 `.venv\\Scripts\\vpstitch.exe`를 `.venv/bin/vpstitch`로 바꾸고, 줄 연결은
@@ -330,9 +349,12 @@ timecode를 읽습니다. 가장 늦게 시작한 플레이트를 공통 시작�
 새 설정의 프록시를 한 번만 다시 만듭니다. 투영 맵은 고정 재사용하지만 영상 픽셀은 각
 프레임마다 decode/warp/blend/encode해야 하므로 최초 캐시 준비 시간 자체는 필요합니다.
 
-최종 영상 렌더는 숨겨진 staging 경로에 먼저 완성한 뒤 검증된 파일이나 시퀀스 폴더만
-사용자가 지정한 이름으로 원자적으로 이동합니다. 실패·취소 시 불완전한 결과가 최종
-파일명으로 남지 않으며 Render Queue 상태도 최종 이동이 끝난 뒤에만 DONE이 됩니다.
+최종 영상 렌더를 시작하면 출력 폴더에 `파일명.rendering.mov`가 즉시 생기고 인코딩되는 동안
+크기가 증가합니다. 이미지 시퀀스는 같은 방식으로 `폴더명.rendering` 폴더를 사용합니다.
+완료·검증 뒤에만 사용자가 지정한 최종 이름으로 원자적으로 바뀌며, 실패·취소 시 불완전한
+진행 파일은 제거됩니다. Render Queue 상태도 최종 이동이 끝난 뒤에만 DONE이 됩니다.
+큐 항목을 우클릭해 macOS에서는 `Open in Finder`, Windows에서는
+`Open in File Explorer`로 완료 파일 또는 현재 진행 파일의 위치를 바로 열 수 있습니다.
 
 Render Queue의 각 행은 사진 스냅숏이 아니라 타임라인의 `Settings lock`입니다. 소스 경로,
 소스 순서, 정확한 FPS, TC 정렬, IN/OUT, 카메라 보정, 캔버스, OCIO, 코덱과 출력 경로를
@@ -529,12 +551,18 @@ Apple EDR/sRGB-piecewise 모니터 인코딩이며 ST2084/PQ 파일 납품이 �
 scene/log 인코딩을 내보낼 때는 `Delivery method: Color space / Log`에서 맨 위에 배치된
 `V-Log V-Gamut`을 선택합니다.
 
-`COLOR > Viewer monitor`는 로컬 검수 화면에만 적용됩니다. 일반 SDR 모니터에서는
-`Standard Rec.709`를 사용합니다. 내부 ACES 변환은 표준 SDR 기준 ODT를 사용하지만 UI에서는
-모니터의 별도 nit 프로파일을 요구하지 않습니다.
-최종 Delivery가 P3-PQ/Rec.2020-PQ 1000 nits 또는 V-Log여도 Quick Preview와 재생 프록시만
-선택한 SDR 모니터 변환을 사용합니다. Viewer 설정은 최종 렌더 config와 Render Queue의
-Settings lock에 기록되지 않으므로 이미 큐에 넣은 납품 컬러스페이스를 바꾸지 않습니다.
+`COLOR > Viewer monitor`는 로컬 검수 화면에만 적용되며 최종 렌더에는 관여하지 않습니다.
+
+- `Standard Rec.709`: SDR 모니터에서 **납품 신호를 그대로** 봅니다. Delivery가
+  P3-PQ/Rec.2020-PQ이면 SDR에서 어둡고 비정상적으로 보일 수 있고, V-Log이면 평평한 Log 신호로
+  보이는 것이 정상입니다. HDR/Log 변환이 실제로 적용됐는지 빠르게 확인할 때 사용합니다.
+- `Rec.709 · ACES tone map`: HDR 납품 신호를 ACES SDR ODT로 정규화해 일반 모니터에서 보기 좋은
+  검수 화면을 만듭니다. 이것은 프리뷰 전용이며 납품 파일을 Rec.709로 바꾸지 않습니다.
+- `Match delivery target`: 납품 디스플레이와 같은 OCIO View를 사용합니다. 해당 HDR 디스플레이가
+  실제 연결·설정된 경우에 사용합니다.
+
+Viewer 설정은 최종 렌더 config와 Render Queue의 Settings lock에 기록되지 않으므로 이미 큐에
+넣은 P3-PQ, Rec.2020-PQ, V-Log 등의 납품 컬러스페이스를 바꾸지 않습니다.
 
 ```powershell
 .\.venv\Scripts\vpstitch.exe list-ocio-spaces `

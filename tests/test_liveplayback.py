@@ -262,7 +262,15 @@ def test_live_session_reuses_decoded_frame_across_setting_changes(
     decoder_positions = tuple(decoder.frame for decoder in _FakeDecoder.instances)
     changed = replace(
         config,
-        output=replace(config.output, seam_feather_deg=7.0),
+        color=replace(
+            config.color,
+            match_enabled=True,
+            match_strength=0.85,
+        ),
+        cameras=(
+            replace(config.cameras[0], color_gain=(1.03, 0.99, 1.01)),
+            *config.cameras[1:],
+        ),
     )
     assert session.can_reconfigure(sources, changed, plan)
     session.reconfigure(changed)

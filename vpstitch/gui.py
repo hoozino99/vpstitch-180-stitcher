@@ -204,6 +204,11 @@ INPUT_VIDEO_RANGES = (
 VIEWER_MONITOR_TRANSFORMS = {
     "sdr-rec709": (
         "Standard Rec.709",
+        None,
+        None,
+    ),
+    "sdr-rec709-aces": (
+        "Rec.709 · ACES tone map",
         "sRGB - Display",
         "ACES 2.0 - SDR 100 nits (Rec.709)",
     ),
@@ -663,6 +668,40 @@ def render_queue_status_text(
     if eta_seconds is None:
         return f"{percent:.1f}% · EST" + elapsed
     return f"{percent:.1f}% · {format_render_duration(eta_seconds)} LEFT" + elapsed
+
+
+def file_manager_reveal_command(
+    path: str | Path,
+    *,
+    platform: str | None = None,
+) -> tuple[str, list[str]]:
+    """Return the native command that reveals a render or opens its folder."""
+    target = Path(path).expanduser()
+    target_exists = target.exists()
+    is_file = target_exists and target.is_file()
+    folder = target if target_exists and target.is_dir() else target.parent
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        return (
+            ("open", ["-R", str(target)])
+            if is_file
+            else ("open", [str(folder)])
+        )
+    if platform == "win32":
+        return (
+            ("explorer.exe", ["/select,", str(target)])
+            if is_file
+            else ("explorer.exe", [str(folder)])
+        )
+    return "xdg-open", [str(folder)]
+
+
+def reveal_in_file_manager(path: str | Path) -> bool:
+    program, arguments = file_manager_reveal_command(path)
+    started = QProcess.startDetached(program, arguments)
+    if isinstance(started, tuple):
+        return bool(started[0])
+    return bool(started)
 
 
 def ocio_space_names(identifier: str) -> tuple[str, ...]:
@@ -5930,13 +5969,20 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Output already exists: {output}")
 
     @staticmethod
-    def _render_staging_path(output: Path, codec: str, token: str) -> Path:
-        safe_token = re.sub(r"[^A-Za-z0-9_-]+", "-", token)[:32]
+    def _render_staging_path(output: Path, codec: str) -> Path:
+        """Return a visible, incomplete render artifact beside the final output."""
         if codec.endswith("sequence"):
-            return output.with_name(f".{output.name}.vpstitch-part-{safe_token}")
-        return output.with_name(
-            f".{output.stem}.vpstitch-part-{safe_token}{output.suffix}"
-        )
+            return output.with_name(f"{output.name}.rendering")
+        return output.with_name(f"{output.stem}.rendering{output.suffix}")
+
+    @staticmethod
+    def _create_render_staging(path: Path, codec: str) -> None:
+        """Make the in-progress artifact visible as soon as rendering starts."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if codec.endswith("sequence"):
+            path.mkdir()
+        else:
+            path.touch(exist_ok=False)
 
     @staticmethod
     def _discard_render_staging(path: Path) -> None:
@@ -6739,11 +6785,13 @@ class MainWindow(QMainWindow):
         self.viewer_monitor.currentIndexChanged.connect(
             self._viewer_monitor_changed
         )
-        self.viewer_status = QLabel(
-            "Managed Rec.709 viewer · delivery and Render Queue stay unchanged."
-        )
+        self.viewer_status = QLabel()
         self.viewer_status.setProperty("muted", True)
         self.viewer_status.setWordWrap(True)
+        # Synchronize the initial explanation with the persisted monitor mode.
+        # Without this call, a restored Standard Rec.709 selection displayed the
+        # legacy colorimetric-viewer message until the operator changed it.
+        self._viewer_monitor_changed()
         self.integer_dither = QCheckBox("TPDF dither for integer masters")
         self.delivery_status = QLabel("Scene/log or managed display output.")
         self.delivery_status.setProperty("muted", True)
@@ -7104,6 +7152,54 @@ class MainWindow(QMainWindow):
             QLabel#sourceStatus { color:#8a8f98; font-size:10px; }
             QLabel#autosaveStatus { color:#10b981; font-size:9px; padding:0 8px; }
             QScrollArea { border:0; background:transparent; }
+            QScrollBar:vertical {
+                background:#0f1011;
+                width:10px;
+                margin:0;
+                border:0;
+            }
+            QScrollBar::handle:vertical {
+                background:#3e3e44;
+                min-height:28px;
+                margin:2px;
+                border:0;
+                border-radius:3px;
+            }
+            QScrollBar::handle:vertical:hover { background:#62666d; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                width:0;
+                height:0;
+                background:transparent;
+                border:0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background:transparent;
+                border:0;
+            }
+            QScrollBar:horizontal {
+                background:#0f1011;
+                height:10px;
+                margin:0;
+                border:0;
+            }
+            QScrollBar::handle:horizontal {
+                background:#3e3e44;
+                min-width:28px;
+                margin:2px;
+                border:0;
+                border-radius:3px;
+            }
+            QScrollBar::handle:horizontal:hover { background:#62666d; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width:0;
+                height:0;
+                background:transparent;
+                border:0;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background:transparent;
+                border:0;
+            }
             QSplitter#workspaceSplitter::handle:horizontal {
                 background:rgba(255,255,255,0.08);
                 margin:9px 2px;
@@ -8304,10 +8400,14 @@ class MainWindow(QMainWindow):
         for source in playback_sources:
             stat = Path(source).stat()
             playback_fingerprints.append((source, stat.st_size, stat.st_mtime_ns))
+        viewer_key = str(self.viewer_monitor.currentData() or "sdr-rec709")
         payload = {
-            "playback_pipeline": 2,
+            # v4 invalidates proxies made before Standard Rec.709 became a raw
+            # delivery-signal monitor instead of an implicit SDR replacement.
+            "playback_pipeline": 4,
             "config": config,
-            "viewer_monitor": str(self.viewer_monitor.currentData() or "sdr-rec709"),
+            "viewer_monitor": viewer_key,
+            "viewer_transform": VIEWER_MONITOR_TRANSFORMS.get(viewer_key),
             "sources": fingerprints,
             "playback_sources": playback_fingerprints,
             "alignment": self._tc_alignment,
@@ -9030,13 +9130,21 @@ class MainWindow(QMainWindow):
             self.viewer_status.setText(
                 "Raw delivery target · HDR/log will look incorrect on this Rec.709 screen."
             )
+        elif key == "sdr-rec709-aces":
+            self.viewer_status.setText(
+                "ACES SDR tone map · preview only; delivery remains unchanged."
+            )
         else:
             self.viewer_status.setText(
-                "Managed Rec.709 viewer · delivery and Render Queue stay unchanged."
+                "Rec.709 monitor · raw delivery signal; HDR/log should look unnormalized."
             )
         if self._loading_config or not self.config_data:
             return
-        self._schedule_live_preview("Viewer monitor updated", immediate=True)
+        self._schedule_live_preview(
+            "Viewer monitor updated",
+            immediate=True,
+            rebuild_playback_cache=False,
+        )
 
     def _apply_viewer_transform(
         self, raw: dict[str, object]
@@ -9046,14 +9154,22 @@ class MainWindow(QMainWindow):
         key = str(self.viewer_monitor.currentData() or "sdr-rec709")
         color = preview.get("color")
         if (
-            key == "delivery"
+            key in {"delivery", "sdr-rec709"}
             or not isinstance(color, dict)
             or color.get("mode") != "ocio"
         ):
+            # A standard SDR monitor must receive the exact delivery-encoded
+            # pixels for an operator to see that PQ/HLG/log output is not an
+            # SDR image.  Replacing the delivery transform with Rec.709 here
+            # hid every delivery-space change and made P3 PQ and V-Log appear
+            # like the same normalized SDR preview.  Only the explicit ACES
+            # tone-map option below is allowed to override delivery.
             return preview
         _label, display, view = VIEWER_MONITOR_TRANSFORMS.get(
             key, VIEWER_MONITOR_TRANSFORMS["sdr-rec709"]
         )
+        if not display or not view:
+            return preview
         displays = ocio_display_views(str(color.get("ocio_config") or ""))
         if display not in displays or view not in displays.get(display, ()):
             raise ValueError(
@@ -9144,7 +9260,10 @@ class MainWindow(QMainWindow):
     def _color_match_setting_changed(self, *_args) -> None:
         if self._loading_config or not self.config_data:
             return
-        self._schedule_live_preview("Camera match updated")
+        self._schedule_live_preview(
+            "Camera match updated",
+            rebuild_playback_cache=False,
+        )
 
     def reset_color_match(self) -> None:
         cameras = self.config_data.get("cameras")
@@ -9259,7 +9378,7 @@ class MainWindow(QMainWindow):
         self._schedule_live_preview(
             message,
             immediate=True,
-            cache_delay_ms=2500,
+            rebuild_playback_cache=False,
         )
 
     def _schedule_live_preview(
@@ -9268,10 +9387,19 @@ class MainWindow(QMainWindow):
         *,
         immediate: bool = False,
         cache_delay_ms: int = 1400,
+        rebuild_playback_cache: bool = True,
     ) -> None:
         """Debounce inspector changes and update the in-memory draft frame."""
         if self._loading_config or self._closing or not self.config_data:
             return
+        if not rebuild_playback_cache:
+            # Color is evaluated by the live renderer from the already decoded
+            # source frames.  Re-encoding every timeline frame here made a
+            # fixed camera gain or viewer change scale with clip duration.
+            self._playback_warmup_timer.stop()
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
+            self._playback_autostart = False
         if (
             self.process is not None
             and self._process_task_name == "BUILD PLAYBACK PROXY"
@@ -9295,7 +9423,11 @@ class MainWindow(QMainWindow):
         else:
             self.preview_note.setText(f"{message} · updating draft…")
         self._live_preview_timer.start(0 if immediate else 40)
-        if self._tc_alignment and not self._plate_move_mode:
+        if (
+            rebuild_playback_cache
+            and self._tc_alignment
+            and not self._plate_move_mode
+        ):
             # Rebuild only after the controls have been idle for a moment. This
             # keeps slider/drag feedback interactive while ensuring Space does
             # not remain on the slower frame-by-frame fallback indefinitely.
@@ -9704,6 +9836,7 @@ class MainWindow(QMainWindow):
             self._schedule_live_preview(
                 "Plate input color space updated",
                 immediate=True,
+                rebuild_playback_cache=False,
             )
         self.statusBar().showMessage(
             f"Input settings applied to {len(selected_paths)} clip(s)", 8000
@@ -9930,6 +10063,15 @@ class MainWindow(QMainWindow):
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return destination
 
+    def _live_color_playback_required(self) -> bool:
+        """Return whether playback must apply camera color dynamically."""
+        return bool(
+            hasattr(self, "color_mode")
+            and self.color_mode.currentData() == "ocio"
+            and hasattr(self, "color_match_enabled")
+            and self.color_match_enabled.isChecked()
+        )
+
     def _request_playback_warmup(
         self,
         *,
@@ -9938,6 +10080,12 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Coalesce a low-resolution proxy build after interactive work finishes."""
         if self._closing or not self._tc_alignment:
+            return
+        if self._live_color_playback_required():
+            self._playback_warmup_timer.stop()
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
+            self._playback_autostart = False
             return
         self._auto_cache_requested = True
         if autoplay:
@@ -9954,6 +10102,11 @@ class MainWindow(QMainWindow):
         if not self._tc_alignment or self._loading_timeline:
             self._auto_cache_requested = False
             self._pending_playback_request = False
+            return
+        if self._live_color_playback_required():
+            self._auto_cache_requested = False
+            self._pending_playback_request = False
+            self._playback_autostart = False
             return
         if self.process is not None:
             self._auto_cache_requested = True
@@ -10310,11 +10463,20 @@ class MainWindow(QMainWindow):
         job = self._selected_queue_job()
         menu = QMenu(self)
         load = menu.addAction("Load Timeline", self.load_selected_queue_job)
+        reveal_label = (
+            "Open in Finder"
+            if sys.platform == "darwin"
+            else "Open in File Explorer"
+            if sys.platform == "win32"
+            else "Open Containing Folder"
+        )
+        reveal = menu.addAction(reveal_label, self.open_selected_queue_output)
         render = menu.addAction("Render Selected", self.render_selected_queue_job)
         menu.addSeparator()
         remove = menu.addAction("Remove from Queue", self.remove_selected_queue_job)
         enabled = job is not None
         load.setEnabled(enabled)
+        reveal.setEnabled(enabled)
         render.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
         remove.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
         menu.exec(self.queue_table.viewport().mapToGlobal(position))
@@ -10529,6 +10691,18 @@ class MainWindow(QMainWindow):
         self.render_queue.remove(job.id)
         self._refresh_queue_table()
 
+    def open_selected_queue_output(self) -> None:
+        job = self._selected_queue_job()
+        if job is None:
+            self.statusBar().showMessage("Select a timeline in Render Queue", 5000)
+            return
+        output = Path(job.output_path)
+        codec = str(job.config_snapshot.get("video", {}).get("output_codec", ""))
+        staging = self._render_staging_path(output, codec)
+        target = output if output.exists() else staging if staging.exists() else output
+        if not reveal_in_file_manager(target):
+            self._error("Render queue", f"Could not open output folder: {target.parent}")
+
     def load_selected_queue_job(self, *_args) -> None:  # type: ignore[no-untyped-def]
         job = self._selected_queue_job()
         if job is None:
@@ -10601,12 +10775,13 @@ class MainWindow(QMainWindow):
             output = Path(job.output_path)
             codec = str(job.config_snapshot.get("video", {}).get("output_codec", ""))
             self._prepare_output_destination(output, codec)
-            staging = self._render_staging_path(output, codec, job.id)
+            staging = self._render_staging_path(output, codec)
             self._discard_render_staging(staging)
             for source in job.source_paths:
                 if not Path(source).is_file():
                     raise ValueError(f"Source is missing: {source}")
             config_path, alignment_path, sources = self._materialize_queue_job(job)
+            self._create_render_staging(staging, codec)
         except Exception as error:
             self.render_queue.update(
                 job.id, status=RenderStatus.FAILED, error=str(error)
@@ -10746,11 +10921,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("Choose a 10-bit or 12-bit master codec")
             output_path = Path(output)
             self._prepare_output_destination(output_path, codec)
-            staging = self._render_staging_path(
-                output_path,
-                codec,
-                f"current-{time.time_ns()}",
-            )
+            staging = self._render_staging_path(output_path, codec)
             self._discard_render_staging(staging)
             config = self._write_working_config()
         except Exception as error:
@@ -10778,6 +10949,11 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._create_render_staging(staging, codec)
+        except Exception as error:
+            self._error("Render", str(error))
             return
         arguments = [
             "stitch-video",
@@ -11424,7 +11600,10 @@ class MainWindow(QMainWindow):
     def _color_pipeline_setting_changed(self, *_args) -> None:
         if self._loading_config or not self.config_data:
             return
-        self._schedule_live_preview("Color pipeline updated")
+        self._schedule_live_preview(
+            "Color pipeline updated",
+            rebuild_playback_cache=False,
+        )
 
     def _update_color_controls(self) -> None:
         enabled = self.color_mode.currentData() == "ocio"

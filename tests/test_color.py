@@ -36,6 +36,68 @@ def test_display_view_pipeline_builds_and_processes_hdr_pixels() -> None:
     assert not np.allclose(output, original)
 
 
+def test_standard_srgb_viewer_is_a_colorimetric_round_trip() -> None:
+    settings = Color(
+        mode="ocio",
+        ocio_config=BUNDLED_ACES_STUDIO_ID,
+        working_space="ACEScct",
+        output_mode="display_view",
+        display="sRGB - Display",
+        view="Video (colorimetric)",
+    )
+    pipeline = ColorPipeline(settings, ["sRGB - Display"])
+    source = np.array(
+        [
+            [[0.18, 0.18, 0.18], [0.9, 0.2, 0.1]],
+            [[0.1, 0.8, 0.2], [1.0, 1.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    output = pipeline.working_to_output(pipeline.input_to_working(0, source))
+
+    np.testing.assert_allclose(output, source, rtol=0.0, atol=4e-5)
+
+
+def test_pq_and_vlog_delivery_signals_remain_visibly_distinct_from_rec709() -> None:
+    ramp = np.linspace(0.0, 1.0, 33, dtype=np.float32)
+    source = np.stack([ramp, ramp, ramp], axis=-1)[None, :, :]
+    common = {
+        "mode": "ocio",
+        "ocio_config": BUNDLED_ACES_STUDIO_ID,
+        "working_space": "ACEScg",
+        "integer_dither": False,
+    }
+    settings = {
+        "rec709": Color(
+            **common,
+            output_mode="display_view",
+            display="sRGB - Display",
+            view="Video (colorimetric)",
+        ),
+        "p3pq": Color(
+            **common,
+            output_mode="display_view",
+            display="ST2084-P3-D65 - Display",
+            view="ACES 2.0 - HDR 1000 nits (P3 D65)",
+        ),
+        "vlog": Color(
+            **common,
+            output_mode="colorspace",
+            output_space="V-Log V-Gamut",
+        ),
+    }
+    outputs: dict[str, np.ndarray] = {}
+    for name, color in settings.items():
+        pipeline = ColorPipeline(color, ["Camera Rec.709"])
+        working = pipeline.input_to_working(0, source.copy())
+        outputs[name] = pipeline.working_to_output(working)
+
+    assert np.max(np.abs(outputs["rec709"] - outputs["p3pq"])) > 0.4
+    assert np.max(np.abs(outputs["rec709"] - outputs["vlog"])) > 0.3
+    assert np.max(np.abs(outputs["p3pq"] - outputs["vlog"])) > 0.1
+
+
 def test_camera_match_gain_is_applied_in_scene_linear_space_with_strength() -> None:
     source = np.array([[[0.1, 0.2, 0.3]]], dtype=np.float32)
     base_settings = Color(
