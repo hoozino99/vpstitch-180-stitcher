@@ -375,6 +375,9 @@ class Stitcher:
                 longitude,
                 valid_masks,
                 self.config.output.seam_feather_deg,
+                self.config.output.seam_paths_deg,
+                row_start=render_tile.y,
+                canvas_height=self.config.output.height,
             )
             render_indices = (
                 list(range(len(weights)))

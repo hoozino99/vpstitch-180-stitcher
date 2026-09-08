@@ -22,6 +22,10 @@ class PairAlignment:
     inlier_ratio: float
     rms_angular_error_deg: float
     correction_from_initial_deg: float
+    fit_region: str = "overlap"
+    seam_matches: int = 0
+    seam_median_before_deg: float | None = None
+    seam_median_after_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,57 @@ def rotation_to_yaw_pitch_roll(rotation: np.ndarray) -> tuple[float, float, floa
     return tuple(float(value) for value in np.rad2deg([yaw, pitch, roll]))  # type: ignore[return-value]
 
 
+def _refine_seam_rotation(
+    left_rays: np.ndarray,
+    right_rays: np.ndarray,
+    left_camera: Camera,
+    right_camera: Camera,
+    rotation: np.ndarray,
+    half_width_deg: float,
+    threshold_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float] | None:
+    """Prefer a supported rotation at the visible blend, with a global fallback.
+
+    A wide overlap can contain multiple parallax depths and lens residuals.
+    Maximizing its total inlier count may leave a double edge at the actual
+    seam. Refine only when a majority of enough seam-local correspondences
+    support a substantially better fit; keep one fixed rotation for the clip.
+    """
+    world = left_rays @ camera_to_world(left_camera).T
+    world += right_rays @ camera_to_world(right_camera).T
+    longitude = np.rad2deg(np.arctan2(world[:, 0], world[:, 2]))
+    seam = (left_camera.yaw_deg + right_camera.yaw_deg) * 0.5
+    distance = np.abs((longitude - seam + 180.0) % 360.0 - 180.0)
+    region = distance <= half_width_deg
+    if np.count_nonzero(region) < 30:
+        return None
+    left, right = left_rays[region], right_rays[region]
+    try:
+        refined, inliers, _ = robust_rotation(
+            left, right, threshold_deg=min(threshold_deg, 0.2)
+        )
+    except CalibrationError:
+        return None
+    if np.count_nonzero(inliers) < 25 or np.mean(inliers) < 0.5:
+        return None
+    # Avoid accepting a distant alternative model or a fit supported only by
+    # a tiny patch with too little angular extent to constrain orientation.
+    support = left[inliers]
+    angles = np.rad2deg(np.arctan2(support[:, :2], support[:, 2:3]))
+    extent = np.ptp(angles, axis=0)
+    if extent[0] < 1.0 or extent[1] < 0.25:
+        return None
+    before = float(np.rad2deg(np.median(angular_residuals(rotation, left, right))))
+    after = float(np.rad2deg(np.median(angular_residuals(refined, left, right))))
+    if (
+        _rotation_distance_deg(rotation, refined) > 2.0
+        or before < 0.03
+        or after >= before * 0.8
+    ):
+        return None
+    return refined, region, inliers, before, after
+
+
 def _pair_rotation(
     left_camera: Camera,
     right_camera: Camera,
@@ -214,6 +269,7 @@ def _pair_rotation(
     ratio: float,
     threshold_deg: float,
     max_correction_deg: float,
+    seam_half_width_deg: float | None = None,
 ) -> tuple[np.ndarray, PairAlignment]:
     left_keypoints, left_descriptors = left_features
     right_keypoints, right_descriptors = right_features
@@ -235,6 +291,24 @@ def _pair_rotation(
             f"{left_camera.name}/{right_camera.name}: unstable alignment "
             f"({inlier_count}/{len(matches)} inliers)"
         )
+    fit_region = "overlap"
+    seam_matches = 0
+    seam_before = seam_after = None
+    match_count = len(matches)
+    if seam_half_width_deg is not None:
+        refinement = _refine_seam_rotation(
+            left_rays, right_rays, left_camera, right_camera, rotation,
+            seam_half_width_deg, threshold_deg,
+        )
+        if refinement is not None:
+            rotation, region, inliers, seam_before, seam_after = refinement
+            match_count = seam_matches = int(np.count_nonzero(region))
+            inlier_count = int(np.count_nonzero(inliers))
+            residuals = angular_residuals(
+                rotation, left_rays[region][inliers], right_rays[region][inliers]
+            )
+            rms = float(np.rad2deg(np.sqrt(np.mean(residuals**2))))
+            fit_region = "seam"
     initial_left = camera_to_world(left_camera)
     initial_right = camera_to_world(right_camera)
     initial_relative = initial_right.T @ initial_left
@@ -247,11 +321,15 @@ def _pair_rotation(
     return rotation, PairAlignment(
         left_camera=left_camera.name,
         right_camera=right_camera.name,
-        matches=len(matches),
+        matches=match_count,
         inliers=inlier_count,
-        inlier_ratio=inlier_count / len(matches),
+        inlier_ratio=inlier_count / match_count,
         rms_angular_error_deg=rms,
         correction_from_initial_deg=correction,
+        fit_region=fit_region,
+        seam_matches=seam_matches,
+        seam_median_before_deg=seam_before,
+        seam_median_after_deg=seam_after,
     )
 
 
@@ -263,6 +341,7 @@ def calibrate_rig_rotation(
     match_ratio: float = 0.72,
     angular_threshold_deg: float = 1.25,
     max_correction_deg: float = 12.0,
+    seam_aware: bool = False,
 ) -> tuple[list[np.ndarray], RigAlignment]:
     if len(image_paths) != len(config.cameras):
         raise CalibrationError(
@@ -284,6 +363,18 @@ def calibrate_rig_rotation(
             match_ratio,
             angular_threshold_deg,
             max_correction_deg,
+            seam_half_width_deg=(
+                max(
+                    4.0,
+                    config.cameras[index].feather_right_deg
+                    if config.cameras[index].feather_right_deg is not None
+                    else config.output.seam_feather_deg,
+                    config.cameras[index + 1].feather_left_deg
+                    if config.cameras[index + 1].feather_left_deg is not None
+                    else config.output.seam_feather_deg,
+                )
+                if seam_aware else None
+            ),
         )
         pair_rotations.append(rotation)
         pair_reports.append(report)

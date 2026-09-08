@@ -177,3 +177,20 @@ def test_per_camera_feather_overrides_global_width() -> None:
     weights = seam_weights(cameras, longitude, valid, feather_deg=8.0)
     assert weights[1][0, 450] < 0.01
     assert weights[1][0, 550] > 0.99
+
+
+def test_fixed_seam_path_has_identical_weights_across_render_tiles() -> None:
+    cameras = (_camera("left", -20), _camera("right", 20))
+    longitude = np.broadcast_to(np.deg2rad(np.linspace(-20, 20, 101)), (80, 101))
+    valid = [np.ones_like(longitude, dtype=bool) for _ in cameras]
+    path = ((-8.0, 4.0, 9.0, -3.0),)
+    full = seam_weights(cameras, longitude, valid, 1.0, path, canvas_height=80)
+    for y0, y1 in [(0, 25), (25, 61), (61, 80)]:
+        tiled = seam_weights(
+            cameras, longitude[y0:y1], [m[y0:y1] for m in valid],
+            1.0, path, row_start=y0, canvas_height=80,
+        )
+        for index in range(2):
+            assert np.array_equal(full[index][y0:y1], tiled[index])
+    assert np.allclose(full[0] + full[1], 1.0)
+    assert not np.allclose(full[0][0], full[0][40])

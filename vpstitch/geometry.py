@@ -220,10 +220,25 @@ def seam_weights(
     longitude: np.ndarray,
     valid_masks: list[np.ndarray],
     feather_deg: float,
+    seam_paths_deg: tuple[tuple[float, ...], ...] | None = None,
+    *,
+    row_start: int = 0,
+    canvas_height: int | None = None,
 ) -> list[np.ndarray]:
     order = np.argsort([camera.yaw_deg for camera in cameras])
     yaws = np.deg2rad(np.array([cameras[i].yaw_deg for i in order], dtype=np.float64))
-    boundaries = (yaws[:-1] + yaws[1:]) * 0.5
+    boundaries: list[float | np.ndarray] = list((yaws[:-1] + yaws[1:]) * 0.5)
+    if seam_paths_deg is not None:
+        if len(seam_paths_deg) != len(cameras) - 1:
+            raise ValueError("one seam path is required per adjacent camera pair")
+        height = canvas_height if canvas_height is not None else longitude.shape[0]
+        # Sample by full-canvas row centers so preview, tile cores and halos
+        # share precisely the same path. The path is fixed for the whole clip.
+        rows = (np.arange(longitude.shape[0]) + row_start + 0.5) / height
+        boundaries = [
+            np.deg2rad(np.interp(rows, np.linspace(0.0, 1.0, len(path)), path))[:, None]
+            for path in seam_paths_deg
+        ]
     weights_ordered: list[np.ndarray] = []
 
     for rank, camera_index in enumerate(order):

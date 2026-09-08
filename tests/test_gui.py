@@ -487,6 +487,29 @@ def test_gui_loads_sample_rig() -> None:
     app.processEvents()
 
 
+def test_gui_reset_seam_path_preserves_color_and_camera_geometry(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    raw = json.loads(Path("configs/five_cam_180.sample.json").read_text())
+    raw["output"]["seam_paths_deg"] = [
+        [(a["yaw_deg"] + b["yaw_deg"]) / 2] * 2
+        for a, b in zip(raw["cameras"], raw["cameras"][1:])
+    ]
+    path = tmp_path / "fixed-seams.json"
+    path.write_text(json.dumps(raw))
+    window = MainWindow()
+    window.load_config(path)
+    geometry = json.dumps(window.config_data["cameras"], sort_keys=True)
+    color = json.dumps(window.config_data["color"], sort_keys=True)
+    assert window.reset_seam_path_button.isEnabled()
+    window.reset_seam_path_button.click()
+    assert "seam_paths_deg" not in window.config_data["output"]
+    assert not window.reset_seam_path_button.isEnabled()
+    assert json.dumps(window.config_data["cameras"], sort_keys=True) == geometry
+    assert json.dumps(window.config_data["color"], sort_keys=True) == color
+    window.close()
+    app.processEvents()
+
+
 def test_gui_full_plate_fit_updates_manual_canvas_controls() -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
@@ -1346,22 +1369,22 @@ def test_gui_uses_compact_resolve_style_workspace() -> None:
     assert window.findChild(QToolBar) is None
     assert not window.inspector_panel.isHidden()
     assert window.right_tabs.currentIndex() == 0
-    assert window.right_tabs.tabText(1) == "RENDER QUEUE"
-    assert window.right_tabs.tabText(2) == "TASK LOG"
+    assert window.right_tabs.tabText(1) == "Render queue"
+    assert window.right_tabs.tabText(2) == "Task log"
     assert window.media_tree.topLevelItemCount() == 1
     assert window.timeline_tree.topLevelItemCount() == 0
-    assert window.new_timeline_button.text() == "NEW TIMELINE"
-    assert window.render_selected_queue_button.text() == "RENDER SELECTED"
-    assert window.render_all_queue_button.text() == "RENDER ALL"
+    assert window.new_timeline_button.text() == "New timeline…"
+    assert window.render_selected_queue_button.text() == "Render selected"
+    assert window.render_all_queue_button.text() == "Render pending"
     assert window.queue_table.columnCount() == 4
     assert [
         window.queue_table.horizontalHeaderItem(column).text()
         for column in range(4)
-    ] == ["TIMELINE", "FPS", "FORMAT", "STATUS / ETA"]
+    ] == ["Timeline", "FPS", "Format", "Status / ETA"]
     assert window.media_tree.selectionMode().name == "ExtendedSelection"
-    assert window.import_button.text() == "IMPORT"
-    assert window.assign_media_button.text() == "ASSIGN SELECTED"
-    assert window.rig_align_button.text() == "STITCH"
+    assert window.import_button.text() == "Import…"
+    assert window.assign_media_button.text() == "Assign selected"
+    assert window.rig_align_button.text() == "Auto stitch"
     assert window.add_queue_button.objectName() == "primaryButton"
     assert window.render_button.objectName() == "secondaryButton"
     assert window.source_table.isColumnHidden(3)
@@ -2926,7 +2949,7 @@ def test_toggle_playback_prefers_ready_live_source_proxy() -> None:
     window.toggle_playback()
 
     assert requested == [(window.timeline_playhead.value(), True, 1)]
-    assert window.playback_button.text() == "Ⅱ  PAUSE"
+    assert window.playback_button.text() == "Pause"
     window.close()
     app.processEvents()
 
@@ -3150,7 +3173,7 @@ def test_plate_inspector_persists_transform_crop_and_feather_per_timeline(
     assert camera["feather_left_deg"] == 2.5
     assert camera["feather_right_deg"] == 6.0
     assert camera["lens"]["distortion"][:2] == [0.0125, -0.001]
-    assert window.settings_tabs.tabText(window.settings_tabs.currentIndex()) == "PLATE"
+    assert window.settings_tabs.tabText(window.settings_tabs.currentIndex()) == "Plate"
 
     window._reset_selected_plate()
     window._live_preview_timer.stop()

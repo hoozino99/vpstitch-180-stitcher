@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import argparse
 import difflib
 import hashlib
 import json
@@ -127,6 +128,7 @@ from .sourcecache import (
     source_proxy_ready,
 )
 from .liveplayback import AlignedFramePlan, LivePlaybackSession
+from .theme import WORKSPACE_STYLE
 
 
 APP_NAME = "VP Stitch"
@@ -1085,7 +1087,8 @@ class PreviewView(QGraphicsView):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._empty = QLabel("P06–P08 또는 P01–P05를 넣고 QUICK PREVIEW를 누르세요")
+        self._empty = QLabel("Create a timeline to start\n\nImport 3 or 5 camera clips, then assign them to the timeline.")
+        self._empty.setWordWrap(True)
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setStyleSheet("color:#8a8f98; font-size:13px; letter-spacing:.5px;")
         self._empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -1113,11 +1116,15 @@ class PreviewView(QGraphicsView):
 
     def set_image(self, image: QImage) -> None:
         pixmap = QPixmap.fromImage(image)
-        self.scene().clear()
-        self._item = self.scene().addPixmap(pixmap)
-        self.scene().setSceneRect(self._item.boundingRect())
+        resized = self._item is None or self._item.pixmap().size() != pixmap.size()
+        if self._item is None:
+            self._item = self.scene().addPixmap(pixmap)
+        else:
+            self._item.setPixmap(pixmap)
+        if resized:
+            self.scene().setSceneRect(self._item.boundingRect())
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
         self._empty.hide()
-        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def set_move_overlay(self, active: bool, label: str = "") -> None:
         self._move_overlay_active = bool(active)
@@ -1238,10 +1245,10 @@ class TrimRangeBar(QWidget):
         painter.drawRoundedRect(left, center - 5.0, right - left, 10.0, 5.0, 5.0)
         lower_x = self._position(self._lower)
         upper_x = self._position(self._upper)
-        painter.setBrush(QColor("#5e6ad2") if self.isEnabled() else QColor("#34343a"))
+        painter.setBrush(QColor("#527d9d") if self.isEnabled() else QColor("#34343a"))
         painter.drawRoundedRect(lower_x, center - 6.0, upper_x - lower_x, 12.0, 5.0, 5.0)
         for position in (lower_x, upper_x):
-            painter.setBrush(QColor("#7170ff") if self.isEnabled() else QColor("#62666d"))
+            painter.setBrush(QColor("#91bdda") if self.isEnabled() else QColor("#62666d"))
             painter.drawRoundedRect(position - 4.0, center - 14.0, 8.0, 28.0, 3.0, 3.0)
         playhead_x = self._position(self._playhead)
         painter.setPen(QColor("#f0eef7") if self.isEnabled() else QColor("#707680"))
@@ -1788,7 +1795,7 @@ class ScrollableLibraryTree(QTreeWidget):
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#7170ff"), 1.5))
+        painter.setPen(QPen(QColor("#91bdda"), 1.5))
         painter.setBrush(QColor(30, 31, 35, 244))
         painter.drawRoundedRect(1, 1, width - 3, height - 3, 7, 7)
         current = self.currentItem()
@@ -2272,33 +2279,12 @@ class ProjectManagerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("VP Stitch · Project Manager")
         self.setMinimumSize(760, 500)
-        self.setStyleSheet(
-            """
-            QDialog, QWidget { background:#08090a; color:#f7f8f8; font-family:'Inter Variable','Inter','SF Pro Text','-apple-system','Segoe UI'; font-size:11px; }
-            QLabel { background:transparent; }
-            QTreeWidget { background:#0f1011; border:1px solid #23252a; border-radius:8px; }
-            QTreeWidget::item { min-height:28px; padding:3px 6px; }
-            QTreeWidget::item:selected { background:#28282c; color:#f7f8f8; }
-            QHeaderView::section { background:#0f1011; color:#8a8f98; border:0; border-bottom:1px solid #23252a; padding:6px; font-size:9px; font-weight:590; }
-            QLineEdit, QSpinBox, QComboBox { background:#191a1b; border:1px solid #34343a; border-radius:6px; padding:5px 7px; }
-            QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color:#7170ff; }
-            QPushButton { background:#191a1b; color:#d0d6e0; border:1px solid #23252a; border-radius:6px; padding:6px 10px; font-weight:510; }
-            QPushButton:hover { background:#28282c; border-color:#3e3e44; color:#f7f8f8; }
-            QPushButton#primaryButton { background:#5e6ad2; color:#f7f8f8; border-color:#7170ff; }
-            QPushButton#primaryButton:hover { background:#828fff; }
-            QPushButton#primaryButton:disabled {
-                background:#151617;
-                color:#62666d;
-                border-color:#23252a;
-            }
-            """
-        )
-        self.project_path: Path | None = None
+        self.setStyleSheet(WORKSPACE_STYLE)
         self.settings = _application_settings()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
-        title = QLabel("VP STITCH PROJECTS")
+        title = QLabel("Projects")
         title.setProperty("sectionTitle", True)
         layout.addWidget(title)
         note = QLabel(
@@ -2316,15 +2302,15 @@ class ProjectManagerDialog(QDialog):
         self.projects.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.projects, 1)
         actions = QHBoxLayout()
-        self.new_project_button = QPushButton("NEW PROJECT")
+        self.new_project_button = QPushButton("New project…")
         self.new_project_button.setObjectName("primaryButton")
         self.new_project_button.setAutoDefault(False)
         self.new_project_button.clicked.connect(self.create_project)
-        open_button = QPushButton("OPEN…")
+        open_button = QPushButton("Open…")
         open_button.setObjectName("secondaryButton")
         open_button.setAutoDefault(False)
         open_button.clicked.connect(self.open_existing)
-        self.open_selected_button = QPushButton("OPEN SELECTED")
+        self.open_selected_button = QPushButton("Open project")
         self.open_selected_button.setObjectName("primaryButton")
         self.open_selected_button.setAutoDefault(False)
         self.open_selected_button.clicked.connect(self.open_selected)
@@ -2431,7 +2417,7 @@ class ProjectManagerDialog(QDialog):
         output_view_label = QLabel("View")
         ocio_spaces_status = QLabel()
         ocio_spaces_status.setProperty("muted", True)
-        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces = QPushButton("Reload spaces")
         load_spaces.setObjectName("secondaryButton")
         ocio_row = QWidget()
         ocio_layout = QHBoxLayout(ocio_row)
@@ -2720,7 +2706,7 @@ class MainWindow(QMainWindow):
         self._render_progress_timer = QTimer(self)
         self._render_progress_timer.setInterval(1000)
         self._render_progress_timer.timeout.connect(self._refresh_render_clock)
-        self._process_output_buffer = ""
+        self._process_output_buffer = b""
         self._process_phase = ""
         self._process_frame_number: int | None = None
         self._process_frame_progress: tuple[int, int] | None = None
@@ -2859,7 +2845,7 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
         self.status_pill = QLabel("READY")
         self.status_pill.hide()
-        self.inspector_toggle = QPushButton("INSPECTOR")
+        self.inspector_toggle = QPushButton("Inspector")
         self.inspector_toggle.setObjectName("topButton")
         self.inspector_toggle.setCheckable(True)
         self.inspector_toggle.setChecked(True)
@@ -2904,15 +2890,15 @@ class MainWindow(QMainWindow):
         media_layout.setContentsMargins(11, 9, 11, 8)
         media_layout.setSpacing(6)
         media_header = QHBoxLayout()
-        media_title = QLabel("MEDIA POOL")
+        media_title = QLabel("Media")
         media_title.setProperty("sectionTitle", True)
         media_header.addWidget(media_title)
         media_header.addStretch()
-        self.new_bin_button = QPushButton("+ FOLDER")
+        self.new_bin_button = QPushButton("Folder…")
         self.new_bin_button.setObjectName("secondaryButton")
         self.new_bin_button.setToolTip("New folder")
         self.new_bin_button.clicked.connect(self.create_media_bin)
-        self.import_button = QPushButton("IMPORT")
+        self.import_button = QPushButton("Import…")
         self.import_button.setObjectName("primaryButton")
         self.import_button.setAccessibleName("Import Media")
         self.import_button.setAccessibleDescription(
@@ -2924,11 +2910,23 @@ class MainWindow(QMainWindow):
         media_header.addWidget(self.new_bin_button)
         media_layout.addLayout(media_header)
         self.media_hint = QLabel(
-            "Drag clips or folders to organize · drop on a folder to move inside."
+            "Drag clips here, or use Import."
         )
         self.media_hint.setWordWrap(True)
         self.media_hint.setProperty("muted", True)
         media_layout.addWidget(self.media_hint)
+
+        self.media_search = QLineEdit()
+        self.media_search.setPlaceholderText("Search clips or folders")
+        self.media_search.setAccessibleName("Search media")
+        self.media_search.setClearButtonEnabled(True)
+        self._media_filter_expanded: set[tuple[str, str]] | None = None
+        self._media_filter_timer = QTimer(self)
+        self._media_filter_timer.setSingleShot(True)
+        self._media_filter_timer.setInterval(150)
+        self._media_filter_timer.timeout.connect(self._filter_media_tree)
+        self.media_search.textChanged.connect(lambda _text: self._media_filter_timer.start())
+        media_layout.addWidget(self.media_search)
 
         self.media_tree = ScrollableLibraryTree()
         self.media_tree.setObjectName("mediaTree")
@@ -2946,7 +2944,7 @@ class MainWindow(QMainWindow):
         self.media_tree.itemSelectionChanged.connect(self._media_selection_changed)
         self.media_tree.moveRequested.connect(self._move_media_tree_items)
         self.media_tree.dragStatusChanged.connect(self._media_drag_status_changed)
-        self.media_tree.setAnimated(True)
+        self.media_tree.setAnimated(False)
         self.media_tree.setMouseTracking(True)
         self.media_tree.setMinimumHeight(120)
         self.media_tree.setVerticalScrollMode(
@@ -2970,11 +2968,11 @@ class MainWindow(QMainWindow):
         timeline_layout.setSpacing(6)
 
         timeline_header = QHBoxLayout()
-        timeline_title = QLabel("PLATE SETS")
+        timeline_title = QLabel("Timelines")
         timeline_title.setProperty("sectionTitle", True)
         timeline_header.addWidget(timeline_title)
         timeline_header.addStretch()
-        self.new_timeline_button = QPushButton("NEW TIMELINE")
+        self.new_timeline_button = QPushButton("New timeline…")
         self.new_timeline_button.setObjectName("secondaryButton")
         self.new_timeline_button.setToolTip(
             "Create a named 3-camera or 5-camera Plate Set timeline"
@@ -3024,13 +3022,13 @@ class MainWindow(QMainWindow):
         active_layout.setContentsMargins(11, 9, 11, 8)
         active_layout.setSpacing(6)
 
-        self.active_plates_title = QLabel("ACTIVE TIMELINE · NONE")
+        self.active_plates_title = QLabel("Active timeline")
         self.active_plates_title.setProperty("inspectorTitle", True)
         self.active_plates_title.setWordWrap(True)
         active_layout.addWidget(self.active_plates_title)
         active_layout.addWidget(self.source_table, 1)
         source_buttons = QHBoxLayout()
-        self.assign_media_button = QPushButton("ASSIGN SELECTED")
+        self.assign_media_button = QPushButton("Assign selected")
         self.assign_media_button.setObjectName("primaryButton")
         self.assign_media_button.setAccessibleName("Assign selected media")
         self.assign_media_button.setToolTip(
@@ -3039,7 +3037,7 @@ class MainWindow(QMainWindow):
         self.assign_media_button.clicked.connect(
             self.add_selected_media_to_active_timeline
         )
-        self.clear_button = QPushButton("REMOVE ALL")
+        self.clear_button = QPushButton("Clear plates")
         self.clear_button.setObjectName("secondaryButton")
         self.clear_button.setToolTip("Remove all assigned plates from this timeline")
         self.clear_button.clicked.connect(self.clear_sources)
@@ -3082,11 +3080,11 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(12, 10, 12, 7)
         preview_layout.setSpacing(7)
         preview_header = QHBoxLayout()
-        title = QLabel("PANORAMA VIEWER")
+        title = QLabel("Viewer")
         title.setProperty("sectionTitle", True)
-        self.preview_context = QLabel("NO TIMELINE OPEN")
+        self.preview_context = QLabel("No timeline open")
         self.preview_context.setProperty("muted", True)
-        preview_limit = QLabel("LIVE ADAPTIVE  ·  FINAL FULL QUALITY")
+        preview_limit = QLabel("Draft preview")
         preview_limit.setObjectName("previewLimit")
         preview_header.addWidget(title)
         preview_header.addSpacing(12)
@@ -3096,7 +3094,7 @@ class MainWindow(QMainWindow):
         preview_layout.addLayout(preview_header)
         preview_layout.addWidget(self.preview_stack, 1)
         self.preview_note = QLabel(
-            "Import builds lightweight source cache · TC Align enables synchronized playback"
+            "Assign camera clips, then Sync timecode to preview the common range."
         )
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_note.setProperty("muted", True)
@@ -3111,12 +3109,12 @@ class MainWindow(QMainWindow):
         self.settings_tabs = QTabWidget()
         self.settings_tabs.setMinimumWidth(0)
         self.settings_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.settings_tabs.addTab(self._stitch_settings(), "RIG")
+        self.settings_tabs.addTab(self._stitch_settings(), "Canvas")
         self._plate_settings_index = self.settings_tabs.addTab(
-            self._plate_settings(), "PLATE"
+            self._plate_settings(), "Plate"
         )
-        self.settings_tabs.addTab(self._color_settings(), "COLOR")
-        self.settings_tabs.addTab(self._output_settings(), "DELIVER")
+        self.settings_tabs.addTab(self._color_settings(), "Color")
+        self.settings_tabs.addTab(self._output_settings(), "Output")
         settings_scroll.setWidget(self.settings_tabs)
 
         inspector_page = QWidget()
@@ -3134,7 +3132,7 @@ class MainWindow(QMainWindow):
         inspector_layout.setSpacing(0)
         self.right_tabs = QTabWidget()
         self.right_tabs.setObjectName("rightTabs")
-        self.right_tabs.addTab(inspector_page, "INSPECTOR")
+        self.right_tabs.addTab(inspector_page, "Inspector")
         inspector_layout.addWidget(self.right_tabs, 1)
 
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -3156,7 +3154,7 @@ class MainWindow(QMainWindow):
         timing_layout.setContentsMargins(12, 7, 12, 7)
         timing_layout.setSpacing(2)
         timing_header = QHBoxLayout()
-        self.timing_title = QLabel("TIMELINE RANGE · NO TIMELINE")
+        self.timing_title = QLabel("Timeline range")
         self.timing_title.setProperty("sectionTitle", True)
         self.timing_status = QLabel("TC Align finds the shortest common range across every camera")
         self.timing_status.setProperty("muted", True)
@@ -3188,7 +3186,7 @@ class MainWindow(QMainWindow):
         self.timeline_playhead.editingFinished.connect(self._scrub_preview)
         self.playhead_time = QLabel("00:00:00.000")
         self.playhead_time.setObjectName("playheadTime")
-        self.reset_timeline_button = QPushButton("RESET RANGE")
+        self.reset_timeline_button = QPushButton("Reset range")
         self.reset_timeline_button.setObjectName("quietButton")
         self.reset_timeline_button.clicked.connect(self._reset_timeline_range)
         timing_values.addWidget(QLabel("IN"))
@@ -3201,7 +3199,7 @@ class MainWindow(QMainWindow):
         timing_values.addWidget(self.timeline_playhead)
         timing_values.addWidget(self.playhead_time)
         timing_values.addStretch()
-        self.playback_button = QPushButton("▶  PLAY")
+        self.playback_button = QPushButton("Play")
         self.playback_button.setObjectName("quietButton")
         self.playback_button.setToolTip(
             "Space starts the adaptive live draft immediately; a 960px playback cache replaces it when ready"
@@ -3263,22 +3261,22 @@ class MainWindow(QMainWindow):
             action_layout.addWidget(button)
             return button
 
-        self.tc_align_button = workflow_button("TC ALIGN", self.align_timecode)
-        self.preview_button = workflow_button("PREVIEW", self.create_preview)
+        self.tc_align_button = workflow_button("Sync timecode", self.align_timecode)
+        self.preview_button = workflow_button("Quick preview", self.create_preview)
         self.preview_button.setToolTip(
             "Stitch only the current playhead frame at 2K using the saved camera geometry"
         )
-        self.rig_align_button = workflow_button("STITCH", self.auto_align)
+        self.rig_align_button = workflow_button("Auto stitch", self.auto_align)
         self.rig_align_button.setEnabled(False)
         self.rig_align_button.setToolTip(
             "Solve yaw, pitch and roll once from the Quick Preview frame, then reuse those values for the timeline"
         )
         self.add_queue_button = workflow_button(
-            "ADD TO QUEUE", self.add_current_to_queue
+            "Add to queue", self.add_current_to_queue
         )
         self.add_queue_button.setObjectName("primaryButton")
         action_layout.addStretch()
-        self.render_button = workflow_button("RENDER NOW", self.render)
+        self.render_button = workflow_button("Render now…", self.render)
         self.render_button.setObjectName("secondaryButton")
         self.render_button.setMinimumWidth(126)
         self.cancel_button = QPushButton("CANCEL")
@@ -3296,11 +3294,13 @@ class MainWindow(QMainWindow):
         queue_layout = QVBoxLayout(queue_page)
         queue_layout.setContentsMargins(0, 4, 0, 0)
         self.queue_status = QLabel("No timelines queued")
+        self.queue_status.setWordWrap(True)
         self.queue_status.setProperty("muted", True)
         queue_layout.addWidget(self.queue_status)
         self.queue_table = QTableWidget(0, 4)
+        self.queue_table.setWordWrap(False)
         self.queue_table.setHorizontalHeaderLabels(
-            ["TIMELINE", "FPS", "FORMAT", "STATUS / ETA"]
+            ["Timeline", "FPS", "Format", "Status / ETA"]
         )
         self.queue_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -3320,7 +3320,7 @@ class MainWindow(QMainWindow):
             2, QHeaderView.ResizeMode.ResizeToContents
         )
         self.queue_table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.ResizeToContents
+            3, QHeaderView.ResizeMode.Stretch
         )
         self.queue_table.doubleClicked.connect(self.load_selected_queue_job)
         self.queue_table.itemSelectionChanged.connect(
@@ -3337,16 +3337,27 @@ class MainWindow(QMainWindow):
             shortcut.activated.connect(self.remove_selected_queue_job)
             self.remove_queue_shortcuts.append(shortcut)
         queue_layout.addWidget(self.queue_table)
+        queue_tools = QHBoxLayout()
+        self.open_queue_output_button = QPushButton("Open output")
+        self.open_queue_output_button.setToolTip("Reveal the selected output or render in progress in your file manager")
+        self.open_queue_output_button.clicked.connect(self.open_selected_queue_output)
+        queue_tools.addWidget(self.open_queue_output_button)
+        self.remove_queue_button = QPushButton("Remove")
+        self.remove_queue_button.setToolTip("Remove the selected job from the queue; output files are kept")
+        self.remove_queue_button.clicked.connect(self.remove_selected_queue_job)
+        queue_tools.addWidget(self.remove_queue_button)
+        queue_tools.addStretch()
+        queue_layout.addLayout(queue_tools)
         queue_actions = QHBoxLayout()
         queue_actions.addStretch()
-        self.render_selected_queue_button = QPushButton("RENDER SELECTED")
+        self.render_selected_queue_button = QPushButton("Render selected")
         self.render_selected_queue_button.setObjectName("secondaryButton")
         self.render_selected_queue_button.setToolTip("Render the selected queue item")
         self.render_selected_queue_button.clicked.connect(
             self.render_selected_queue_job
         )
         queue_actions.addWidget(self.render_selected_queue_button)
-        self.render_all_queue_button = QPushButton("RENDER ALL")
+        self.render_all_queue_button = QPushButton("Render pending")
         self.render_all_queue_button.setObjectName("primaryButton")
         self.render_all_queue_button.clicked.connect(self.render_all_queue_jobs)
         queue_actions.addWidget(self.render_all_queue_button)
@@ -3359,14 +3370,14 @@ class MainWindow(QMainWindow):
         self.log_status.setProperty("muted", True)
         task_log_header.addWidget(self.log_status)
         task_log_header.addStretch()
-        self.clear_log_button = QPushButton("CLEAR LOG")
+        self.clear_log_button = QPushButton("Clear log")
         self.clear_log_button.setObjectName("secondaryButton")
         self.clear_log_button.clicked.connect(self.log.clear)
         task_log_header.addWidget(self.clear_log_button)
         task_log_layout.addLayout(task_log_header)
         task_log_layout.addWidget(self.log)
-        self.right_tabs.addTab(queue_page, "RENDER QUEUE")
-        self.right_tabs.addTab(log_page, "TASK LOG")
+        self.right_tabs.addTab(queue_page, "Render queue")
+        self.right_tabs.addTab(log_page, "Task log")
         self.jobs_tabs = self.right_tabs
         self.log_box = self.inspector_panel
 
@@ -4001,9 +4012,9 @@ class MainWindow(QMainWindow):
     def _update_plate_set_context(self) -> None:
         timeline = self._active_timeline_record()
         if timeline is None:
-            active_label = "ACTIVE TIMELINE · NONE"
+            active_label = "Active timeline"
             preview_label = f"{self.project_store.settings.name} / NO TIMELINE OPEN"
-            range_label = "TIMELINE RANGE · NO TIMELINE"
+            range_label = "Timeline range"
         else:
             folder = next(
                 (
@@ -4198,7 +4209,7 @@ class MainWindow(QMainWindow):
         output_view_label = QLabel("View")
         ocio_spaces_status = QLabel()
         ocio_spaces_status.setProperty("muted", True)
-        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces = QPushButton("Reload spaces")
         load_spaces.setObjectName("secondaryButton")
         ocio_row = QWidget()
         ocio_layout = QHBoxLayout(ocio_row)
@@ -4495,7 +4506,7 @@ class MainWindow(QMainWindow):
         output_view_label = QLabel("View")
         ocio_spaces_status = QLabel()
         ocio_spaces_status.setProperty("muted", True)
-        load_spaces = QPushButton("LOAD SPACES")
+        load_spaces = QPushButton("Reload spaces")
         load_spaces.setObjectName("secondaryButton")
         ocio_row = QWidget()
         ocio_layout = QHBoxLayout(ocio_row)
@@ -5280,8 +5291,50 @@ class MainWindow(QMainWindow):
                 selected_item.setSelected(True)
             self.media_tree.scrollToItem(first_selected)
         self.media_tree.blockSignals(False)
+        self._filter_media_tree()
         self._refresh_timeline_tree()
         self._update_plate_set_context()
+
+    def _filter_media_tree(self) -> None:
+        """Filter existing rows without rebuilding media or changing the project."""
+        query = self.media_search.text().strip().casefold()
+        if query and self._media_filter_expanded is None:
+            _, self._media_filter_expanded = self._capture_media_tree_state()
+        previous = self.media_tree.blockSignals(True)
+        matches = 0
+
+        def visit(item: QTreeWidgetItem, parent_matches: bool = False) -> bool:
+            nonlocal matches
+            kind = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            direct = not query or parent_matches or (kind != "project" and query in item.text(0).casefold())
+            children_visible = False
+            for index in range(item.childCount()):
+                children_visible = visit(item.child(index), direct and kind != "project") or children_visible
+            visible = direct or children_visible
+            item.setHidden(not visible)
+            if not visible:
+                item.setSelected(False)
+            if kind == "media" and visible:
+                matches += 1
+            if query and children_visible:
+                item.setExpanded(True)
+            elif not query and self._media_filter_expanded is not None:
+                key = (kind, str(item.data(0, Qt.ItemDataRole.UserRole + 1) or ""))
+                item.setExpanded(key in self._media_filter_expanded)
+            return visible
+
+        try:
+            for index in range(self.media_tree.topLevelItemCount()):
+                visit(self.media_tree.topLevelItem(index))
+        finally:
+            self.media_tree.blockSignals(previous)
+        if not query:
+            self._media_filter_expanded = None
+        self.media_hint.setText(
+            f"{matches} matching clip{'s' if matches != 1 else ''}"
+            if query else "Drag clips here, or use Import."
+        )
+        self._update_source_status()
 
     def _append_media_tree_item(self, parent: QTreeWidgetItem, media: MediaRecord) -> None:
         number = plate_number(media.path)
@@ -5764,6 +5817,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_timeline = False
             self._refresh_media_tree()
+        self._update_source_status()
         if (
             self._auto_workflows_enabled
             and self._tc_alignment is not None
@@ -5794,7 +5848,7 @@ class MainWindow(QMainWindow):
             self.jobs_toggle.blockSignals(True)
             self.jobs_toggle.setChecked(False)
             self.jobs_toggle.blockSignals(False)
-        self.inspector_toggle.setText("INSPECTOR" if checked else "SHOW INSPECTOR")
+        self.inspector_toggle.setText("Inspector" if checked else "SHOW INSPECTOR")
 
     def _toggle_log(self, checked: bool) -> None:
         self.inspector_panel.setVisible(checked)
@@ -6032,7 +6086,7 @@ class MainWindow(QMainWindow):
         heading.setProperty("sectionTitle", True)
         layout.addWidget(heading)
         note = QLabel(
-            "This exact folder and name are stored with the queue item. Render All will not reuse another timeline's destination."
+            "Each queue item keeps its own output folder, file name, and render settings."
         )
         note.setWordWrap(True)
         note.setProperty("muted", True)
@@ -6132,6 +6186,15 @@ class MainWindow(QMainWindow):
         loaded = sum(bool(path) for path in self.source_table.paths())
         expected = self.source_table.camera_count()
         ready = loaded == expected and expected in SUPPORTED_CAMERA_COUNTS
+        if self.process is None:
+            self._set_busy_ui(False)
+        if self.preview._item is None:
+            if ready:
+                self.preview._empty.setText("Your plates are ready\n\nUse Quick preview to inspect the stitch, or Sync timecode for playback.")
+            elif self._active_timeline_id is not None:
+                self.preview._empty.setText(f"Assign {expected} camera clips\n\nSelect a complete set in Media, then choose Assign selected.")
+            else:
+                self.preview._empty.setText("Create a timeline to start\n\nImport 3 or 5 camera clips, then create a timeline from your selection.")
         for name in ("tc_align_button", "preview_button", "add_queue_button", "render_button"):
             button = getattr(self, name, None)
             if button is not None and self.process is None:
@@ -6199,11 +6262,11 @@ class MainWindow(QMainWindow):
         align_note.setWordWrap(True)
         profile_layout.addWidget(align_note)
         profile_actions = QHBoxLayout()
-        open_profile = QPushButton("OPEN…")
+        open_profile = QPushButton("Open…")
         open_profile.setObjectName("secondaryButton")
         open_profile.setToolTip("Open another calibrated rig profile")
         open_profile.clicked.connect(self.choose_config)
-        save_profile = QPushButton("SAVE AS…")
+        save_profile = QPushButton("Save as…")
         save_profile.setObjectName("secondaryButton")
         save_profile.setToolTip("Save the current rig profile")
         save_profile.clicked.connect(self.save_as)
@@ -6261,6 +6324,13 @@ class MainWindow(QMainWindow):
         self.canvas_ratio = QLabel()
         self.canvas_ratio.setProperty("muted", True)
         form.addRow("Ratio", self.canvas_ratio)
+        self.reset_seam_path_button = QPushButton("Reset seam path")
+        self.reset_seam_path_button.setEnabled(False)
+        self.reset_seam_path_button.setToolTip(
+            "Restore the default joins between cameras. Custom paths stay fixed throughout a clip."
+        )
+        self.reset_seam_path_button.clicked.connect(self._reset_seam_path)
+        form.addRow("Plate joins", self.reset_seam_path_button)
         for widget in (
             self.canvas_width,
             self.canvas_height,
@@ -6294,14 +6364,14 @@ class MainWindow(QMainWindow):
         flow_form.addRow("Max displacement", self.flow_max)
         layout.addWidget(flow)
 
-        fit_full = QPushButton("FIT FULL PLATES")
+        fit_full = QPushButton("Fit all plates")
         fit_full.setObjectName("primaryButton")
         fit_full.setToolTip(
             "Fit the complete warped plate boundaries with a 3% safety margin"
         )
         fit_full.clicked.connect(self.fit_full_plates)
         layout.addWidget(fit_full)
-        analyze = QPushButton("COVERAGE MASK")
+        analyze = QPushButton("Check coverage")
         analyze.setObjectName("secondaryButton")
         analyze.setToolTip(
             "Analyze which parts of the current manual canvas contain image data"
@@ -6327,7 +6397,7 @@ class MainWindow(QMainWindow):
         note.setProperty("muted", True)
         layout.addWidget(note)
 
-        transform = QGroupBox("TRANSFORM")
+        transform = QGroupBox("Transform")
         transform_form = QFormLayout(transform)
         transform_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
@@ -6363,7 +6433,7 @@ class MainWindow(QMainWindow):
             transform_form.addRow(label, widget)
         layout.addWidget(transform)
 
-        crop = QGroupBox("SOURCE CROP")
+        crop = QGroupBox("Source crop")
         crop_form = QFormLayout(crop)
         crop_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
@@ -6385,7 +6455,7 @@ class MainWindow(QMainWindow):
             crop_form.addRow(label, widget)
         layout.addWidget(crop)
 
-        warp = QGroupBox("LENS WARP")
+        warp = QGroupBox("Lens correction")
         warp_form = QFormLayout(warp)
         warp_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
@@ -6403,7 +6473,7 @@ class MainWindow(QMainWindow):
             warp_form.addRow(f"Warp {index}", widget)
         layout.addWidget(warp)
 
-        blend = QGroupBox("EDGE BLEND")
+        blend = QGroupBox("Edge blend")
         blend_form = QFormLayout(blend)
         blend_form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
@@ -6429,10 +6499,10 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(self._plate_control_changed)
 
         actions = QHBoxLayout()
-        reset = QPushButton("RESET PLATE")
+        reset = QPushButton("Reset plate")
         reset.setObjectName("secondaryButton")
         reset.clicked.connect(self._reset_selected_plate)
-        refresh = QPushButton("REFRESH FRAME")
+        refresh = QPushButton("Refresh preview")
         refresh.setObjectName("primaryButton")
         refresh.setToolTip(
             "Live Preview updates automatically; use this only to retry the current frame"
@@ -6748,7 +6818,7 @@ class MainWindow(QMainWindow):
         ocio_button.setFixedWidth(48)
         ocio_button.clicked.connect(self.choose_ocio)
         ocio_layout.addWidget(ocio_button)
-        self.ocio_reload_button = QPushButton("LOAD SPACES")
+        self.ocio_reload_button = QPushButton("Reload spaces")
         self.ocio_reload_button.setObjectName("secondaryButton")
         self.ocio_reload_button.clicked.connect(self._reload_ocio_spaces)
         self.input_space = _new_ocio_space_combo("Camera Rec.709")
@@ -6847,13 +6917,13 @@ class MainWindow(QMainWindow):
         match_actions_layout = QHBoxLayout(match_actions)
         match_actions_layout.setContentsMargins(0, 0, 0, 0)
         match_actions_layout.setSpacing(5)
-        self.color_match_button = QPushButton("MATCH")
+        self.color_match_button = QPushButton("Match cameras")
         self.color_match_button.setObjectName("primaryButton")
         self.color_match_button.setToolTip(
             "Match camera white points from the current Quick Preview overlaps"
         )
         self.color_match_button.clicked.connect(self.match_cameras)
-        self.color_match_reset_button = QPushButton("RESET")
+        self.color_match_reset_button = QPushButton("Reset")
         self.color_match_reset_button.setObjectName("secondaryButton")
         self.color_match_reset_button.clicked.connect(self.reset_color_match)
         match_actions_layout.addWidget(self.color_match_button, 1)
@@ -6932,7 +7002,7 @@ class MainWindow(QMainWindow):
         self.output_hint.setWordWrap(True)
         self.output_hint.setProperty("muted", True)
         layout.addWidget(self.output_hint)
-        resources = QPushButton("ESTIMATE 20K RESOURCES")
+        resources = QPushButton("Estimate render resources")
         resources.setObjectName("secondaryButton")
         resources.clicked.connect(self.estimate_resources)
         layout.addWidget(resources)
@@ -6942,294 +7012,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background:#08090a;
-                color:#f7f8f8;
-                font-family:'Inter Variable','Inter','SF Pro Text','-apple-system','Segoe UI';
-                font-size:11px;
-            }
-            QLabel { background:transparent; }
-            QFrame#topBar { background:#0f1011; border-bottom:1px solid #23252a; }
-            QLabel#appTitle { color:#f7f8f8; font-size:15px; font-weight:590; }
-            QLabel#appSubtitle { color:#62666d; font-size:9px; letter-spacing:.8px; }
-            QLabel#projectTitle { color:#f7f8f8; font-size:11px; font-weight:590; }
-            QLabel#profileLabel { color:#d0d6e0; font-size:10px; }
-            QLabel#statusPill {
-                color:#10b981;
-                border:1px solid #23252a;
-                border-radius:6px;
-                padding:3px 7px;
-                font-size:8px;
-                font-weight:590;
-                letter-spacing:1px;
-            }
-            QFrame#inspectorPanel, QFrame#previewPanel,
-            QFrame#timingPanel, QFrame#logPanel {
-                background:#0f1011;
-                border:1px solid rgba(255,255,255,0.08);
-                border-radius:6px;
-            }
-            QFrame#libraryPanel { background:transparent; border:0; }
-            QFrame#librarySection {
-                background:#0f1011;
-                border:0;
-                border-bottom:1px solid rgba(255,255,255,0.08);
-                border-radius:0;
-            }
-            QFrame#previewPanel { background:#0f1011; }
-            QFrame#actionBar {
-                background:#0f1011;
-                border:0;
-                border-top:1px solid rgba(255,255,255,0.08);
-                border-radius:0;
-            }
-            QFrame#inspectorSection { background:transparent; border:0; border-bottom:1px solid #23252a; }
-            QFrame#formSeparator {
-                background:#23252a;
-                border:0;
-                min-height:1px;
-                max-height:1px;
-                margin:3px 0;
-            }
-            QGroupBox {
-                background:transparent;
-                border:0;
-                border-top:1px solid #23252a;
-                border-radius:0;
-                margin-top:10px;
-                padding:12px 2px 5px;
-                color:#d0d6e0;
-                font-weight:510;
-            }
-            QGroupBox::title { subcontrol-origin:margin; left:2px; padding:0 4px; color:#d0d6e0; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTableWidget, QTreeWidget {
-                background:#191a1b;
-                border:1px solid #34343a;
-                border-radius:5px;
-                padding:4px;
-                selection-background-color:#5e6ad2;
-                selection-color:#f7f8f8;
-            }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#7170ff; }
-            QComboBox::drop-down {
-                width:22px;
-                border:0;
-                border-left:1px solid #34343a;
-                background:#191a1b;
-            }
-            QComboBox::drop-down:hover { background:#28282c; }
-            QComboBox::down-arrow { width:9px; height:7px; }
-            QComboBox QAbstractItemView {
-                background:#191a1b;
-                border:1px solid #34343a;
-                outline:0;
-                padding:3px;
-                selection-background-color:#5e6ad2;
-            }
-            QPushButton {
-                background:#191a1b;
-                color:#d0d6e0;
-                border:1px solid #23252a;
-                border-radius:6px;
-                padding:5px 8px;
-                font-weight:510;
-            }
-            QPushButton:hover { background:#28282c; border-color:#3e3e44; color:#f7f8f8; }
-            QPushButton:pressed { background:#0f1011; }
-            QPushButton:checked { color:#f7f8f8; border-color:#7170ff; background:#28282c; }
-            QPushButton:disabled { color:#62666d; background:#0f1011; border-color:#23252a; }
-            QPushButton#topButton { background:transparent; padding:4px 7px; color:#d0d6e0; }
-            QPushButton#primaryButton { background:#5e6ad2; color:#f7f8f8; border-color:#7170ff; }
-            QPushButton#primaryButton:hover { background:#828fff; }
-            QPushButton#secondaryButton, QPushButton#quietButton { background:#191a1b; color:#d0d6e0; }
-            QPushButton#quietButton { padding:6px 10px; }
-            QPushButton#iconButton { padding:5px 9px; min-width:28px; }
-            QPushButton#dangerButton { background:#1c2026; color:#bd8998; border-color:#48333a; }
-            QPushButton#dangerButton:hover { background:#2b2025; color:#f0b3c3; border-color:#80505e; }
-            QPushButton#dangerButton:disabled { color:#5f565b; background:#171a1f; border-color:#29272a; }
-            QPushButton#layoutChoice {
-                background:#191a1b;
-                color:#d0d6e0;
-                border:1px solid #34343a;
-                padding:10px 12px;
-                text-align:left;
-            }
-            QPushButton#layoutChoice:hover { background:#28282c; border-color:#3e3e44; }
-            QPushButton#layoutChoice:checked {
-                background:#28282c;
-                color:#f7f8f8;
-                border:1px solid #7170ff;
-            }
-            QFrame#selectedMediaCard {
-                background:#141516;
-                border:1px solid #34343a;
-                border-radius:7px;
-            }
-            QFrame#selectedMediaCard[state='ready'] { border-color:#3f6255; }
-            QFrame#selectedMediaCard[state='warning'] { border-color:#735744; }
-            QLabel#selectedMediaState {
-                color:#8a8f98;
-                font-size:9px;
-                font-weight:650;
-                letter-spacing:.5px;
-            }
-            QLabel#selectedMediaState[state='ready'] { color:#7fc5a9; }
-            QLabel#selectedMediaState[state='warning'] { color:#d6a274; }
-            QLabel#selectedMediaFiles {
-                color:#d0d6e0;
-                background:#0f1011;
-                border-top:1px solid #23252a;
-                border-bottom:1px solid #23252a;
-                padding:7px 8px;
-                font-family:'Cascadia Mono','SF Mono','Menlo';
-                font-size:10px;
-            }
-            QPushButton#workflowButton {
-                background:rgba(255,255,255,0.03);
-                color:#d0d6e0;
-                border-color:rgba(255,255,255,0.08);
-                font-size:10px;
-                letter-spacing:.3px;
-            }
-            QPushButton#workflowButton:hover { border-color:#7170ff; background:#28282c; }
-            QPushButton#cancelButton { color:#e4a2b9; border-color:#694050; max-width:90px; }
-            QHeaderView::section {
-                background:#0f1011;
-                color:#8a8f98;
-                border:0;
-                border-bottom:1px solid #23252a;
-                padding:5px 4px;
-                font-size:9px;
-                font-weight:590;
-            }
-            QTableWidget { border:0; background:#0f1011; }
-            QTableWidget::item { border-bottom:1px solid #23252a; padding:3px; }
-            QTableWidget::item:selected { background:#28282c; color:#f7f8f8; }
-            QTreeWidget#mediaTree, QTreeWidget#timelineTree {
-                border:0;
-                border-top:1px solid rgba(255,255,255,0.08);
-                border-radius:0;
-                background:#0f1011;
-                padding:5px 0 2px;
-                show-decoration-selected:1;
-            }
-            QTreeWidget#mediaTree::item {
-                min-height:26px;
-                padding:2px 5px;
-                border:0;
-                border-bottom:1px solid rgba(255,255,255,0.055);
-            }
-            QTreeWidget#timelineTree::item { min-height:24px; padding:2px 4px; border:0; }
-            QTreeWidget#mediaTree::item:hover { background:#1b1c20; color:#ffffff; }
-            QTreeWidget#mediaTree::item:selected, QTreeWidget#timelineTree::item:selected { background:#28282c; color:#f7f8f8; }
-            QTabWidget::pane { border:0; }
-            QTabBar::tab {
-                background:#0f1011;
-                color:#62666d;
-                border:0;
-                border-bottom:2px solid transparent;
-                padding:7px 11px;
-                font-weight:510;
-            }
-            QTabBar::tab:selected { color:#f7f8f8; border-bottom:2px solid #7170ff; }
-            QLabel#durationBadge { color:#d0d6e0; padding:2px 5px; font-weight:590; }
-            QLabel#previewLimit {
-                color:#8a8f98;
-                border:1px solid #34343a;
-                border-radius:6px;
-                padding:3px 7px;
-                font-size:9px;
-                font-weight:590;
-            }
-            QLabel#playheadTime {
-                color:#d0d6e0;
-                padding:2px 5px;
-                font-family:'Cascadia Mono','SF Mono','Menlo';
-                font-size:10px;
-            }
-            QLabel#sourceStatus { color:#8a8f98; font-size:10px; }
-            QLabel#autosaveStatus { color:#10b981; font-size:9px; padding:0 8px; }
-            QScrollArea { border:0; background:transparent; }
-            QScrollBar:vertical {
-                background:#0f1011;
-                width:10px;
-                margin:0;
-                border:0;
-            }
-            QScrollBar::handle:vertical {
-                background:#3e3e44;
-                min-height:28px;
-                margin:2px;
-                border:0;
-                border-radius:3px;
-            }
-            QScrollBar::handle:vertical:hover { background:#62666d; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                width:0;
-                height:0;
-                background:transparent;
-                border:0;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background:transparent;
-                border:0;
-            }
-            QScrollBar:horizontal {
-                background:#0f1011;
-                height:10px;
-                margin:0;
-                border:0;
-            }
-            QScrollBar::handle:horizontal {
-                background:#3e3e44;
-                min-width:28px;
-                margin:2px;
-                border:0;
-                border-radius:3px;
-            }
-            QScrollBar::handle:horizontal:hover { background:#62666d; }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width:0;
-                height:0;
-                background:transparent;
-                border:0;
-            }
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-                background:transparent;
-                border:0;
-            }
-            QSplitter#workspaceSplitter::handle:horizontal {
-                background:rgba(255,255,255,0.08);
-                margin:9px 2px;
-                border-radius:2px;
-            }
-            QSplitter#workspaceSplitter::handle:horizontal:hover {
-                background:#7170ff;
-            }
-            QSplitter#librarySplitter::handle:vertical {
-                background:transparent;
-                border-top:1px solid #34343a;
-                margin:3px 10px;
-            }
-            QSplitter#librarySplitter::handle:vertical:hover {
-                border-top:2px solid #7170ff;
-            }
-            QProgressBar {
-                border:1px solid #34343a;
-                border-radius:6px;
-                background:#191a1b;
-                text-align:center;
-                color:#d0d6e0;
-            }
-            QProgressBar::chunk { background:#5e6ad2; border-radius:5px; }
-            QLabel[muted='true'] { color:#8a8f98; }
-            QLabel[sectionTitle='true'] { color:#f7f8f8; font-size:11px; font-weight:590; letter-spacing:.7px; }
-            QLabel[inspectorTitle='true'] { color:#d0d6e0; font-size:10px; font-weight:590; letter-spacing:.6px; }
-            QStatusBar { background:#0f1011; border-top:1px solid #23252a; color:#8a8f98; }
-            """
-        )
+        self.setStyleSheet(WORKSPACE_STYLE)
 
     def load_config(self, path: Path) -> None:
         try:
@@ -7277,6 +7060,7 @@ class MainWindow(QMainWindow):
         self.center_yaw.setValue(float(output.get("center_yaw_deg", 0.0)))
         self.center_pitch.setValue(float(output.get("center_pitch_deg", 0.0)))
         self.seam_feather.setValue(float(output.get("seam_feather_deg", 4.0)))
+        self.reset_seam_path_button.setEnabled(bool(output.get("seam_paths_deg")))
         self._loading_config = False
         self._update_canvas_ratio()
         flow = raw.setdefault("flow", {})
@@ -7348,6 +7132,13 @@ class MainWindow(QMainWindow):
         height = self.canvas_height.value()
         ratio = width / max(1, height)
         self.canvas_ratio.setText(f"{ratio:.3f}:1  ·  MANUAL")
+
+    def _reset_seam_path(self) -> None:
+        output = self.config_data.get("output", {})
+        if isinstance(output, dict):
+            output.pop("seam_paths_deg", None)
+        self.reset_seam_path_button.setEnabled(False)
+        self._schedule_live_preview("Default seam positions restored")
 
     def _canvas_controls_changed(self) -> None:
         self._update_canvas_ratio()
@@ -8266,7 +8057,7 @@ class MainWindow(QMainWindow):
             playing=True,
             direction=1,
         ):
-            self.playback_button.setText("Ⅱ  PAUSE")
+            self.playback_button.setText("Pause")
             return
         self.toggle_playback()
 
@@ -8318,7 +8109,7 @@ class MainWindow(QMainWindow):
         self._stop_live_proxy_playback()
         self._reverse_timer.stop()
         self.media_player.pause()
-        self.playback_button.setText("▶  PLAY")
+        self.playback_button.setText("Play")
 
     def step_playback(self, direction: int, *, continuous: bool = False) -> None:
         if not continuous:
@@ -8646,10 +8437,10 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         self._live_playing = False
-                        self.playback_button.setText("▶  PLAY")
+                        self.playback_button.setText("Play")
         elif current and error:
             self._live_playing = False
-            self.playback_button.setText("▶  PLAY")
+            self.playback_button.setText("Play")
             self.preview_note.setText(f"Live playback unavailable · {error}")
             self._append_log(f"LIVE PLAYBACK: {error}")
 
@@ -8718,7 +8509,7 @@ class MainWindow(QMainWindow):
 
     def _playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self.playback_button.setText("Ⅱ  PAUSE" if playing else "▶  PLAY")
+        self.playback_button.setText("Pause" if playing else "Play")
         if playing:
             self.preview_stack.setCurrentWidget(self.video_preview)
             self.preview_note.setText("Playback proxy · Space to pause")
@@ -8766,7 +8557,8 @@ class MainWindow(QMainWindow):
         self._reverse_timer.stop()
         if self._live_playing:
             self._stop_live_proxy_playback()
-            self.playback_button.setText("▶  PLAY")
+            self.playback_button.setText("Play")
+            self.preview_note.setText(f"Paused · frame {self.timeline_playhead.value()}")
             if self._auto_cache_requested:
                 self._request_playback_warmup(delay_ms=0)
             return
@@ -8810,7 +8602,7 @@ class MainWindow(QMainWindow):
             playing=True,
             direction=1,
         ):
-            self.playback_button.setText("Ⅱ  PAUSE")
+            self.playback_button.setText("Pause")
             return
         if not self._tc_alignment:
             self._error("Playback", "Run TC ALIGN before building synchronized playback")
@@ -10449,11 +10241,23 @@ class MainWindow(QMainWindow):
 
     def _update_queue_action_state(self) -> None:
         job = self._selected_queue_job()
+        idle = self.process is None and not self._queue_running
+        count = len(self.render_queue.jobs)
+        self.queue_status.setText(
+            f"{count} queued · {job.name}" if job is not None
+            else f"{count} timeline{'s' if count != 1 else ''} queued" if count
+            else "No timelines queued"
+        )
         self.render_selected_queue_button.setEnabled(
-            job is not None and job.status is not RenderStatus.RENDERING
+            idle and job is not None and job.status is not RenderStatus.RENDERING
         )
         self.render_all_queue_button.setEnabled(
-            bool(self.render_queue.jobs) and not self._queue_running
+            idle and any(job.status in {RenderStatus.QUEUED, RenderStatus.FAILED} for job in self.render_queue.jobs)
+        )
+        self.open_queue_output_button.setEnabled(job is not None)
+        self.remove_queue_button.setEnabled(job is not None and job.status is not RenderStatus.RENDERING)
+        self.render_selected_queue_button.setText(
+            "Render again" if job is not None and job.status is RenderStatus.DONE else "Render selected"
         )
 
     def _queue_table_menu(self, position) -> None:  # type: ignore[no-untyped-def]
@@ -10475,9 +10279,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         remove = menu.addAction("Remove from Queue", self.remove_selected_queue_job)
         enabled = job is not None
-        load.setEnabled(enabled)
+        load.setEnabled(enabled and self.process is None)
         reveal.setEnabled(enabled)
-        render.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
+        render.setEnabled(self.render_selected_queue_button.isEnabled())
         remove.setEnabled(enabled and job.status is not RenderStatus.RENDERING)
         menu.exec(self.queue_table.viewport().mapToGlobal(position))
 
@@ -10618,7 +10422,7 @@ class MainWindow(QMainWindow):
             sources = self._validate_sources()
             output = self._request_render_destination(
                 title="Add Timeline to Render Queue",
-                action_label="ADD TO QUEUE",
+                action_label="Add to queue",
             )
             if output is None:
                 return
@@ -10912,7 +10716,7 @@ class MainWindow(QMainWindow):
             sources = self._validate_sources()
             output = self._request_render_destination(
                 title="Render Current Timeline",
-                action_label="RENDER NOW",
+                action_label="Render now…",
             )
             if output is None:
                 return
@@ -11029,7 +10833,7 @@ class MainWindow(QMainWindow):
         self._process_failure = failure
         self._process_interactive = interactive
         self._process_task_name = task
-        self._process_output_buffer = ""
+        self._process_output_buffer = b""
         self._process_phase = ""
         self._process_frame_number = None
         self._process_frame_progress = None
@@ -11107,7 +10911,8 @@ class MainWindow(QMainWindow):
             self._refresh_render_clock()
 
     def _set_busy_ui(self, busy: bool) -> None:
-        sources_ready = all(self.source_table.paths())
+        paths = self.source_table.paths()
+        sources_ready = len(paths) in SUPPORTED_CAMERA_COUNTS and all(paths)
         inspector_live = busy and self._process_interactive
         self.import_button.setEnabled(not busy)
         self.assign_media_button.setEnabled(
@@ -11118,12 +10923,12 @@ class MainWindow(QMainWindow):
         self.new_timeline_button.setEnabled(not busy)
         self.media_tree.setEnabled(not busy)
         self.timeline_tree.setEnabled(not busy)
-        self.clear_button.setEnabled(not busy)
+        self.clear_button.setEnabled(not busy and any(paths))
         self.source_table.setEnabled(not busy)
         self.settings_tabs.setEnabled(not busy or inspector_live)
         self.tc_align_button.setEnabled(not busy and sources_ready)
         self.preview_button.setEnabled(not busy and sources_ready)
-        self.playback_button.setEnabled(not busy or inspector_live)
+        self.playback_button.setEnabled((not busy or inspector_live) and sources_ready)
         self.add_queue_button.setEnabled(not busy and sources_ready)
         self.render_button.setEnabled(not busy and sources_ready)
         self.rig_align_button.setEnabled(not busy and self._preview_ready)
@@ -11142,13 +10947,25 @@ class MainWindow(QMainWindow):
         self.reset_timeline_button.setEnabled(
             (not busy or inspector_live) and self._tc_alignment is not None
         )
+        self.timeline_playhead.setEnabled(
+            (not busy or inspector_live) and self._tc_alignment is not None
+        )
+        self._update_queue_action_state()
 
-    def _read_process(self) -> None:
+    def _read_process(self, *, final: bool = False) -> None:
         process = self.sender()
         if self.process is None or (process is not None and process is not self.process):
             return
-        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        normalized = text.replace("\r", "\n")
+        # Pipe reads can split both a progress line and a UTF-8 character.
+        # Keep the unfinished bytes until the next read instead of losing ETA
+        # updates or displaying half a filename as a separate log entry.
+        data = self._process_output_buffer + bytes(self.process.readAllStandardOutput())
+        lines = data.replace(b"\r", b"\n").split(b"\n")
+        self._process_output_buffer = lines.pop()
+        if final and self._process_output_buffer:
+            lines.append(self._process_output_buffer)
+            self._process_output_buffer = b""
+        normalized = b"\n".join(lines).decode("utf-8", errors="replace")
         progress_value: tuple[int, int] | None = None
         frame_progress: tuple[int, int] | None = None
         frame_value: str | None = None
@@ -11325,7 +11142,7 @@ class MainWindow(QMainWindow):
                 f"FRAME {done}/{total} · {render_progress_text(done, total, eta)}"
             )
             if self._queue_current_id is not None:
-                self._refresh_queue_table()
+                self._refresh_active_queue_status((done, total, eta))
 
     def _begin_render_progress(self, total_frames: int) -> None:
         now = time.monotonic()
@@ -11459,12 +11276,17 @@ class MainWindow(QMainWindow):
             item = self.queue_table.item(row, 3)
             if item is not None:
                 item.setText(status)
+                item.setToolTip(f"{status}\nOutput: {job.output_path}")
             return
+        # Structural changes build rows once; steady progress keeps row identity,
+        # selection, and scroll position intact.
+        self._refresh_queue_table()
 
     def _process_finished(self, exit_code: int, _status) -> None:  # type: ignore[no-untyped-def]
         sender = self.sender()
         if self.process is None or (sender is not None and sender is not self.process):
             return
+        self._read_process(final=True)
         callback = self._process_success
         failure = self._process_failure
         process = self.process
@@ -11793,10 +11615,18 @@ def main() -> int:
             StorageAccessDialog(first_run=True).exec()
             settings.setValue(_STORAGE_SETUP_KEY, True)
             settings.sync()
-        launcher = ProjectManagerDialog()
-        if launcher.exec() != QDialog.DialogCode.Accepted or launcher.project_path is None:
-            return 0
-        window = MainWindow(launcher.project_path)
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--project", type=Path)
+        arguments, _ = parser.parse_known_args(sys.argv[1:])
+        project_path = arguments.project
+        if project_path is None:
+            launcher = ProjectManagerDialog()
+            if launcher.exec() != QDialog.DialogCode.Accepted or launcher.project_path is None:
+                return 0
+            project_path = launcher.project_path
+        elif not project_path.is_file():
+            raise FileNotFoundError(f"Project does not exist: {project_path}")
+        window = MainWindow(project_path)
         window.show()
         return app.exec()
     except Exception:

@@ -77,6 +77,8 @@ class InteractivePreviewRenderer:
         self._warped: list[np.ndarray] = []
         self._valid_masks: list[np.ndarray] = []
         self._longitude: np.ndarray | None = None
+        self._weights_key: object | None = None
+        self._weights: list[np.ndarray] = []
         self._frame_revision = 0
 
     @staticmethod
@@ -267,12 +269,21 @@ class InteractivePreviewRenderer:
 
         if self._longitude is None:
             _, _, _, self._longitude = camera_map(config.cameras[0], tile, output)
-        weights = seam_weights(
-            config.cameras,
-            self._longitude,
-            self._valid_masks,
-            output.seam_feather_deg,
+        weights_key = (
+            output,
+            tuple(geometry_keys),
+            tuple((camera.feather_left_deg, camera.feather_right_deg) for camera in config.cameras),
         )
-        blended = weighted_blend(self._warped, weights)
+        if weights_key != self._weights_key:
+            self._weights = seam_weights(
+                config.cameras,
+                self._longitude,
+                self._valid_masks,
+                output.seam_feather_deg,
+                output.seam_paths_deg,
+                canvas_height=height,
+            )
+            self._weights_key = weights_key
+        blended = weighted_blend(self._warped, self._weights)
         rendered = color.working_to_output(blended)
         return np.rint(np.clip(rendered, 0.0, 1.0) * 65535.0).astype(np.uint16)

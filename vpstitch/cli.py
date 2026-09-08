@@ -635,6 +635,7 @@ def _calibrate_rig(args: argparse.Namespace) -> None:
         match_ratio=args.match_ratio,
         angular_threshold_deg=args.angular_threshold,
         max_correction_deg=args.max_correction,
+        seam_aware=getattr(args, "refine_seams", False),
     )
     write_calibrated_config(args.config, args.output, alignment)
     if args.report:
@@ -972,6 +973,10 @@ def build_parser() -> argparse.ArgumentParser:
     rig.add_argument("--match-ratio", type=float, default=0.72)
     rig.add_argument("--angular-threshold", type=float, default=1.25)
     rig.add_argument("--max-correction", type=float, default=12.0)
+    rig.add_argument(
+        "--refine-seams", action="store_true",
+        help="refine supported seam-local rotations; review across the clip before delivery",
+    )
     rig.add_argument("images", nargs="+", help="one synchronized still per camera, config order")
     rig.set_defaults(function=_calibrate_rig)
 

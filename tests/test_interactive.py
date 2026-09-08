@@ -58,6 +58,20 @@ def _plates(tmp_path: Path) -> list[Path]:
     return paths
 
 
+def test_changing_fixed_seam_path_invalidates_cached_preview(tmp_path: Path) -> None:
+    rig = _rig()
+    paths = _plates(tmp_path)
+    renderer = InteractivePreviewRenderer(max_width=320, max_height=180)
+    original = renderer.render(rig, paths)
+    changed = replace(rig, output=replace(
+        rig.output, seam_paths_deg=((-30.0, -15.0), (12.0, 30.0)),
+    ))
+    updated = renderer.render(changed, paths)
+    fresh = InteractivePreviewRenderer(max_width=320, max_height=180).render(changed, paths)
+    assert not np.array_equal(original, updated)
+    assert np.array_equal(updated, fresh)
+
+
 def test_interactive_renderer_reuses_sources_and_only_rewarps_changed_camera(
     tmp_path: Path,
     monkeypatch,
@@ -187,3 +201,29 @@ def test_same_stream_frame_reuses_working_pixels_for_output_setting_change(
     renderer.render_frames(changed, frames, frame_token=12)
 
     assert remaps == len(rig.cameras)
+
+
+def test_playback_reuses_feather_weights_and_invalidates_edits(monkeypatch) -> None:
+    rig = _rig()
+    renderer = InteractivePreviewRenderer(max_width=320, max_height=180)
+    frames = [np.full((120, 160, 3), 10000 * (i + 1), np.uint16) for i in range(3)]
+    calls = 0
+    real_weights = interactive.seam_weights
+
+    def tracked(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_weights(*args, **kwargs)
+
+    monkeypatch.setattr(interactive, "seam_weights", tracked)
+    renderer.render_frames(rig, frames, frame_token=1)
+    renderer.render_frames(rig, frames, frame_token=2)
+    assert calls == 1
+    changed = replace(rig, cameras=(replace(rig.cameras[0], feather_right_deg=12), *rig.cameras[1:]))
+    actual = renderer.render_frames(changed, frames, frame_token=2)
+    assert calls == 2
+    reference = InteractivePreviewRenderer(max_width=320, max_height=180)
+    np.testing.assert_array_equal(actual, reference.render_frames(changed, frames))
+    moved = replace(changed, cameras=(replace(changed.cameras[0], yaw_deg=-43), *changed.cameras[1:]))
+    actual = renderer.render_frames(moved, frames, frame_token=2)
+    np.testing.assert_array_equal(actual, reference.render_frames(moved, frames))

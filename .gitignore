@@ -6,6 +6,12 @@ dist/
 __pycache__/
 .pytest_cache/
 .pytest-tmp/
+.DS_Store
+.codex-tmp/
+audit/
+# Local camera footage, screenshots, and machine-specific QA projects.
+artifacts/plate-qc-2026-09-07/
+artifacts/ux-refresh-2026-09-07/
 *.pyc
 *.egg-info/
 *.raw

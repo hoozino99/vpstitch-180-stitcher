@@ -8,6 +8,23 @@ import pytest
 from vpstitch.config import ConfigError, load_config
 
 
+def test_seam_paths_roundtrip_as_hashable_output(tmp_path: Path) -> None:
+    raw = json.loads(Path("configs/five_cam_180.sample.json").read_text())
+    raw["output"]["seam_paths_deg"] = [
+        [(a["yaw_deg"] + b["yaw_deg"]) / 2] * 3
+        for a, b in zip(raw["cameras"], raw["cameras"][1:])
+    ]
+    path = tmp_path / "paths.json"
+    path.write_text(json.dumps(raw))
+    output = load_config(path).output
+    assert isinstance(output.seam_paths_deg, tuple)
+    assert isinstance(hash(output), int)
+    raw["output"]["seam_paths_deg"][0][0] = float("nan")
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ConfigError, match="finite angles"):
+        load_config(path)
+
+
 def test_sample_config_is_15k_five_camera_passthrough() -> None:
     config = load_config(Path("configs/five_cam_180.sample.json"))
     assert len(config.cameras) == 5

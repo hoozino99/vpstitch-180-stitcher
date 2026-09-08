@@ -17,6 +17,15 @@ Finder/Explorer 열기, 렌더 시작 즉시 보이는 `.rendering` 진행 파�
 
 ## Desktop GUI
 
+현재 작업 브랜치에는 아직 릴리스하지 않은 UI·성능·이음새 개선이 포함됩니다. 아래 조작명은
+작업 브랜치 기준이며, 다운로드된 `v0.1.1` 화면과는 다를 수 있습니다.
+
+- `Media` 검색창에서 클립·폴더 이름을 찾습니다. 검색을 지우면 기존 폴더 펼침 상태로 돌아갑니다.
+- `Render pending`은 대기·실패 작업만 처리합니다. 완료 항목은 `Render again`으로 다시 렌더합니다.
+- 큐의 `Open output`은 결과 파일을 찾고, `Remove`는 출력 파일을 남긴 채 큐 항목만 제거합니다.
+- [개선 및 검증 기록](docs/workspace-seam-validation.md)에 변경 내용, 속도 측정 범위,
+  실제 macOS 패키지 검증 결과와 이음새 설정 사용법이 정리되어 있습니다.
+
 Windows에서는 `VP Stitch GUI.bat`를 더블클릭하거나 PowerShell에서 실행합니다.
 
 ```powershell
@@ -41,35 +50,35 @@ VideoToolbox를 우선 사용하고, 지원되지 않는 변환이나 코덱은 
 1. 시작 화면에서 프로젝트를 만들거나 기존 `project.json`을 엽니다. 프로젝트의 기본
    캔버스와 OCIO Config, Input/Working/Output transform은 네이티브 메뉴의
    `Project > Project Settings…`에서 바꿀 수 있습니다.
-2. 왼쪽 `MEDIA POOL`에서 폴더를 만들고 전방 3카메라 `P06–P08` 또는 후방 5카메라
+2. 왼쪽 `Media`에서 폴더를 만들고 전방 3카메라 `P06–P08` 또는 후방 5카메라
    `P01–P05` 원본을 임포트합니다. 클립은 카메라 번호 순으로 정리되며, 임포트만으로
-   타임라인이 자동 생성되지는 않습니다. 폴더를 선택한 뒤 `+ FOLDER`를 누르면 그 안에
+   타임라인이 자동 생성되지는 않습니다. 폴더를 선택한 뒤 `Folder…`를 누르면 그 안에
    하위 폴더가 생성됩니다. 폴더나 여러 클립을 드래그해 다른 폴더에 놓으면 계층과 순서가
    프로젝트에 저장되며, 우클릭 `Move to Folder` 메뉴로도 같은 이동을 할 수 있습니다.
-3. `NEW TIMELINE`에서 이름과 `3 CAM · FRONT · P06–P08` 또는
+3. `New timeline…`에서 이름과 `3 CAM · FRONT · P06–P08` 또는
    `5 CAM · REAR · P01–P05` 레이아웃을 고릅니다. Media Pool에서 완성된 세트를
    먼저 선택했다면 생성과 동시에 플레이트를 넣을 수 있습니다. 그렇지 않으면 생성 후
-   클립을 선택하고 우클릭해 활성 타임라인에 추가합니다. 왼쪽 `PLATE SETS`에는 개별
+   클립을 선택하고 우클릭해 활성 타임라인에 추가합니다. 왼쪽 `Timelines`에는 개별
    클립 없이 타임라인만 표시되며, 더블클릭해 작업 타임라인을 전환합니다.
 4. Media Pool 클립/폴더나 Plate Sets 타임라인을 선택한 뒤 `Backspace` 또는
    `Delete`를 누르면 프로젝트에서 제거됩니다. 우클릭 메뉴에서도 같은 동작을 할 수
    있으며 확인창을 거치고 원본 영상 파일은 디스크에서 삭제하지 않습니다.
    Media Pool의 폴더·클립 행에는 아이콘, 펼침 화살표, 구분선이 표시되고 드래그 중에는
    이동 항목 카드와 드롭 위치가 강조됩니다.
-   `MEDIA POOL`, `PLATE SETS`, `ACTIVE TIMELINE`은 각각 테두리로 구분되며 섹션 사이
+   `Media`, `Timelines`, `ACTIVE TIMELINE`은 각각 테두리로 구분되며 섹션 사이
    핸들을 위아래로 드래그해 높이를 조절할 수 있습니다. 왼쪽 패널과 프리뷰 사이 핸들도
    좌우로 드래그할 수 있고, 마지막 패널 배치는 앱을 다시 열어도 복원됩니다.
 5. 각 타임라인은 기본적으로 프로젝트 해상도와 OCIO 설정을 따르지만
    `Timeline > Timeline Settings…`에서 상속을 끄고 별도로 덮어쓸 수 있습니다.
    OCIO config를 읽으면 Input / Working / Delivery 항목이 해당 config의 전체 컬러스페이스
    목록으로 채워집니다. 드롭다운에서 고르거나 이름 일부를 입력해 필터링할 수 있습니다.
-6. embedded SMPTE timecode가 있으면 `TC ALIGN`을 눌러 시작점을 맞추고 가장 짧은
+6. embedded SMPTE timecode가 있으면 `Sync timecode`을 눌러 시작점을 맞추고 가장 짧은
    공통 구간으로 자동 트림합니다.
 7. 하나의 타임라인 바에서 전체 스티칭 구간의 IN/OUT을 조절합니다.
-8. 고정 피사체가 잘 보이는 시각을 플레이헤드로 선택하고 `QUICK PREVIEW`를 누릅니다.
+8. 고정 피사체가 잘 보이는 시각을 플레이헤드로 선택하고 `Quick preview`를 누릅니다.
    현재 저장된 카메라 값으로 플레이헤드의 한 프레임만 최대 2K로 스티칭합니다. 첫 프리뷰
    이후에는 플레이헤드를 끌어 놓을 때 해당 대표 프레임만 다시 확인합니다.
-9. 왼쪽 `ACTIVE TIMELINE`에서 플레이트 하나를 선택하면 Inspector가 `PLATE` 탭으로
+9. 왼쪽 `ACTIVE TIMELINE`에서 플레이트 하나를 선택하면 Inspector가 `Plate` 탭으로
    전환됩니다. 해당 플레이트의 Position X/Y, Rotation, Scale, 좌·우·상·하 Crop,
    Lens Warp 1–4, 좌·우 Feather를 타임라인별로 미세조정하면 메모리 상주형 1280px
    인터랙티브 프리뷰에 자동 반영됩니다. 숫자 필드를 위아래로 드래그해 값을 스크럽할 수 있고 `Shift`를 누른
@@ -87,7 +96,7 @@ VideoToolbox를 우선 사용하고, 지원되지 않는 변환이나 코덱은 
     대표 프레임에서 yaw/pitch/roll을 한 번 계산해 타임라인 전체에 고정 적용하고, 결과
     프리뷰를 자동으로 다시 생성합니다.
 12. 미디어를 임포트하면 카메라별 960×540 이하 H.264 소스 프록시를 독립 백그라운드
-   작업으로 선제 생성합니다. `TC ALIGN` 뒤에는 이 프록시를 지속 디코딩하며 모든 카메라가
+   작업으로 선제 생성합니다. `Sync timecode` 뒤에는 이 프록시를 지속 디코딩하며 모든 카메라가
    준비된 완전한 프레임 묶음만 표시합니다. 준비된 뒤에는 첫
    `Play` 또는 `Space`부터 바로 재생되며, `Space` 재생/일시정지, `J/K/L` 연속 역재생·정지·정방향,
    `←/→` 한 프레임 이동, `P` 전체화면을 사용할 수 있습니다. 액티브 타임라인에서
@@ -103,11 +112,12 @@ VideoToolbox를 우선 사용하고, 지원되지 않는 변환이나 코덱은 
    프레임 이동하며, 최종 렌더와 같은 TC 스킵 및 카메라별 수동 프레임 오프셋 계산을 공유합니다.
    `P` 전체화면은 정지 프리뷰와 동영상 모두 별도 최상위 전체화면 창을 사용하며, 종횡비와
    전체 캔버스를 유지한 채 화면 폭에 맞는 최대 크기로 표시합니다.
-13. `RENDER NOW` 또는 `ADD TO QUEUE`를 누르면 출력 폴더와 파일명을 확인하는 창이
+13. `Render now…` 또는 `Add to queue`를 누르면 출력 폴더와 파일명을 확인하는 창이
     열립니다. 큐 항목마다 확정된 전체 출력 경로와 설정 스냅샷을 별도로 보관하므로
-    `RENDER ALL` 실행 시 다른 타임라인의 경로나 이름이 섞이지 않습니다. Render Queue
-    하단은 `RENDER`와 `RENDER ALL`만 표시하며, 로드/제거는 더블클릭·우클릭 또는
-    `Backspace`/`Delete`로 처리합니다.
+    `Render pending` 실행 시 다른 타임라인의 경로나 이름이 섞이지 않습니다. Render Queue
+    하단에는 `Render selected`, `Render pending`, `Open output`, `Remove`가 표시됩니다.
+    완료한 항목을 선택하면 `Render selected`는 `Render again`으로 바뀝니다.
+    타임라인 로드는 더블클릭·우클릭, 큐 제거는 `Remove` 또는 `Backspace`/`Delete`로 처리합니다.
 
 프로젝트 변경은 작은 JSON 파일에 즉시 원자 저장됩니다. 추가로 내용이 바뀐 경우에만
 10분마다 `project.autosave.json` 복구 스냅샷을 갱신하므로 고해상도 영상 디코딩이나
@@ -329,7 +339,7 @@ PowerShell의 백틱(`) 대신 역슬래시(`\\`)를 사용하십시오.
 
 ## SMPTE TC 정렬과 공통 듀레이션
 
-GUI의 `TC ALIGN`은 video stream, container 또는 QuickTime `tmcd` metadata의
+GUI의 `Sync timecode`은 video stream, container 또는 QuickTime `tmcd` metadata의
 timecode를 읽습니다. 가장 늦게 시작한 플레이트를 공통 시작점으로 선택하고, 앞서
 시작한 플레이트는 필요한 프레임만큼 건너뜁니다. 이후 남아 있는 프레임 수가 가장
 짧은 플레이트를 공통 OUT으로 사용하므로 앞뒤로 1~3프레임 차이가 있어도 출력 길이가

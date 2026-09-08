@@ -15,7 +15,8 @@ def weighted_blend(images: list[np.ndarray], weights: list[np.ndarray]) -> np.nd
         accumulator += image * weight[..., None]
         weight_sum += weight
     valid = weight_sum > 1e-8
-    accumulator[valid] /= weight_sum[valid, None]
-    accumulator[~valid] = 0.0
+    # Boolean indexing copies the covered RGB pixels twice. Broadcast the
+    # denominator in-place instead, retaining the same float32 arithmetic.
+    np.divide(accumulator, weight_sum[..., None], out=accumulator, where=valid[..., None])
+    np.copyto(accumulator, 0.0, where=~valid[..., None])
     return accumulator
-

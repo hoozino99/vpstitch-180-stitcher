@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,7 @@ class Output:
     tile_width: int = 1024
     tile_height: int = 512
     seam_feather_deg: float = 4.0
+    seam_paths_deg: tuple[tuple[float, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -254,7 +256,24 @@ def load_config(path: str | Path) -> RigConfig:
         raise ConfigError("cameras must be ordered from left to right by increasing yaw_deg")
 
     out_raw = _expect_dict(root.get("output", {}), "output")
+    if out_raw.get("seam_paths_deg") is not None:
+        try:
+            out_raw["seam_paths_deg"] = tuple(
+                tuple(float(v) for v in path) for path in out_raw["seam_paths_deg"]
+            )
+        except (TypeError, ValueError) as error:
+            raise ConfigError("seam_paths_deg must contain an angle path per adjacent camera pair") from error
     output = Output(**out_raw)
+    if output.seam_paths_deg is not None:
+        if len(output.seam_paths_deg) != len(cameras) - 1:
+            raise ConfigError("seam_paths_deg must contain one path per adjacent camera pair")
+        for index, path in enumerate(output.seam_paths_deg):
+            if len(path) < 2 or any(
+                not math.isfinite(angle)
+                or not cameras[index].yaw_deg < angle < cameras[index + 1].yaw_deg
+                for angle in path
+            ):
+                raise ConfigError("each seam path needs at least two finite angles between its camera yaws")
     if output.projection not in {"cylindrical", "cylindrical_rugby", "rectilinear"}:
         raise ConfigError(
             "projection must be 'cylindrical', 'cylindrical_rugby', or 'rectilinear'"
